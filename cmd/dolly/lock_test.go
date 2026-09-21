@@ -68,7 +68,7 @@ func TestUnlock(t *testing.T) {
 		dir := fakeWithLock(2 * time.Hour)
 		withFake(t, dir, "yes\n", true)
 		code, out, _ := runCLI("unlock", "--config", template)
-		if code != 0 || !strings.Contains(out, "Removed "+lockDN) || !strings.Contains(out, "stale:") || dir.Has(lockDN) {
+		if code != 0 || !strings.Contains(out, "Removed "+lockDN) || !strings.Contains(out, "stale?:") || dir.Has(lockDN) {
 			t.Errorf("exit %d, %q", code, out)
 		}
 	})
@@ -76,7 +76,7 @@ func TestUnlock(t *testing.T) {
 		dir := fakeWithLock(time.Minute)
 		withFake(t, dir, "", false)
 		code, out, _ := runCLI("unlock", "--yes", "--config", template)
-		if code != 0 || dir.Has(lockDN) || strings.Contains(out, "stale:") {
+		if code != 0 || dir.Has(lockDN) || strings.Contains(out, "stale?:") {
 			t.Errorf("exit %d, %q", code, out)
 		}
 	})
