@@ -56,7 +56,7 @@ Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/
 go install github.com/dirkpetersen/dolly/cmd/dolly@latest
 
 # Create a config
-cp config.example.yaml dolly.yaml
+cp dolly.yaml.template dolly.yaml   # dolly.yaml is git-ignored; it may hold secrets
 $EDITOR dolly.yaml
 
 # See what would happen
@@ -71,6 +71,7 @@ dolly sync --config dolly.yaml
 ```yaml
 source:
   url: ldaps://dc01.example.edu:636
+  ca_file: /etc/dolly/ad-ca.pem       # optional, see "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu
   bind_password_file: /etc/dolly/ad.secret
   users:
@@ -84,6 +85,7 @@ source:
 target:
   url: ldap://ldap.example.edu:389
   start_tls: true
+  ca_file: /etc/dolly/ldap-ca.pem     # optional, see "TLS certificates"
   bind_dn: cn=dolly,dc=example,dc=edu
   bind_password_file: /etc/dolly/ldap.secret
   users_base: ou=people,dc=example,dc=edu
@@ -172,6 +174,19 @@ docker run --rm -v /etc/dolly:/etc/dolly:ro -v dolly-state:/var/lib/dolly \
 ```
 
 A nightly `dolly sync --full` alongside frequent incremental runs is a good default, because it catches deletions and anything the incremental pass missed.
+
+## TLS certificates
+
+If the TLS handshake fails because the server's CA isn't trusted locally (common with an internal AD CA), pull the server's certificate chain and point `ca_file` at it:
+
+```bash
+openssl s_client -connect dc01.example.edu:636 -showcerts </dev/null 2>/dev/null \
+  | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > /etc/dolly/ad-ca.pem
+# For StartTLS on 389: openssl s_client -connect ldap.example.edu:389 -starttls ldap -showcerts
+openssl x509 -in /etc/dolly/ad-ca.pem -noout -subject -issuer -fingerprint -sha256
+```
+
+Check the fingerprint against a trusted source before relying on it. Dolly never silently disables certificate verification.
 
 ## Permissions
 

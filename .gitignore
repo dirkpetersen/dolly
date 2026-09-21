@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local Dolly config (may contain passwords); dolly.yaml.template is the checked-in example
+dolly.yaml

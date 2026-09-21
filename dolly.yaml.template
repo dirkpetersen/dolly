@@ -1,0 +1,55 @@
+# Dolly configuration template.
+# Copy to dolly.yaml (git-ignored) and edit. Never commit dolly.yaml.
+
+source:
+  url: ldaps://dc01.example.edu:636
+  ca_file: /etc/dolly/ad-ca.pem       # optional; see README "TLS certificates"
+  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu
+  bind_password_file: /etc/dolly/ad.secret
+  users:
+    base: OU=People,DC=example,DC=edu
+    filter: (&(objectClass=user)(objectCategory=person))
+  groups:
+    base: OU=Groups,DC=example,DC=edu
+    filter: (objectClass=group)
+  page_size: 500
+
+target:
+  url: ldap://ldap.example.edu:389
+  start_tls: true
+  ca_file: /etc/dolly/ldap-ca.pem     # optional; see README "TLS certificates"
+  bind_dn: cn=dolly,dc=example,dc=edu
+  bind_password_file: /etc/dolly/ldap.secret
+  users_base: ou=people,dc=example,dc=edu
+  groups_base: ou=groups,dc=example,dc=edu
+
+mapping:
+  users:
+    rdn: uid
+    object_classes: [inetOrgPerson, posixAccount, shadowAccount]
+    attributes:
+      uid: sAMAccountName
+      cn: displayName
+      givenName: givenName
+      sn: sn
+      mail: mail
+      uidNumber: uidNumber          # from AD's RFC2307 attributes
+      gidNumber: gidNumber
+      homeDirectory: "/home/{{ .sAMAccountName }}"
+      loginShell: "/bin/bash"
+  groups:
+    rdn: cn
+    object_classes: [posixGroup, groupOfNames]
+    attributes:
+      cn: sAMAccountName
+      gidNumber: gidNumber
+      description: description
+    membership:
+      - attribute: member           # full DN, rewritten to target tree
+      - attribute: memberUid        # bare uid, for posixGroup
+
+sync:
+  disabled_accounts: skip           # skip | include | lock
+  prune: false                      # delete Dolly-managed target entries missing from AD
+                                    # (group members removed in AD are always removed)
+  state_file: /var/lib/dolly/state.json

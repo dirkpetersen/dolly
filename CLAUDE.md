@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Dolly is a Go tool (Go 1.22+, built on `github.com/go-ldap/ldap`) that replicates users and groups one way from Active Directory to OpenLDAP. The repo currently holds only `README.md`, `LICENSE` (MIT), and a Go `.gitignore`. No code exists yet. `README.md` is the spec: CLI surface, config schema (`dolly.yaml`), and sync algorithm. Keep it in sync when behavior changes.
+Dolly is a Go tool (Go 1.22+, built on `github.com/go-ldap/ldap`) that replicates users and groups one way from Active Directory to OpenLDAP. The repo currently holds only `README.md`, `LICENSE` (MIT), `dolly.yaml.template`, and a Go `.gitignore`. No code exists yet. `README.md` is the spec: CLI surface, config schema (`dolly.yaml`), and sync algorithm. Keep it in sync when behavior changes.
 
 Planned layout and commands (from README):
 
@@ -22,6 +22,8 @@ CLI: `dolly sync [--full] [--users|--groups] [--dry-run]`, `dolly diff`, `dolly 
 2. **Only touch what Dolly owns.** Target groups can hold members added directly on the LDAP server. On sync, add members newly in the AD group, and remove members that Dolly previously replicated but that are no longer in the AD group or no longer in AD. Leave every other member alone. So Dolly must persist which entries and group members it wrote. The README puts this in the state file, and `prune` also only deletes Dolly-created entries. Never compute membership as "replace with AD's list".
 3. **Users and groups sync independently.** `--users` or `--groups` alone must work, and neither may assume the other ran in the same invocation.
 4. **Users and groups only.** No computers, contacts, NIS netgroups, or autofs maps, even though the predecessor exported the last two.
+5. **Config and secrets.** The default config is `dolly.yaml` in the working directory. It is git-ignored because it may contain passwords. The checked-in example is `dolly.yaml.template`. Keep the template, the README config block, and the config structs in sync, and never commit a real `dolly.yaml`.
+6. **Missing server certificate.** If an LDAPS or StartTLS connection fails because the server's CA isn't trusted locally, fetch the chain with `openssl s_client -connect host:636 -showcerts </dev/null | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > ca.pem` (add `-starttls ldap` for port 389). Show the fingerprint with `openssl x509 -noout -fingerprint -sha256`, and set `ca_file` in `dolly.yaml`. Code should load `ca_file` into the TLS root pool and never fall back to `InsecureSkipVerify`. See README "TLS certificates".
 
 ## Predecessor: ad2openldap
 
