@@ -4,9 +4,11 @@
 # Defaults match the tree produced by ad2openldap.
 
 source:
-  url: ldaps://dc01.example.edu:636
+  urls:                               # tried in order
+    - ldaps://dc01.example.edu:636
+    - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
-  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu
+  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
@@ -31,19 +33,20 @@ mapping:
   users:
     rdn: uid
     object_classes: [account, posixAccount]
-    required: [uid, uidNumber]        # AD users missing any of these are skipped with a warning
+    required: [uid, uidNumber, gidNumber]   # AD users missing any of these are ignored
+    create_only: [loginShell, homeDirectory]  # set on creation, then never overwritten (local overrides survive)
     attributes:
       uid: uid
       cn: uid
       uidNumber: uidNumber
-      gidNumber: '{{ or .gidNumber "65534" }}'
+      gidNumber: gidNumber
       homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
       loginShell: '{{ or .loginShell "/bin/bash" }}'
       gecos: gecos
   groups:
     rdn: cn
     object_classes: [groupOfNames, posixGroup]
-    required: [name, gidNumber]       # AD groups missing any of these are skipped with a warning
+    required: [name, gidNumber]       # AD groups missing any of these are ignored, also when flattening
     attributes:
       cn: name
       gidNumber: gidNumber
@@ -54,8 +57,13 @@ mapping:
 
 sync:
   prune_users: false                  # delete Dolly-owned users that are gone from AD (groups are never deleted)
+  prune_after_days: 30                # how long a user must be gone from AD before the entry is deleted
+  disabled_shell: /sbin/nologin       # loginShell for disabled AD accounts; "" leaves the shell alone
   max_delete_percent: 10              # abort if a run would remove more than this share; --force overrides
+  max_delete_min: 25                  # ...but never abort for this many removals or fewer
   lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
+  run_timeout: 45m                    # a run aborts itself after this long; must be shorter than lock_ttl
+  network_timeout: 30s                # connect and per-operation timeout
 
 notify:
   smtp_host: mx.example.edu
@@ -67,3 +75,4 @@ notify:
   to: [ldap-admins@example.edu]
   subject_prefix: "[dolly]"
   on: failure                         # failure | changes | always
+  remind_every: 24h                   # while a failure persists, remind at most this often
