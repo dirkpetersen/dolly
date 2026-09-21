@@ -49,10 +49,6 @@ func uidOnly(c *config.Config) {
 	c.Mapping.Groups.Membership = []config.Membership{{Attribute: config.AttrMemberUID}}
 }
 
-// lax turns off sync.require_member_on_target, for tests of rules that
-// predate it or of what happens without it.
-func lax(c *config.Config) { c.Sync.RequireMemberOnTarget = false }
-
 func guid(n int) string { return fmt.Sprintf("00000000-0000-0000-0000-%012x", n) }
 
 // rec returns the short name opStr uses for a record DN.
@@ -252,6 +248,30 @@ func warnings(p *Plan, k WarningKind) []string {
 		}
 	}
 	return out
+}
+
+// missing renders the plan's skipped members as "<uid> in <group DN>: <why>",
+// in plan order (sorted by group, then uid).
+func missing(p *Plan) []string {
+	var out []string
+	for _, m := range p.MissingMembers {
+		out = append(out, m.UID+" in "+m.Group+": "+m.Why)
+	}
+	return out
+}
+
+// wantMissing checks the exact list of skipped members.
+func wantMissing(t *testing.T, p *Plan, want ...string) {
+	t.Helper()
+	if got := missing(p); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("missing members mismatch\n got:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// localUID is a local user entry (no record) with only a uid: no uidNumber,
+// as in a groups-only deployment whose users come from elsewhere.
+func localUID(dn, uid string) *model.Entry {
+	return &model.Entry{DN: dn, Attrs: map[string][]string{"objectClass": {"account"}, "uid": {uid}}}
 }
 
 func wantWarning(t *testing.T, p *Plan, k WarningKind, substr string) {

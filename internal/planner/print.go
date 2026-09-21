@@ -97,6 +97,19 @@ func (p *Plan) Print(w io.Writer) {
 	fmt.Fprintf(w, "  memberships: +%d -%d (%d of them local, removed by a prune; %d values renamed)\n", c.MembersAdded, c.MembersRemoved, p.Guard.LocalRemovals, c.MembersRenamed)
 	fmt.Fprintf(w, "  records:     +%d ~%d -%d\n", c.RecordsAdded, c.RecordsUpdated, c.RecordsDeleted)
 	fmt.Fprintf(w, "  ignored:     %d entries missing required attributes\n", c.IgnoredEntries)
+	// Not a warning: members without a target entry are expected in a
+	// groups-only deployment and are picked up once the entry exists.
+	if n := len(p.MissingMembers); n > 0 {
+		fmt.Fprintf(w, "  members skipped: %d not on the target (use --debug to list them)\n", n)
+	}
+}
+
+// PrintDebug writes the plan's debug details, one line each: the group
+// members skipped because they have no entry on the target.
+func (p *Plan) PrintDebug(w io.Writer) {
+	for _, m := range p.MissingMembers {
+		fmt.Fprintf(w, "debug: skip %s in %s: %s\n", m.UID, m.Group, m.Why)
+	}
 }
 
 func describe(op Op) string {

@@ -90,7 +90,6 @@ sync:
   lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
   run_timeout: 45m                    # a run aborts itself after this long; must be shorter than lock_ttl
   network_timeout: 30s                # connect and per-operation timeout
-  require_member_on_target: true      # add a group member only if an entry with its uid exists under users_base
 
 notify:
   smtp_host: mx.example.edu
@@ -130,14 +129,14 @@ Dolly can manage groups without ever creating users. Run `dolly sync --groups` (
 
 - `target.users_base` can be read-only for Dolly, and larger than the server's search size limit. A `--groups` run never reads it in full; it looks up only the uids of the members it would add, 50 per search.
 - AD users need only the attribute `uid` is mapped from to be group members. If your Unix identity is `sAMAccountName` and the Unix numbers live only on the target, map `uid: sAMAccountName` (and `cn: sAMAccountName`) and put `sAMAccountName` in `mapping.users.required` instead of `uid`. `uidNumber` and `gidNumber` stay in the list; they only matter for user entries, which a groups-only run never creates.
-- With `sync.require_member_on_target` (the default), a member is added only if an entry with its uid already exists under `users_base`. Members without one are skipped and listed once per run as `missing-on-target`.
+- A member is added only if an entry with its uid already exists under `users_base` (this is always on; there's no setting for it). Neither the AD user nor the target entry needs `uidNumber` for this check; only groups need `gidNumber`. Members without a target entry are skipped, not warned about: the run summary shows one count line, and `--debug` lists each skipped (group, user) pair. A skipped member is picked up automatically once its entry exists.
 - The AD users base isn't searched either: every member is fetched from AD by DN, and must still match `source.users.filter`.
 
 ## Config validation
 
 Dolly validates `dolly.yaml` before connecting to anything:
 
-- Unknown keys are a config error.
+- Unknown keys are a config error. The removed key `sync.require_member_on_target` gets an explanation: its rule (group members must exist on the target) is now always on, so delete the line.
 - `mapping.users.required` must include the AD attributes that `uid`, `uidNumber`, and `gidNumber` are mapped from, when they're mapped from a plain attribute. With the defaults that's `uid`, `uidNumber`, `gidNumber`; with `uid: sAMAccountName` it's `sAMAccountName` instead of `uid`. `uidNumber` and `gidNumber` must be mapped.
 - `mapping.groups.required` must include `name` and `gidNumber`.
 - `mapping.users.rdn` must map to the same value as `uid`.
@@ -227,7 +226,6 @@ Run behavior: pruning, the mass-deletion guard, and timeouts.
 | `lock_ttl` | `60m` | A run lock older than this (by the server's `createTimestamp`) is treated as stale and broken. |
 | `run_timeout` | `45m` | A run aborts itself after this long. Must be shorter than `lock_ttl` so a live run's lock is never mistaken for stale. |
 | `network_timeout` | `30s` | Connect and per-operation timeout against both AD and the target. |
-| `require_member_on_target` | `true` | Add an AD user to a target group only if an entry with its uid exists under `users_base` (Dolly-owned or local; with `member` in the membership list, an entry at the member DN). Skipped members are listed once per run as `missing-on-target`. |
 
 See [How it works](how-it-works/index.md#guard) for the mass-deletion guard in detail, and [Run lock](how-it-works/run-lock.md) for locking.
 

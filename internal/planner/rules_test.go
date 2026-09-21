@@ -69,6 +69,44 @@ func TestRuleLocalMemberNeverRemoved(t *testing.T) {
 	})
 }
 
+// Rule: a member value removed by hand on the target is re-added only if
+// Dolly owns the membership (a roleOccupant names it) and AD still lists the
+// user: AD wins for Dolly-owned members. A local member removed by hand is
+// never Dolly's business and isn't restored.
+func TestRuleManualRemoval(t *testing.T) {
+	jdoe := mkUser(1, "jdoe")
+	ad := []*model.ADObject{jdoe, mkGroup(10, "hpc", jdoe.DN)}
+	users := []*model.Entry{tUser(1, "jdoe"), uRec(1, "jdoe"), localUID(udn("local1"), "local1")}
+	t.Run("owned member removed by hand is re-added", func(t *testing.T) {
+		p := build(t, cfg(t), world{ad: ad, target: append(users, tGroup(10, "hpc", "local1"), gRec(10, "hpc", "jdoe"))}, both)
+		wantOps(t, p,
+			"add-member "+gdn("hpc")+" member="+udn("jdoe"),
+			"add-member "+gdn("hpc")+" memberUid=jdoe")
+	})
+	t.Run("owned memberUid value removed by hand is re-added", func(t *testing.T) {
+		g := tGroup(10, "hpc", "jdoe", "local1")
+		g.DeleteValue("memberUid", "jdoe", strings.EqualFold)
+		p := build(t, cfg(t), world{ad: ad, target: append(users, g, gRec(10, "hpc", "jdoe"))}, both)
+		wantOps(t, p, "add-member "+gdn("hpc")+" memberUid=jdoe")
+	})
+	t.Run("local member removed by hand is not restored", func(t *testing.T) {
+		// local1 was a local member (no roleOccupant) and is no longer in
+		// the group; its user entry still exists. Nothing is written.
+		p := build(t, cfg(t), world{ad: ad, target: append(users, tGroup(10, "hpc", "jdoe"), gRec(10, "hpc", "jdoe"))}, both)
+		wantOps(t, p)
+	})
+	t.Run("local member also in the AD group comes back as owned", func(t *testing.T) {
+		// Known consequence: jdoe was a local member of hpc and is also in
+		// the AD group. Once removed by hand, the next run can't tell this
+		// from a new AD membership, so it adds jdoe as Dolly-owned.
+		p := build(t, cfg(t), world{ad: ad, target: append(users, tGroup(10, "hpc", "local1"), gRec(10, "hpc"))}, both)
+		wantOps(t, p,
+			"update-record rec:a add roleOccupant="+udn("jdoe"),
+			"add-member "+gdn("hpc")+" member="+udn("jdoe"),
+			"add-member "+gdn("hpc")+" memberUid=jdoe")
+	})
+}
+
 // Rule: a target user or group with the same name as an AD entry but no
 // ownership record is a conflict: logged and skipped.
 func TestRuleConflictWithoutRecord(t *testing.T) {
@@ -240,12 +278,13 @@ func TestRuleGroupGoneFromAD(t *testing.T) {
 }
 
 // Rule: roleOccupant always names members by DN (<rdn>=<uid>,<users_base>),
-// also with memberUid only, where the user entry needn't exist.
+// also with memberUid only, where the user entry must exist under
+// users_base with that uid, but not necessarily at that DN.
 func TestRuleOccupantIsDNWithMemberUIDOnly(t *testing.T) {
 	jdoe := mkUser(1, "jdoe")
-	p := build(t, cfg(t, uidOnly, lax), world{
+	p := build(t, cfg(t, uidOnly), world{
 		ad:     []*model.ADObject{jdoe, mkGroup(10, "hpc", jdoe.DN)},
-		target: []*model.Entry{tGroupUID(10, "hpc", "local1"), gRec(10, "hpc")},
+		target: []*model.Entry{localUID("uid=jdoe,ou=staff,"+people, "jdoe"), tGroupUID(10, "hpc", "local1"), gRec(10, "hpc")},
 	}, Options{Groups: true})
 	wantOps(t, p,
 		"update-record rec:a add roleOccupant="+udn("jdoe"),
@@ -623,35 +662,36 @@ func TestUsersAndGroupsIndependently(t *testing.T) {
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("jdoe"),
 			"add-entry "+gdn("hpc")+" member="+udn("jdoe")+" memberUid=jdoe")
 	})
-	// A groups-only run with member never writes a DN for a user that has
-	// no record and no entry yet: that member is pending until a users sync.
-	// With memberUid only, members are bare uids and need no user entry.
+	// A groups-only run never adds a user that has no entry on the target
+	// yet (with member or memberUid only): the member is skipped until a
+	// users sync, or someone else, creates the entry.
 	t.Run("groups only skips users not yet created", func(t *testing.T) {
 		bob := mkUser(2, "bob")
 		ad := []*model.ADObject{jdoe, bob, mkGroup(10, "hpc", jdoe.DN, bob.DN)}
-		p := build(t, cfg(t, lax), world{ad: ad, target: []*model.Entry{tUser(1, "jdoe"), uRec(1, "jdoe")}}, Options{Groups: true})
+		p := build(t, cfg(t), world{ad: ad, target: []*model.Entry{tUser(1, "jdoe"), uRec(1, "jdoe")}}, Options{Groups: true})
 		wantOps(t, p,
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("jdoe"),
 			"add-entry "+gdn("hpc")+" member="+udn("jdoe")+" memberUid=jdoe")
-		wantWarning(t, p, WarnPending, udn("bob")+": user not yet created; run a users sync")
-		if n := len(warnings(p, WarnPending)); n != 1 {
-			t.Errorf("pending warnings = %d, want 1: %v", n, p.Warnings)
+		wantMissing(t, p, "bob in "+gdn("hpc")+": no entry on the target at "+udn("bob"))
+		if len(p.Warnings) != 0 {
+			t.Errorf("a skipped member is not a warning: %v", p.Warnings)
 		}
 
-		p = build(t, cfg(t, lax), world{ad: ad}, Options{Groups: true})
-		wantOps(t, p) // no member resolves to an entry, so the group waits too
+		p = build(t, cfg(t), world{ad: ad}, Options{Groups: true})
+		wantOps(t, p) // no member has an entry, so the group waits too
 		wantWarning(t, p, WarnPending, gdn("hpc")+": AD group has no resolvable members")
 
-		p = build(t, cfg(t, uidOnly, lax), world{ad: ad}, Options{Groups: true})
-		wantOps(t, p,
-			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("bob")+"|"+udn("jdoe"),
-			"add-entry "+gdn("hpc")+" memberUid=bob|jdoe")
-		if len(warnings(p, WarnPending)) != 0 {
-			t.Errorf("memberUid only must not report pending users: %v", p.Warnings)
-		}
+		p = build(t, cfg(t, uidOnly), world{ad: ad}, Options{Groups: true})
+		wantOps(t, p, // posixGroup may be empty
+			"add-record rec:a seeAlso="+gdn("hpc"),
+			"add-entry "+gdn("hpc"))
+		wantMissing(t, p,
+			"bob in "+gdn("hpc")+": no entry on the target under "+people,
+			"jdoe in "+gdn("hpc")+": no entry on the target under "+people)
 
 		p = build(t, cfg(t), world{ad: ad}, both) // users are created first
 		index(t, p, "add-entry "+gdn("hpc")+" member="+udn("bob")+"|"+udn("jdoe"))
+		wantMissing(t, p)
 	})
 	t.Run("groups only follows the target's user DN, not a pending rename", func(t *testing.T) {
 		u := mkUser(1, "jdoe2")

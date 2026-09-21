@@ -66,7 +66,6 @@ sync:
   lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
   run_timeout: 45m                    # a run aborts itself after this long; must be shorter than lock_ttl
   network_timeout: 30s                # connect and per-operation timeout
-  require_member_on_target: true      # add a group member only if an entry with its uid exists under users_base
 
 notify:
   smtp_host: mx.example.edu

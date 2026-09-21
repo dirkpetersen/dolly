@@ -43,8 +43,8 @@ Usage:
 
 Commands:
   sync       Read AD and the target, then apply the differences
-             [--users|--groups] [--dry-run] [--force]
-  adopt      One-time takeover of an existing tree [--dry-run]
+             [--users|--groups] [--dry-run] [--force] [--debug]
+  adopt      One-time takeover of an existing tree [--dry-run] [--debug]
   unlock     Show and remove the run lock after a crash [--yes]
   check      Test connectivity, binds, search scopes, size limits, and SMTP
   install    Install the binary, config, and systemd --user units
@@ -53,6 +53,9 @@ Commands:
 
 Every command that reads the config accepts --config FILE. Without it Dolly
 uses ./dolly.yaml, then $XDG_CONFIG_HOME/dolly/dolly.yaml (~/.config/dolly/).
+Every command that plans (sync, adopt) accepts --debug, which prints debug
+details to stderr, such as each group member skipped for having no entry on
+the target.
 
 Exit codes: 0 success (or the lock is held elsewhere), 1 error, 2 guard tripped.
 Run "dolly <command> -h" for a command's flags.
@@ -143,28 +146,36 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 	groups := fs.Bool("groups", false, "sync groups only")
 	dryRun := fs.Bool("dry-run", false, "print the plan without writing or taking the lock")
 	force := fs.Bool("force", false, "apply even if the mass-deletion guard trips")
+	dbg := debugFlag(fs)
 	fix := fs.String("fixture", "", "plan from a snapshot file (development only)")
 	if code, ok := parse(fs, args); !ok {
 		return code
 	}
 	// --users and --groups select phases; both together, like neither, mean both.
 	opt := planner.Options{Users: *users || !*groups, Groups: *groups || !*users}
-	return plan("sync", *cfgPath, *fix, *dryRun, *force, opt, stdout, stderr)
+	return plan("sync", *cfgPath, *fix, *dryRun, *force, *dbg, opt, stdout, stderr)
 }
 
 func runAdopt(args []string, stdout, stderr io.Writer) int {
 	fs := newFlags("adopt", "Create ownership records for an existing tree, such as one written by ad2openldap.\nRun it once before the first sync, and check --dry-run first.", stderr, fixtureHelp)
 	cfgPath := fs.String("config", "", "config file")
 	dryRun := fs.Bool("dry-run", false, "print the records adopt would create without writing")
+	dbg := debugFlag(fs)
 	fix := fs.String("fixture", "", "plan from a snapshot file (development only)")
 	if code, ok := parse(fs, args); !ok {
 		return code
 	}
-	return plan("adopt", *cfgPath, *fix, *dryRun, false, planner.Options{Adopt: true}, stdout, stderr)
+	return plan("adopt", *cfgPath, *fix, *dryRun, false, *dbg, planner.Options{Adopt: true}, stdout, stderr)
+}
+
+// debugFlag adds --debug, which every command that plans accepts.
+func debugFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("debug", false, "print debug details to stderr, such as each group member skipped for having no entry on the target")
 }
 
 // plan loads the config and snapshots, builds the plan, and prints it.
-func plan(cmd, cfgPath, fix string, dryRun, force bool, opt planner.Options, stdout, stderr io.Writer) int {
+// With showDebug, the plan's debug details go to stderr.
+func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
 	path, err := config.Find(cfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
@@ -197,6 +208,9 @@ func plan(cmd, cfgPath, fix string, dryRun, force bool, opt planner.Options, std
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
 		return exitError
+	}
+	if showDebug {
+		p.PrintDebug(stderr)
 	}
 	p.Print(stdout)
 	if p.Guard.Tripped {
@@ -275,7 +289,10 @@ func readLive(cfg *config.Config, opt planner.Options, stderr io.Writer) (*fixtu
 	progress("read target: %d group entries, %s, %d user and %d group ownership records",
 		len(tgt.Groups), users, len(recs.Users), len(recs.Groups))
 
-	if opt.Groups && !opt.Adopt && !readUsers && (cfg.Sync.RequireMemberOnTarget || cfg.Mapping.Groups.HasMember()) {
+	// spec: a member is added only if its entry exists on the target, so a
+	// groups-only run always looks up the candidates (by uid only: no
+	// uidNumber is needed on either side).
+	if opt.Groups && !opt.Adopt && !readUsers {
 		cands, err := planner.MemberCandidates(snap, tgt, recs, cfg)
 		if err != nil {
 			return nil, err

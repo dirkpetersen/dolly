@@ -19,7 +19,7 @@ type TargetSnapshot struct {
 	// size-limited); it looks up the uids it needs instead (ExistingUsers).
 	UsersRead bool
 	// ExistingUsers are the entries under users_base found by targeted uid
-	// lookups, for the require_member_on_target check. Nil when none were
+	// lookups, for the check that group members exist. Nil when none were
 	// made; the planner then uses Users.
 	ExistingUsers *UserSet
 }

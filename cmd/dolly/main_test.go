@@ -72,6 +72,56 @@ func TestUsersAndGroupsFlagsTogether(t *testing.T) {
 	}
 }
 
+// --debug lists each member skipped for having no entry on the target on
+// stderr; without it, the plan shows only the count, and never a warning.
+func TestDebugListsMissingMembers(t *testing.T) {
+	fix := filepath.Join(t.TempDir(), "missing.yaml")
+	data := `now: 2024-06-01T00:00:00Z
+ad:
+  users:
+    - guid: 00000000-0000-0000-0000-000000000001
+      dn: CN=jdoe,OU=People,DC=example,DC=edu
+      attrs: {uid: [jdoe]}
+      userAccountControl: 512
+    - guid: 00000000-0000-0000-0000-000000000002
+      dn: CN=bob,OU=People,DC=example,DC=edu
+      attrs: {uid: [bob]}
+      userAccountControl: 512
+  groups:
+    - guid: 00000000-0000-0000-0000-0000000000a1
+      dn: CN=lab,OU=Groups,DC=example,DC=edu
+      attrs: {name: [lab], gidNumber: ["5000"]}
+      members:
+        - CN=jdoe,OU=People,DC=example,DC=edu
+        - CN=bob,OU=People,DC=example,DC=edu
+target:
+  entries:
+    - dn: ou=people,dc=local
+      attrs: {objectClass: [organizationalUnit], ou: [people]}
+    - dn: ou=group,dc=local
+      attrs: {objectClass: [organizationalUnit], ou: [group]}
+    - dn: uid=jdoe,ou=people,dc=local
+      attrs: {objectClass: [account], uid: [jdoe]}
+`
+	if err := os.WriteFile(fix, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"sync", "--dry-run", "--groups", "--config", template, "--fixture", fix}
+	code, out, errs := runCLI(args...)
+	if code != 0 || !strings.Contains(out, "  members skipped: 1 not on the target (use --debug to list them)") ||
+		strings.Contains(out, "Warnings") || strings.Contains(errs, "debug:") {
+		t.Errorf("without --debug: exit %d, stderr %q\n%s", code, errs, out)
+	}
+	code, out2, errs := runCLI(append(args, "--debug")...)
+	want := "debug: skip bob in cn=lab,ou=group,dc=local: no entry on the target at uid=bob,ou=people,dc=local\n"
+	if code != 0 || !strings.Contains(errs, want) || out2 != out {
+		t.Errorf("--debug: exit %d, stderr %q, want %q; stdout changed: %v", code, errs, want, out2 != out)
+	}
+	if code, _, errs := runCLI("adopt", "--dry-run", "--debug", "--config", template, "--fixture", fix); code != 0 {
+		t.Errorf("adopt --debug: exit %d, %s", code, errs)
+	}
+}
+
 func TestGuardExitCode(t *testing.T) {
 	dir := t.TempDir()
 	fix := filepath.Join(dir, "empty.yaml")

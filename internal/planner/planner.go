@@ -33,7 +33,7 @@ func Build(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records,
 	if err != nil {
 		return nil, err
 	}
-	if opt.Groups && !opt.Adopt && !tgt.UsersRead && tgt.ExistingUsers == nil && (cfg.Sync.RequireMemberOnTarget || p.memberMode) {
+	if opt.Groups && !opt.Adopt && !tgt.UsersRead && tgt.ExistingUsers == nil {
 		return nil, fmt.Errorf("planning groups needs the target's users: read users_base or look up the member uids (TargetSnapshot.ExistingUsers)")
 	}
 	p.prepare(ad)
@@ -108,11 +108,9 @@ type planner struct {
 	userRecBySee, groupRecBySee map[string]string        // DNKey(seeAlso) -> GUID
 	existing                    *model.UserSet           // users found by targeted lookups (groups-only runs)
 	entryUIDs                   map[string]bool          // lowercased uids of userEntries, built on first use
-	missingReported             map[string]bool          // members reported as missing on the target
 
 	removedPairs, addedPairs map[string]bool
 	localRemovedPairs        map[string]bool    // local memberships removed by a prune
-	pendingUsers             map[string]bool    // GUIDs reported as not yet on the target
 	byUserDN                 map[string]*adUser // built on first use in the groups phase
 }
 
@@ -145,9 +143,8 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		groupRecs:    map[string]*model.Record{},
 		userRecBySee: map[string]string{}, groupRecBySee: map[string]string{},
 		removedPairs: map[string]bool{}, addedPairs: map[string]bool{},
-		localRemovedPairs: map[string]bool{}, pendingUsers: map[string]bool{},
-		missingReported: map[string]bool{},
-		existing:        tgt.ExistingUsers,
+		localRemovedPairs: map[string]bool{},
+		existing:          tgt.ExistingUsers,
 	}
 	for name, src := range cfg.Mapping.Users.Attributes {
 		v, err := config.CompileValue(name, src)
@@ -614,13 +611,23 @@ func (p *planner) finish() {
 	if !p.opt.Adopt {
 		g.evaluate()
 	}
-	order := map[WarningKind]int{WarnConflict: 0, WarnIDChanged: 1, WarnDuplicateID: 2, WarnDuplicate: 3, WarnInvalid: 4, WarnIgnored: 5, WarnPending: 6, WarnMissingOnTarget: 7}
+	order := map[WarningKind]int{WarnConflict: 0, WarnIDChanged: 1, WarnDuplicateID: 2, WarnDuplicate: 3, WarnInvalid: 4, WarnIgnored: 5, WarnPending: 6}
 	sort.SliceStable(p.plan.Warnings, func(i, j int) bool {
 		a, b := p.plan.Warnings[i], p.plan.Warnings[j]
 		if order[a.Kind] != order[b.Kind] {
 			return order[a.Kind] < order[b.Kind]
 		}
 		return strings.ToLower(a.Subject) < strings.ToLower(b.Subject)
+	})
+	sort.SliceStable(p.plan.MissingMembers, func(i, j int) bool {
+		a, b := p.plan.MissingMembers[i], p.plan.MissingMembers[j]
+		if ka, kb := model.MustDNKey(a.Group), model.MustDNKey(b.Group); ka != kb {
+			return ka < kb
+		}
+		if la, lb := strings.ToLower(a.UID), strings.ToLower(b.UID); la != lb {
+			return la < lb
+		}
+		return a.DN < b.DN
 	})
 	for _, w := range p.plan.Warnings {
 		if w.Kind == WarnIgnored {

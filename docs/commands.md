@@ -12,6 +12,7 @@ dolly sync --users        # users only
 dolly sync --groups       # groups only
 dolly sync --dry-run      # print the plan, write nothing
 dolly sync --force        # apply even if the mass-deletion guard trips
+dolly sync --debug        # also print per-entry debug lines to stderr
 ```
 
 | Flag | Effect |
@@ -20,14 +21,31 @@ dolly sync --force        # apply even if the mass-deletion guard trips
 | `--groups` | Sync groups only. The default with neither flag is both. |
 | `--dry-run` | Print the planned adds, modifies, renames, and removals without writing anything. Takes no run lock. |
 | `--force` | Apply the run even if it trips the [mass-deletion guard](how-it-works/index.md#guard). |
+| `--debug` | Print debug details to stderr. See [The `--debug` flag](#the-debug-flag). |
 
 There is no `dolly diff` — use `dolly sync --dry-run` instead.
 
 A groups-only run doesn't read the AD users base or the target's `users_base` in full: it fetches each group member from AD by DN and looks up only the uids it needs on the target, so it works with a huge or size-limited `users_base`. See [Groups-only deployments](configuration.md#groups-only-deployments). A users-only run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced; the only group values a `--users` run changes are `member`/`memberUid` fix-ups for a renamed or pruned user. Removing owned memberships from a group happens only in a run that includes groups.
 
-In a `--groups` run, a member's target DN comes from the user's own ownership record (`seeAlso`), not a fresh AD lookup, so a user rename still pending its own `--users` sync causes no group churn. With `sync.require_member_on_target` (the default), a member is added only if its entry exists under `users_base`. With it off and `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it; with `memberUid` only, no user entry is needed.
+In a `--groups` run, a member's target DN comes from the user's own ownership record (`seeAlso`), not a fresh AD lookup, so a pending user rename causes no group churn. A member is added only if its entry already exists under `users_base` (see [Ownership](how-it-works/ownership.md)); otherwise it is skipped, counted in the summary, and listed with `--debug`. Neither AD users nor target users need `uidNumber`; only groups need `gidNumber`.
 
 `--users` and `--groups` each work standalone and never assume the other ran in the same invocation.
+
+## The `--debug` flag
+
+`--debug` is accepted by every command that plans (`sync` and `adopt`). Without it, a group member skipped because it has no matching entry under `users_base` is only counted, in a single run-summary line (`members skipped: N not on the target (use --debug to list them)`, omitted when the count is zero) — it's never a per-entry warning and never triggers a notification. With `--debug`, Dolly also prints one line per skipped member to stderr:
+
+```text
+debug: skip <uid> in <group DN>: no entry on the target under <users_base>
+```
+
+With `member` in `mapping.groups.membership`, the message instead names the expected member DN:
+
+```text
+debug: skip <uid> in <group DN>: no entry on the target at <member DN>
+```
+
+A skipped member is re-evaluated on every run and added (and recorded as Dolly-owned) as soon as a matching entry exists — see [Group membership](how-it-works/ownership.md#group-membership).
 
 ## `dolly adopt`
 
@@ -36,6 +54,7 @@ One-time takeover of an existing target tree that has no Dolly ownership records
 ```bash
 dolly adopt --dry-run
 dolly adopt
+dolly adopt --debug      # also print per-entry debug lines to stderr
 ```
 
 See [Adopting an existing tree](operations/adopting.md) for what it does and its caveats.

@@ -32,28 +32,12 @@ func (p *planner) userDN(u *adUser) string {
 	return u.dn
 }
 
-// notOnTarget reports whether a groups-only run in member mode must skip u:
-// the user has no ownership record and no entry on the target, so a member
-// value would be a dangling DN. With memberUid only, members are bare uids
-// and need no user entry. The skip is reported once per user as pending.
-// With sync.require_member_on_target (the default) the stricter
-// missingOnTarget check runs first, so this only matters when it is off.
-func (p *planner) notOnTarget(u *adUser, dn string) bool {
-	if p.opt.Users || !p.memberMode || p.userRecs[u.obj.GUID] != nil || p.onTarget(dn, u.uid) {
-		return false
-	}
-	if !p.pendingUsers[u.obj.GUID] {
-		p.pendingUsers[u.obj.GUID] = true
-		p.warn(WarnPending, u.dn, "user not yet created; run a users sync (its group memberships are skipped until then)")
-	}
-	return true
-}
-
 // onTarget reports whether the target has an entry for a member: with
 // member in the membership list, an entry at dn; with memberUid only, any
 // entry under users_base with that uid. Entries come from the full read of
-// users_base (including users this plan creates or renames first) or, in a
-// groups-only run, from the targeted uid lookups.
+// users_base (updated as the users phase plans: users it creates or renames
+// count, users it prunes don't) or, in a groups-only run, from the targeted
+// uid lookups. Only the uid matters: no uidNumber is needed on either side.
 func (p *planner) onTarget(dn, uid string) bool {
 	if p.memberMode {
 		return p.userEntries[model.MustDNKey(dn)] != nil || p.existing.HasDN(dn)
@@ -69,19 +53,14 @@ func (p *planner) onTarget(dn, uid string) bool {
 	return p.entryUIDs[strings.ToLower(uid)] || p.existing.HasUID(uid)
 }
 
-// missingOnTarget reports a member skipped by require_member_on_target,
-// once per user and run.
-func (p *planner) missingOnTarget(dn, uid string) {
-	k := model.MustDNKey(dn)
-	if p.missingReported[k] {
-		return
-	}
-	p.missingReported[k] = true
+// missingMember records a member skipped because it has no entry on the
+// target. It is debug-level: counted in the summary, listed with --debug.
+func (p *planner) missingMember(group, dn, uid string) {
+	why := "no entry on the target under " + p.cfg.Target.UsersBase
 	if p.memberMode {
-		p.warn(WarnMissingOnTarget, dn, "no entry at this DN under users_base; not added to groups (sync.require_member_on_target)")
-		return
+		why = "no entry on the target at " + dn
 	}
-	p.warn(WarnMissingOnTarget, uid, "no entry with this uid under users_base; not added to groups (sync.require_member_on_target)")
+	p.plan.MissingMembers = append(p.plan.MissingMembers, MissingMember{Group: group, UID: uid, DN: dn, Why: why})
 }
 
 // desired returns the members a group should have: its flattened AD
@@ -90,8 +69,9 @@ func (p *planner) missingOnTarget(dn, uid string) {
 // and a Dolly-owned value for them isn't removed either (it goes only when
 // the user leaves the AD group).
 //
-// spec: with require_member_on_target, a member is added only if its entry
-// exists under users_base, Dolly-owned or local.
+// spec: the users to be added to a target group must exist on the target
+// (always on). A member without an entry under users_base is skipped and
+// re-evaluated on the next run.
 func (p *planner) desired(g *adGroup) (want []member, keep map[string]bool) {
 	keep = map[string]bool{}
 	for _, o := range p.groupMembers[g.obj.GUID] {
@@ -101,12 +81,9 @@ func (p *planner) desired(g *adGroup) (want []member, keep map[string]bool) {
 		}
 		dn := p.userDN(u)
 		uid := model.RDNValue(dn)
-		if p.cfg.Sync.RequireMemberOnTarget && !p.onTarget(dn, uid) {
-			p.missingOnTarget(dn, uid)
+		if !p.onTarget(dn, uid) {
+			p.missingMember(g.dn, dn, uid)
 			keep[model.MustDNKey(dn)] = true
-			continue
-		}
-		if p.notOnTarget(u, dn) {
 			continue
 		}
 		want = append(want, member{dn: dn, uid: uid})
@@ -122,8 +99,8 @@ type MemberCandidate struct {
 }
 
 // MemberCandidates returns every enabled AD user that a groups phase would
-// want as a member of a synced group, before the require_member_on_target
-// check, sorted by uid. A groups-only run doesn't read users_base (it may be
+// want as a member of a synced group, before the check that its entry
+// exists on the target, sorted by uid. A groups-only run doesn't read users_base (it may be
 // large and size-limited), so the command layer looks these uids up on the
 // target and passes what it finds in TargetSnapshot.ExistingUsers. Like
 // Build, it does no I/O.
@@ -161,13 +138,15 @@ func MemberCandidates(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *mod
 func (p *planner) syncGroup(g *adGroup) {
 	guid := g.obj.GUID
 	key := model.MustDNKey(g.dn)
-	want, keep := p.desired(g)
 	rec := p.groupRecs[guid]
+	// desired runs only for a group that is synced, not for a conflict, so
+	// members of a skipped group aren't listed as missing.
 	if rec == nil {
 		if e := p.groupEntries[key]; e != nil {
 			p.groupConflict(e, guid)
 			return
 		}
+		want, _ := p.desired(g)
 		p.createGroup(g, nil, want, "new AD group")
 		return
 	}
@@ -202,6 +181,7 @@ func (p *planner) syncGroup(g *adGroup) {
 		}
 		p.updateRecord(rec, "rename complete", func(r *model.Record) { r.DelNote(model.NoteRenamingFrom) })
 	}
+	want, keep := p.desired(g)
 	if cur == nil {
 		p.createGroup(g, rec, want, "Dolly-owned group is missing on the target; re-creating it")
 		return

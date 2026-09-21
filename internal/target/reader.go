@@ -122,8 +122,7 @@ func (r *Reader) LookupUsers(ctx context.Context, uids []string) (*model.UserSet
 		for _, k := range keys[i:min(i+lookupChunk, len(keys))] {
 			chunk = append(chunk, uniq[k])
 		}
-		req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, uidFilter(chunk), []string{"uid"}, nil)
-		res, err := ldapconn.Search(ctx, r.conn, req)
+		res, err := ldapconn.Search(ctx, r.conn, lookupRequest(base, chunk))
 		switch {
 		case err != nil && ldapconn.IsNoSuchObject(err):
 			return nil, fmt.Errorf("target %s: users_base %s does not exist", r.URL, base)
@@ -135,6 +134,16 @@ func (r *Reader) LookupUsers(ctx context.Context, uids []string) (*model.UserSet
 		}
 	}
 	return set, nil
+}
+
+// lookupRequest is one existence lookup: a subtree search under base that
+// filters only on uid and requests only uid.
+//
+// spec: group members must exist on the target, but neither side needs
+// uidNumber, so the filter never mentions objectClass=posixAccount or
+// uidNumber: any entry with the uid counts.
+func lookupRequest(base string, uids []string) *ldap.SearchRequest {
+	return ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, uidFilter(uids), []string{"uid"}, nil)
 }
 
 // uidFilter returns (|(uid=a)(uid=b)...) with each value escaped.

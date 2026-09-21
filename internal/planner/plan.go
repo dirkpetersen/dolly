@@ -85,12 +85,20 @@ const (
 	WarnDuplicate   WarningKind = "duplicate"    // duplicate uid/cn in AD, first one wins
 	WarnDuplicateID WarningKind = "duplicate-id" // duplicate uidNumber/gidNumber
 	WarnIDChanged   WarningKind = "id-changed"   // uidNumber/gidNumber changed
-	WarnPending     WarningKind = "pending"      // groupOfNames group without members, or a user not yet on the target
+	WarnPending     WarningKind = "pending"      // groupOfNames group without members
 	WarnInvalid     WarningKind = "invalid"      // mapping failed for an entry
-	// WarnMissingOnTarget: an AD group member with no entry under
-	// users_base, not added (sync.require_member_on_target).
-	WarnMissingOnTarget WarningKind = "missing-on-target"
 )
+
+// MissingMember is an AD group member that wasn't added to a target group
+// because it has no entry on the target. It is debug-level information,
+// not a warning: the summary shows only the count, and --debug lists them.
+// The member is checked again on every run and added once its entry exists.
+type MissingMember struct {
+	Group string // target group DN
+	UID   string // the member's uid
+	DN    string // the member's target DN
+	Why   string // e.g. "no entry on the target under ou=people,dc=local"
+}
 
 // Warning is one line in the run summary. Warnings don't stop the run.
 type Warning struct {
@@ -133,8 +141,11 @@ type Plan struct {
 	Groups   bool   // groups were planned
 	Ops      []Op
 	Warnings []Warning
-	Counts   Counts
-	Guard    Guard
+	// MissingMembers are the (group, member) pairs skipped because the
+	// member has no entry on the target, sorted by group, then uid.
+	MissingMembers []MissingMember
+	Counts         Counts
+	Guard          Guard
 	// ADUsersRead and TargetUsersRead say whether the AD users base and the
 	// target's users_base were read in full. A groups-only run reads
 	// neither: it fetches AD members by DN and looks up the uids it needs.

@@ -117,9 +117,12 @@ type Sync struct {
 	LockTTL          Duration `yaml:"lock_ttl"`
 	RunTimeout       Duration `yaml:"run_timeout"`
 	NetworkTimeout   Duration `yaml:"network_timeout"`
-	// RequireMemberOnTarget adds an AD user to a target group only if an
-	// entry with its uid exists under users_base. Defaults to true.
-	RequireMemberOnTarget bool `yaml:"require_member_on_target"`
+}
+
+// removedKeys explains config keys that no longer exist, so the unknown-key
+// error says what to do instead of just "not found".
+var removedKeys = map[string]string{
+	"require_member_on_target": "sync.require_member_on_target was removed: a member is now always added to a target group only if its entry exists under users_base; delete the line",
 }
 
 // Notify configures email notifications. An empty SMTPHost disables them.
@@ -185,16 +188,14 @@ func Load(path string) (*Config, error) {
 // Parse decodes and validates config data. path is the config file's
 // absolute path, used to resolve relative paths; it is not read.
 func Parse(data []byte, path string) (*Config, error) {
-	// Defaults for booleans whose zero value isn't the default are set
-	// before decoding; yaml.v3 leaves fields absent from the file untouched.
-	c := &Config{Path: path, Sync: Sync{RequireMemberOnTarget: true}}
+	c := &Config{Path: path}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(c); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("%s: config is empty", path)
 		}
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, fmt.Errorf("%s: %w", path, explainRemoved(err))
 	}
 	c.applyDefaults()
 	c.resolvePaths()
@@ -202,6 +203,27 @@ func Parse(data []byte, path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: invalid config:\n%w", path, err)
 	}
 	return c, nil
+}
+
+// explainRemoved rewrites yaml.v3's unknown-field errors for removed keys.
+func explainRemoved(err error) error {
+	var te *yaml.TypeError
+	if !errors.As(err, &te) {
+		return err
+	}
+	changed := false
+	for i, msg := range te.Errors {
+		for key, why := range removedKeys {
+			if strings.Contains(msg, "field "+key+" not found") {
+				te.Errors[i] = msg + ": " + why
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return err
+	}
+	return te
 }
 
 func (c *Config) applyDefaults() {

@@ -195,19 +195,20 @@ func TestFind(t *testing.T) {
 	}
 }
 
-func TestRequireMemberOnTargetDefault(t *testing.T) {
-	c, err := Parse(dolly.ConfigTemplate, "/x/dolly.yaml")
-	if err != nil || !c.Sync.RequireMemberOnTarget {
-		t.Fatalf("template: %v, %v", c.Sync.RequireMemberOnTarget, err)
+// sync.require_member_on_target was removed (the rule is always on). The
+// unknown-key error must say so instead of just "not found".
+func TestRemovedRequireMemberOnTarget(t *testing.T) {
+	for _, v := range []string{"true", "false"} {
+		_, err := Parse(edit(t, "  network_timeout: 30s ", "  require_member_on_target: "+v+"\n  network_timeout: 30s "), "/x/dolly.yaml")
+		if err == nil || !strings.Contains(err.Error(), "field require_member_on_target not found") ||
+			!strings.Contains(err.Error(), "was removed: a member is now always added to a target group only if its entry exists under users_base") {
+			t.Errorf("%s: err = %v", v, err)
+		}
 	}
-	line := "  require_member_on_target: true      # add a group member only if an entry with its uid exists under users_base\n"
-	c, err = Parse(edit(t, line, ""), "/x/dolly.yaml")
-	if err != nil || !c.Sync.RequireMemberOnTarget {
-		t.Errorf("omitted: %v, %v; want the default true", c.Sync.RequireMemberOnTarget, err)
-	}
-	c, err = Parse(edit(t, line, "  require_member_on_target: false\n"), "/x/dolly.yaml")
-	if err != nil || c.Sync.RequireMemberOnTarget {
-		t.Errorf("false: %v, %v", c.Sync.RequireMemberOnTarget, err)
+	// Other unknown keys keep yaml.v3's plain message.
+	_, err := Parse(edit(t, "  network_timeout: 30s ", "  bogus: 1\n  network_timeout: 30s "), "/x/dolly.yaml")
+	if err == nil || !strings.Contains(err.Error(), "field bogus not found") || strings.Contains(err.Error(), "removed") {
+		t.Errorf("bogus: err = %v", err)
 	}
 }
 

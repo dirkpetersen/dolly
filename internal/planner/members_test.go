@@ -118,63 +118,140 @@ func TestRuleRelaxedMemberRequirements(t *testing.T) {
 	})
 }
 
-// Rule (sync.require_member_on_target, default on): a member is added only
-// if an entry with its uid exists under users_base, Dolly-owned or local.
-// Otherwise it is skipped and listed once per run as missing-on-target.
-func TestRequireMemberOnTarget(t *testing.T) {
+// Rule (always on): the users to be added to a target group must exist on
+// the target. A member is added only if an entry for it exists under
+// users_base, Dolly-owned or local: by uid with memberUid only, at the
+// member DN with member. Otherwise it is skipped: not a warning, only a
+// summary count and a --debug line per (group, uid) pair.
+func TestRuleMembersMustExistOnTarget(t *testing.T) {
 	jdoe, bob := noNumbers(1, "jdoe"), noNumbers(2, "bob")
 	ad := []*model.ADObject{jdoe, bob, mkGroup(10, "hpc", jdoe.DN, bob.DN), mkGroup(11, "lab", bob.DN)}
-	localJdoe := &model.Entry{DN: udn("jdoe"), Attrs: map[string][]string{"objectClass": {"account", "posixAccount"}, "uid": {"jdoe"}}}
+	localJdoe := localUID(udn("jdoe"), "jdoe")
 
-	t.Run("on, memberUid", func(t *testing.T) {
+	t.Run("memberUid", func(t *testing.T) {
 		p := build(t, cfg(t, uidOnly), world{ad: ad, target: []*model.Entry{localJdoe}}, Options{Groups: true})
 		wantOps(t, p,
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("jdoe"),
 			"add-entry "+gdn("hpc")+" memberUid=jdoe",
 			"add-record rec:b seeAlso="+gdn("lab"),
 			"add-entry "+gdn("lab"))
-		if w := warnings(p, WarnMissingOnTarget); len(w) != 1 || !strings.HasPrefix(w[0], "bob: no entry with this uid") {
-			t.Errorf("missing-on-target = %v, want bob once", w)
+		// One entry per (group, uid) pair, sorted by group, then uid.
+		wantMissing(t, p,
+			"bob in "+gdn("hpc")+": no entry on the target under "+people,
+			"bob in "+gdn("lab")+": no entry on the target under "+people)
+		if len(p.Warnings) != 0 {
+			t.Errorf("skipped members must not be warnings: %v", p.Warnings)
 		}
 	})
-	t.Run("on, member DN must exist", func(t *testing.T) {
+	t.Run("member DN must exist", func(t *testing.T) {
 		// An entry with uid bob exists, but not at the member DN.
-		elsewhere := &model.Entry{DN: "uid=bob,ou=staff," + people, Attrs: map[string][]string{"uid": {"bob"}}}
+		elsewhere := localUID("uid=bob,ou=staff,"+people, "bob")
 		p := build(t, cfg(t), world{ad: ad, target: []*model.Entry{localJdoe, elsewhere}}, Options{Groups: true})
 		wantOps(t, p,
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("jdoe"),
 			"add-entry "+gdn("hpc")+" member="+udn("jdoe")+" memberUid=jdoe")
-		wantWarning(t, p, WarnMissingOnTarget, udn("bob")+": no entry at this DN")
+		wantMissing(t, p,
+			"bob in "+gdn("hpc")+": no entry on the target at "+udn("bob"),
+			"bob in "+gdn("lab")+": no entry on the target at "+udn("bob"))
 		wantWarning(t, p, WarnPending, gdn("lab")+": AD group has no resolvable members")
-	})
-	t.Run("off", func(t *testing.T) {
-		p := build(t, cfg(t, uidOnly, lax), world{ad: ad}, Options{Groups: true})
-		wantOps(t, p,
-			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("bob")+"|"+udn("jdoe"),
-			"add-entry "+gdn("hpc")+" memberUid=bob|jdoe",
-			"add-record rec:b seeAlso="+gdn("lab")+" roleOccupant="+udn("bob"),
-			"add-entry "+gdn("lab")+" memberUid=bob")
-		if len(warnings(p, WarnMissingOnTarget)) != 0 {
-			t.Errorf("off must not check: %v", p.Warnings)
-		}
 	})
 	t.Run("entries created in the same run count", func(t *testing.T) {
 		a, b := mkUser(1, "jdoe"), mkUser(2, "bob")
 		p := build(t, cfg(t), world{ad: []*model.ADObject{a, b, mkGroup(10, "hpc", a.DN, b.DN)}}, both)
 		index(t, p, "add-entry "+gdn("hpc")+" member="+udn("bob")+"|"+udn("jdoe"))
-		if len(warnings(p, WarnMissingOnTarget)) != 0 {
-			t.Errorf("created users are on the target: %v", p.Warnings)
-		}
+		wantMissing(t, p)
 	})
 	t.Run("owned member whose entry vanished is kept, not re-added", func(t *testing.T) {
 		p := build(t, cfg(t, uidOnly), world{ad: ad, target: []*model.Entry{localJdoe,
 			tGroupUID(10, "hpc", "jdoe", "bob"), gRec(10, "hpc", "jdoe", "bob"), tGroupUID(11, "lab", "bob"), gRec(11, "lab", "bob")}}, Options{Groups: true})
 		wantOps(t, p)
-		wantWarning(t, p, WarnMissingOnTarget, "bob: ")
+		wantMissing(t, p,
+			"bob in "+gdn("hpc")+": no entry on the target under "+people,
+			"bob in "+gdn("lab")+": no entry on the target under "+people)
 		if p.Guard.MembershipRemovals != 0 {
 			t.Errorf("removals = %d", p.Guard.MembershipRemovals)
 		}
 	})
+	t.Run("owned member whose entry vanished and whose value was removed stays out", func(t *testing.T) {
+		// The record still names bob, but neither the value nor the entry is
+		// there: the value isn't restored while the entry is missing.
+		p := build(t, cfg(t, uidOnly), world{ad: ad, target: []*model.Entry{localJdoe,
+			tGroupUID(10, "hpc", "jdoe"), gRec(10, "hpc", "jdoe", "bob")}}, Options{Groups: true})
+		if hasOp(p, "add-member "+gdn("hpc")) || hasOp(p, "delete-member") || hasOp(p, "update-record rec:a") {
+			t.Errorf("unexpected ops:\n  %s", strings.Join(opStrs(p), "\n  "))
+		}
+	})
+}
+
+// Rule: a skipped member is re-evaluated on every run. Run 1 skips bob
+// because his entry doesn't exist; once someone creates it, run 2 adds him
+// and records ownership (record first).
+func TestRuleMissingMemberSelfHeals(t *testing.T) {
+	jdoe, bob := noNumbers(1, "jdoe"), noNumbers(2, "bob")
+	ad := []*model.ADObject{jdoe, bob, mkGroup(10, "hpc", jdoe.DN, bob.DN)}
+	for _, tc := range []struct {
+		name string
+		mod  func(*config.Config)
+		grp  func(uids ...string) *model.Entry
+		add  []string
+	}{
+		{"memberUid", uidOnly, func(u ...string) *model.Entry { return tGroupUID(10, "hpc", u...) },
+			[]string{"add-member " + gdn("hpc") + " memberUid=bob"}},
+		{"member", func(*config.Config) {}, func(u ...string) *model.Entry { return tGroup(10, "hpc", u...) },
+			[]string{"add-member " + gdn("hpc") + " member=" + udn("bob"), "add-member " + gdn("hpc") + " memberUid=bob"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Run 1: bob has no entry yet. The group already holds jdoe.
+			w := world{ad: ad, target: []*model.Entry{localUID(udn("jdoe"), "jdoe"), tc.grp("jdoe"), gRec(10, "hpc", "jdoe")}}
+			p, _ := buildGroupsOnly(t, cfg(t, tc.mod), w)
+			wantOps(t, p)
+			if len(p.MissingMembers) != 1 || p.MissingMembers[0].UID != "bob" {
+				t.Fatalf("run 1: missing = %v, want bob", missing(p))
+			}
+			// Run 2: bob's entry now exists (created by someone else).
+			w.target = append(w.target, localUID(udn("bob"), "bob"))
+			p, _ = buildGroupsOnly(t, cfg(t, tc.mod), w)
+			wantOps(t, p, append([]string{"update-record rec:a add roleOccupant=" + udn("bob")}, tc.add...)...)
+			wantMissing(t, p)
+		})
+	}
+}
+
+// Regression: a user pruned in a run must not be added back to its groups
+// in the same run. Pruning also removes the user's local memberships; if
+// the groups phase then re-added the user (still a valid member through its
+// uid), former local memberships would turn into Dolly-owned ones. The
+// pruned entry is deleted, so it isn't on the target and is skipped.
+func TestRulePrunedUserNotReAdded(t *testing.T) {
+	jdoe := noNumbers(1, "jdoe") // lost uidNumber: no user entry, but still a valid member
+	prune := func(c *config.Config) { c.Sync.PruneUsers = true; c.Sync.PruneAfterDays = 30 }
+	for _, tc := range []struct {
+		name string
+		mod  func(*config.Config)
+		grp  *model.Entry
+		del  []string
+	}{
+		{"member", prune, tGroup(10, "hpc", "jdoe", "local1"),
+			[]string{"delete-member " + gdn("hpc") + " member=" + udn("jdoe"), "delete-member " + gdn("hpc") + " memberUid=jdoe"}},
+		{"memberUid", func(c *config.Config) { uidOnly(c); prune(c) }, tGroupUID(10, "hpc", "jdoe", "local1"),
+			[]string{"delete-member " + gdn("hpc") + " memberUid=jdoe"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// jdoe is a local member of hpc (no roleOccupant), and has been
+			// gone as a user entry for longer than prune_after_days.
+			p := build(t, cfg(t, tc.mod), world{
+				ad:     []*model.ADObject{jdoe, mkGroup(10, "hpc", jdoe.DN)},
+				target: []*model.Entry{tUser(1, "jdoe"), uRec(1, "jdoe", "missing-since=2024-01-01T00:00:00Z"), tc.grp, gRec(10, "hpc")},
+			}, both)
+			wantOps(t, p, append(tc.del, "delete-entry "+udn("jdoe"), "delete-record rec:1")...)
+			if hasOp(p, "add-member") || hasOp(p, "update-record rec:a") {
+				t.Errorf("a pruned user must not be re-added or claimed:\n  %s", strings.Join(opStrs(p), "\n  "))
+			}
+			if len(p.MissingMembers) != 1 || p.MissingMembers[0].UID != "jdoe" {
+				t.Errorf("missing = %v, want jdoe", missing(p))
+			}
+		})
+	}
 }
 
 // A groups-only run reads neither the AD users base nor users_base: AD
@@ -197,7 +274,7 @@ func TestGroupsOnlyWithLookups(t *testing.T) {
 	wantOps(t, p,
 		"update-record rec:a add roleOccupant="+udn("jdoe"),
 		"add-member "+gdn("hpc")+" memberUid=jdoe")
-	wantWarning(t, p, WarnMissingOnTarget, "bob: no entry with this uid")
+	wantMissing(t, p, "bob in "+gdn("hpc")+": no entry on the target under "+people)
 	if p.ADUsersRead || p.TargetUsersRead || p.Counts.ADUsers != 0 || p.Counts.Followed != 3 {
 		t.Errorf("read flags %v %v, AD users %d, followed %d", p.ADUsersRead, p.TargetUsersRead, p.Counts.ADUsers, p.Counts.Followed)
 	}
@@ -230,11 +307,31 @@ func TestPrintGroupsOnlyHeader(t *testing.T) {
 	p, _ := buildGroupsOnly(t, cfg(t, uidOnly), world{ad: []*model.ADObject{jdoe, mkGroup(10, "hpc", jdoe.DN)}})
 	var b strings.Builder
 	p.Print(&b)
-	for _, want := range []string{"users base not read, 1 members fetched by DN", "Target: users_base not read", "missing-on-target jdoe"} {
+	for _, want := range []string{"users base not read, 1 members fetched by DN", "Target: users_base not read",
+		"  members skipped: 1 not on the target (use --debug to list them)\n"} {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("output lacks %q:\n%s", want, b.String())
 		}
 	}
+	if strings.Contains(b.String(), "Warnings") || strings.Contains(b.String(), "debug:") {
+		t.Errorf("a skipped member is no warning, and debug lines go only to PrintDebug:\n%s", b.String())
+	}
+	var d strings.Builder
+	p.PrintDebug(&d)
+	if want := "debug: skip jdoe in " + gdn("hpc") + ": no entry on the target under " + people + "\n"; d.String() != want {
+		t.Errorf("debug = %q, want %q", d.String(), want)
+	}
+
+	t.Run("count line omitted when zero", func(t *testing.T) {
+		p, _ := buildGroupsOnly(t, cfg(t, uidOnly), world{ad: []*model.ADObject{jdoe, mkGroup(10, "hpc", jdoe.DN)},
+			target: []*model.Entry{localUID(udn("jdoe"), "jdoe")}})
+		var b, d strings.Builder
+		p.Print(&b)
+		p.PrintDebug(&d)
+		if strings.Contains(b.String(), "  members skipped:") || d.Len() != 0 {
+			t.Errorf("no skipped members, yet:\n%s\n%s", b.String(), d.String())
+		}
+	})
 }
 
 // A member that exists in AD but matches neither search filter is skipped
@@ -249,11 +346,13 @@ func TestFilteredMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := cfg(t, uidOnly, lax)
+	c := cfg(t, uidOnly)
 	tgt, recs, err := model.Classify(containers(), model.Bases{Users: c.Target.UsersBase, Groups: c.Target.GroupsBase, State: c.Target.StateBase})
 	if err != nil {
 		t.Fatal(err)
 	}
+	tgt.ExistingUsers = model.NewUserSet()
+	tgt.ExistingUsers.Add(udn("jdoe"), "jdoe")
 	p, err := Build(snap, tgt, recs, c, Options{Groups: true, Now: now})
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +400,7 @@ func TestRuleIDRange(t *testing.T) {
 	child.DN = "CN=child," + adOther
 	hpc := mkGroup(10, "hpc", big.DN, child.DN)
 	p := build(t, cfg(t), world{ad: []*model.ADObject{big, ok, badGrp, child, hpc}}, both)
-	// big gets no user entry (so, with require_member_on_target, it isn't
+	// big gets no user entry (so, having no entry on the target, it isn't
 	// added to hpc either), badgid isn't created, and child isn't
 	// flattened, which leaves hpc without members for now.
 	wantOps(t, p,
@@ -318,7 +417,7 @@ func TestRuleIDRange(t *testing.T) {
 	t.Run("still a member with memberUid", func(t *testing.T) {
 		// A user whose uidNumber can't be written is still a valid member:
 		// memberUid doesn't carry the number.
-		p := build(t, cfg(t, uidOnly, lax), world{ad: []*model.ADObject{big, mkGroup(10, "hpc", big.DN)}}, Options{Groups: true})
+		p := build(t, cfg(t, uidOnly), world{ad: []*model.ADObject{big, mkGroup(10, "hpc", big.DN)}, target: []*model.Entry{localUID(udn("big"), "big")}}, Options{Groups: true})
 		wantOps(t, p,
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("big"),
 			"add-entry "+gdn("hpc")+" memberUid=big")
