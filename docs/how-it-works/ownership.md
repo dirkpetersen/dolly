@@ -10,12 +10,12 @@ ou=dolly,dc=local
 ├── ou=groups
 │   └── cn=<objectGUID>   objectClass: organizationalRole
 │                         seeAlso: cn=hpc-users,ou=group,dc=local
-│                         roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added)
+│                         roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added, always a DN)
 ├── cn=lock                                                              (only while a run is active)
 └── cn=status             last successful run, current failure, last notification
 ```
 
-Each record's RDN is `cn=<objectGUID>` — the AD object's `objectGUID`, formatted as a canonical hyphenated string (AD returns it as 16 mixed-endian bytes, so Dolly normalizes it once to a single consistent format). `seeAlso` points at the managed target entry. On group records, `roleOccupant` lists the members Dolly itself added to that group; `memberUid` ownership is derived from those DNs rather than tracked separately. User records also carry small `description` values in `key=value` form, such as `missing-since=2024-01-01` or a saved shell to restore later.
+Each record's RDN is `cn=<objectGUID>` — the AD object's `objectGUID`, formatted as a canonical hyphenated string (AD returns it as 16 mixed-endian bytes, so Dolly normalizes it once to a single consistent format). `seeAlso` points at the managed target entry. On group records, `roleOccupant` lists the members Dolly itself added to that group, always as a DN built as `<rdn>=<uid>,<users_base>` (for example `uid=jdoe,ou=people,dc=local`), even when the group's schema uses `memberUid` only; `memberUid` ownership is derived from those DNs rather than tracked separately. With `memberUid` only, that DN is just an identifier inside the ownership record — the user entry it points at doesn't have to exist on the target. User records also carry small `description` values in `key=value` form, such as `missing-since=2024-01-01` or a saved shell to restore later.
 
 Dolly creates `state_base` and its children if they're missing. It never creates `users_base` or `groups_base` — if those don't exist, it stops with a clear error.
 
@@ -24,6 +24,8 @@ Dolly creates `state_base` and its children if they're missing. It never creates
 - A user in the AD group but not in the target group is added to the target group and recorded as Dolly-owned.
 - A Dolly-owned member who left the AD group, or was deleted from AD, is removed from the target group and from the record.
 - Membership is never replaced wholesale. Dolly never computes "the target group's members = AD's list"; it adds and removes individual `member` and `memberUid` values, and only ever touches the attributes listed in the mapping.
+- With `member` in `mapping.groups.membership` (`groupOfNames`), a new AD group with no resolvable members isn't created until it has one. With `memberUid` only, `posixGroup` may be empty, so the group is created right away — see [Group schema](../configuration.md#group-schema-rfc2307bis-or-rfc-2307).
+- With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, so a groups-only run (`--groups`) never touches them.
 
 ## Local wins
 
@@ -65,7 +67,9 @@ Attributes listed in `mapping.users.create_only` (by default `loginShell` and `h
 
 ## Empty group placeholder
 
-`groupOfNames` requires at least one `member`. A new AD group with no resolvable members isn't created on the target until it has one. If removing Dolly-owned members would leave an existing target group with none at all, Dolly adds `target.empty_group_member` as a placeholder instead of violating the schema, and removes the placeholder again once a real member exists.
+This only applies when `member` is in `mapping.groups.membership` (the rfc2307bis default). `groupOfNames` requires at least one `member`, so a new AD group with no resolvable members isn't created on the target until it has one, and if removing Dolly-owned members would leave an existing target group with none at all, Dolly adds `target.empty_group_member` as a placeholder instead of violating the schema, removing the placeholder again once a real member exists.
+
+With `memberUid` only (RFC 2307, structural `posixGroup`), none of this applies: `empty_group_member` isn't used, and groups may be empty and are created right away. See [Group schema](../configuration.md#group-schema-rfc2307bis-or-rfc-2307).
 
 ## Required attributes
 

@@ -113,7 +113,7 @@ target:
   users_base: ou=people,dc=local
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
-  empty_group_member: cn=empty,dc=local   # placeholder member for groups that would otherwise be empty
+  empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
 mapping:
   users:
@@ -131,14 +131,14 @@ mapping:
       gecos: gecos
   groups:
     rdn: cn
-    object_classes: [groupOfNames, posixGroup]
+    object_classes: [groupOfNames, posixGroup]   # RFC 2307 servers (structural posixGroup): [posixGroup] only
     required: [name, gidNumber]       # AD groups missing any of these are ignored, also when flattening
     attributes:
       cn: name
       gidNumber: gidNumber
     membership:
       - attribute: member             # full DN of the target user
-      - attribute: memberUid          # bare uid
+      - attribute: memberUid          # bare uid; RFC 2307 servers: list only this one
     flatten_nested: true
 
 sync:
@@ -166,6 +166,18 @@ notify:
 ```
 
 **Passwords.** Each password can be given inline (`bind_password`, `password`) or in a separate file (`bind_password_file`, `password_file`). Setting both to a non-empty value is a config error; an empty value counts as unset. If `dolly.yaml` contains an inline password, Dolly refuses to run unless the file is readable only by its owner (mode `0600` or stricter), the same way `ssh` treats private keys. `dolly.yaml` is git-ignored, so an inline password never ends up in the repository.
+
+**Group schema: rfc2307bis or RFC 2307.** The defaults assume rfc2307bis, where `posixGroup` is auxiliary and can be combined with `groupOfNames`, so members are written as both `member` DNs and `memberUid` values. Many older servers use RFC 2307 (`nis.schema`), where `posixGroup` is structural and can't be combined with `groupOfNames`. For those, configure `memberUid` only:
+
+```yaml
+mapping:
+  groups:
+    object_classes: [posixGroup]
+    membership:
+      - attribute: memberUid
+```
+
+To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, and `empty_group_member` isn't used.
 
 Attribute values are plain AD attribute names or Go templates. Dolly only writes the attributes listed in the mapping, so other attributes on an entry are left alone. To exclude users or groups, use the search `filter`, for example `(!(memberOf=CN=ExcludedFromLDAPSync,OU=Groups,DC=example,DC=edu))`.
 
@@ -220,7 +232,7 @@ ou=dolly,dc=local
 ├── ou=groups
 │   └── cn=<objectGUID>   objectClass: organizationalRole
 │                         seeAlso: cn=hpc-users,ou=group,dc=local
-│                         roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added)
+│                         roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added, always a DN)
 ├── cn=lock                                                              (only while a run is active)
 └── cn=status             last successful run, current failure, last notification
 ```
@@ -236,8 +248,9 @@ The rules:
 - A user or group renamed in AD (same `objectGUID`) is renamed in place, and its `member` and `memberUid` values are updated in every group.
 - A user who is gone from AD (deleted, moved out of scope, or missing a `required` attribute) loses all Dolly-owned memberships right away. The user entry is deleted only when `prune_users` is on and the user has been gone for `prune_after_days`. At that point Dolly also removes the user from groups where they were added locally, so no group points at a user that no longer exists.
 - A group deleted from AD loses its Dolly-owned members and its ownership record. The group itself stays.
-- A new AD group with no resolvable members isn't created until it has one, because `groupOfNames` needs at least one `member`.
-- If removing Dolly-owned members would leave a group with no members at all, Dolly adds the `empty_group_member` placeholder instead of breaking the `groupOfNames` schema. It removes the placeholder once the group has a real member again.
+- Ownership records always name members by DN in `roleOccupant`, built as `<rdn>=<uid>,<users_base>`, even when groups use `memberUid` only. With `memberUid` only, that DN is just an identifier, and the user entry doesn't have to exist on the target.
+- With `member` in the membership list (`groupOfNames`), a new AD group with no resolvable members isn't created until it has one, because `groupOfNames` needs at least one `member`. With `memberUid` only, `posixGroup` may be empty, so the group is created right away.
+- With `member` in the membership list, if removing Dolly-owned members would leave a group with no members at all, Dolly adds the `empty_group_member` placeholder instead of breaking the `groupOfNames` schema. It removes the placeholder once the group has a real member again.
 - A disabled AD account (`userAccountControl` bit `0x2`) keeps its user entry, but Dolly removes it from every group where it's Dolly-owned and sets `loginShell` to `disabled_shell`, because an SSH key would otherwise still work. Local memberships are untouched. When the account is re-enabled, Dolly restores the previous shell.
 - Attributes in `create_only` are written when Dolly creates the user and never again, so a shell or home directory changed on the LDAP server stays changed. `disabled_shell` is the one exception.
 - The AD primary group (`primaryGroupID`, usually Domain Users) is ignored, because AD doesn't list it in the group's `member` attribute.

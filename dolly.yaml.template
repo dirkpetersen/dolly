@@ -29,7 +29,7 @@ target:
   users_base: ou=people,dc=local
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
-  empty_group_member: cn=empty,dc=local   # placeholder member for groups that would otherwise be empty
+  empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
 mapping:
   users:
@@ -47,14 +47,14 @@ mapping:
       gecos: gecos
   groups:
     rdn: cn
-    object_classes: [groupOfNames, posixGroup]
+    object_classes: [groupOfNames, posixGroup]   # RFC 2307 servers (structural posixGroup): [posixGroup] only
     required: [name, gidNumber]       # AD groups missing any of these are ignored, also when flattening
     attributes:
       cn: name
       gidNumber: gidNumber
     membership:
       - attribute: member             # full DN of the target user
-      - attribute: memberUid          # bare uid
+      - attribute: memberUid          # bare uid; RFC 2307 servers: list only this one
     flatten_nested: true
 
 sync:

@@ -53,7 +53,7 @@ target:
   users_base: ou=people,dc=local
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
-  empty_group_member: cn=empty,dc=local   # placeholder member for groups that would otherwise be empty
+  empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
 mapping:
   users:
@@ -71,14 +71,14 @@ mapping:
       gecos: gecos
   groups:
     rdn: cn
-    object_classes: [groupOfNames, posixGroup]
+    object_classes: [groupOfNames, posixGroup]   # RFC 2307 servers (structural posixGroup): [posixGroup] only
     required: [name, gidNumber]       # AD groups missing any of these are ignored, also when flattening
     attributes:
       cn: name
       gidNumber: gidNumber
     membership:
       - attribute: member             # full DN of the target user
-      - attribute: memberUid          # bare uid
+      - attribute: memberUid          # bare uid; RFC 2307 servers: list only this one
     flatten_nested: true
 
 sync:
@@ -108,6 +108,20 @@ notify:
 ## Passwords
 
 Each password can be given inline (`bind_password`, `password`) or in a separate file (`bind_password_file`, `password_file`). Setting both to a non-empty value is a config error; an empty value counts as unset. If `dolly.yaml` contains an inline password, Dolly refuses to run unless the file is readable only by its owner (mode `0600` or stricter), the same way `ssh` treats private keys. `dolly.yaml` is git-ignored, so an inline password never ends up in the repository.
+
+## Group schema: rfc2307bis or RFC 2307
+
+The defaults assume rfc2307bis, where `posixGroup` is auxiliary and can be combined with `groupOfNames`, so members are written as both `member` DNs and `memberUid` values. Many older servers use RFC 2307 (`nis.schema`), where `posixGroup` is structural and can't be combined with `groupOfNames`. For those, configure `memberUid` only:
+
+```yaml
+mapping:
+  groups:
+    object_classes: [posixGroup]
+    membership:
+      - attribute: memberUid
+```
+
+To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, and `empty_group_member` isn't used.
 
 ## `source`
 
@@ -141,7 +155,7 @@ Connection settings and base DNs for the target LDAP server. Dolly reads and wri
 | `users_base` | `ou=people,dc=local` | Where user entries live. Dolly never creates this container. |
 | `groups_base` | `ou=group,dc=local` | Where group entries live. Dolly never creates this container. |
 | `state_base` | `ou=dolly,dc=local` | Where Dolly's ownership records, run lock, and status entry live. Dolly creates this container and its children if missing. See [Ownership](how-it-works/ownership.md). |
-| `empty_group_member` | `cn=empty,dc=local` | Placeholder member DN used so a group never violates `groupOfNames` by having zero members. |
+| `empty_group_member` | `cn=empty,dc=local` | Placeholder member DN used so a `groupOfNames` group never has zero members. Only used when `member` is in `mapping.groups.membership`; unused with `memberUid` only. See [Group schema](#group-schema-rfc2307bis-or-rfc-2307). |
 
 ## `mapping`
 
@@ -168,11 +182,11 @@ How AD attributes become target entries. Attribute values are plain AD attribute
 | Key | Default / example | Meaning |
 |---|---|---|
 | `rdn` | `cn` | The attribute used as the RDN for group entries, sourced from AD's `name`. |
-| `object_classes` | `[groupOfNames, posixGroup]` | rfc2307bis-style schema: `groupOfNames` for `member`, `posixGroup` for `memberUid`. |
+| `object_classes` | `[groupOfNames, posixGroup]` | rfc2307bis-style schema: `groupOfNames` for `member`, auxiliary `posixGroup` for `memberUid`. RFC 2307 servers use `[posixGroup]` alone (structural). See [Group schema](#group-schema-rfc2307bis-or-rfc-2307). |
 | `required` | `[name, gidNumber]` | AD groups missing either are ignored everywhere, including when flattening nested groups. |
 | `attributes.cn` | `name` | |
 | `attributes.gidNumber` | `gidNumber` | |
-| `membership` | `[{attribute: member}, {attribute: memberUid}]` | Both attributes are maintained: `member` as the full target user DN, `memberUid` as the bare `uid`. Values are sorted for stable comparison. |
+| `membership` | `[{attribute: member}, {attribute: memberUid}]` | Both attributes are maintained: `member` as the full target user DN, `memberUid` as the bare `uid`. Values are sorted for stable comparison. RFC 2307 servers list only `memberUid`. |
 | `flatten_nested` | `true` | Members of child (nested) groups are added recursively to the parent, with cycle protection. |
 
 ## `sync`
