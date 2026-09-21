@@ -55,25 +55,28 @@ Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/
 # Install
 go install github.com/dirkpetersen/dolly/cmd/dolly@latest
 
-# Create a config
-cp dolly.yaml.template dolly.yaml   # dolly.yaml is git-ignored; it may hold secrets
-$EDITOR dolly.yaml
+# Self-install for the current (unprivileged) user: binary, config, systemd --user units
+dolly install
+$EDITOR ~/.config/dolly/dolly.yaml
 
 # See what would happen
-dolly sync --config dolly.yaml --dry-run
+dolly sync --dry-run
 
-# Do it for real
-dolly sync --config dolly.yaml
+# Do it for real, then let the timer take over
+dolly sync
+systemctl --user enable --now dolly.timer
 ```
+
+Dolly runs as a regular user by default and needs no root.
 
 ## Configuration
 
 ```yaml
 source:
   url: ldaps://dc01.example.edu:636
-  ca_file: /etc/dolly/ad-ca.pem       # optional, see "TLS certificates"
+  ca_file: ad-ca.pem                   # optional, see "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu
-  bind_password_file: /etc/dolly/ad.secret
+  bind_password_file: ad.secret         # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
     filter: (&(objectClass=user)(objectCategory=person))
@@ -85,9 +88,9 @@ source:
 target:
   url: ldap://ldap.example.edu:389
   start_tls: true
-  ca_file: /etc/dolly/ldap-ca.pem     # optional, see "TLS certificates"
+  ca_file: ldap-ca.pem                 # optional, see "TLS certificates"
   bind_dn: cn=dolly,dc=example,dc=edu
-  bind_password_file: /etc/dolly/ldap.secret
+  bind_password_file: ldap.secret
   users_base: ou=people,dc=example,dc=edu
   groups_base: ou=groups,dc=example,dc=edu
 
@@ -120,10 +123,24 @@ sync:
   disabled_accounts: skip           # skip | include | lock
   prune: false                      # delete Dolly-managed target entries missing from AD
                                     # (group members removed in AD are always removed)
-  state_file: /var/lib/dolly/state.json
+  # state_file: ~/.local/state/dolly/state.json   # default: $XDG_STATE_HOME/dolly/state.json
 ```
 
-Attribute values can be plain AD attribute names or Go templates for derived values.
+Attribute values can be plain AD attribute names or Go templates for derived values. Relative paths (`ca_file`, `bind_password_file`, `state_file`) resolve against the config file's directory.
+
+### File locations (XDG)
+
+| What | Default path |
+|---|---|
+| Binary | `~/.local/bin/dolly` |
+| Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`) |
+| Secrets and CA files | next to the config, mode `0600` |
+| State (high-water mark, owned entries and members) | `$XDG_STATE_HOME/dolly/state.json` (`~/.local/state/dolly/`) |
+| Lock file | `$XDG_RUNTIME_DIR/dolly.lock` |
+| systemd units | `$XDG_CONFIG_HOME/systemd/user/dolly.{service,timer}` |
+| Logs | journald (`journalctl --user -u dolly`) |
+
+Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dolly/dolly.yaml`.
 
 ## Commands
 
@@ -136,6 +153,8 @@ Attribute values can be plain AD attribute names or Go templates for derived val
 | `dolly sync --dry-run` | Prints planned adds, modifies, and deletes without writing |
 | `dolly diff` | Compares source and target and reports differences |
 | `dolly check` | Tests connectivity, binds, and search scopes |
+| `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units |
+| `dolly uninstall` | Removes the units and binary, and keeps config and state |
 | `dolly version` | Prints the version |
 
 ## How it works
@@ -149,15 +168,17 @@ Attribute values can be plain AD attribute names or Go templates for derived val
 
 ## Running it on a schedule
 
-**systemd timer**
+**systemd user timer (default)**
+
+`dolly install` writes these units, so you normally don't create them by hand:
 
 ```ini
-# /etc/systemd/system/dolly.service
+# ~/.config/systemd/user/dolly.service
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/dolly sync --config /etc/dolly/dolly.yaml
+ExecStart=%h/.local/bin/dolly sync
 
-# /etc/systemd/system/dolly.timer
+# ~/.config/systemd/user/dolly.timer
 [Timer]
 OnCalendar=*:0/15
 Persistent=true
@@ -166,11 +187,16 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+```bash
+systemctl --user enable --now dolly.timer
+loginctl enable-linger "$USER"   # keep the timer running while you're logged out (may need an admin)
+```
+
 **Container**
 
 ```bash
-docker run --rm -v /etc/dolly:/etc/dolly:ro -v dolly-state:/var/lib/dolly \
-  ghcr.io/<your-org>/dolly sync --config /etc/dolly/dolly.yaml
+docker run --rm -v ~/.config/dolly:/config:ro -v dolly-state:/state -e XDG_STATE_HOME=/state \
+  ghcr.io/<your-org>/dolly sync --config /config/dolly.yaml
 ```
 
 A nightly `dolly sync --full` alongside frequent incremental runs is a good default, because it catches deletions and anything the incremental pass missed.
@@ -181,9 +207,9 @@ If the TLS handshake fails because the server's CA isn't trusted locally (common
 
 ```bash
 openssl s_client -connect dc01.example.edu:636 -showcerts </dev/null 2>/dev/null \
-  | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > /etc/dolly/ad-ca.pem
+  | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > ~/.config/dolly/ad-ca.pem
 # For StartTLS on 389: openssl s_client -connect ldap.example.edu:389 -starttls ldap -showcerts
-openssl x509 -in /etc/dolly/ad-ca.pem -noout -subject -issuer -fingerprint -sha256
+openssl x509 -in ~/.config/dolly/ad-ca.pem -noout -subject -issuer -fingerprint -sha256
 ```
 
 Check the fingerprint against a trusted source before relying on it. Dolly never silently disables certificate verification.

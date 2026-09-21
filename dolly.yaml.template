@@ -1,11 +1,12 @@
 # Dolly configuration template.
-# Copy to dolly.yaml (git-ignored) and edit. Never commit dolly.yaml.
+# `dolly install` copies this to ~/.config/dolly/dolly.yaml ($XDG_CONFIG_HOME).
+# A ./dolly.yaml in the working directory also works; it is git-ignored. Never commit it.
 
 source:
   url: ldaps://dc01.example.edu:636
-  ca_file: /etc/dolly/ad-ca.pem       # optional; see README "TLS certificates"
+  ca_file: ad-ca.pem                   # optional; see README "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu
-  bind_password_file: /etc/dolly/ad.secret
+  bind_password_file: ad.secret         # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
     filter: (&(objectClass=user)(objectCategory=person))
@@ -17,9 +18,9 @@ source:
 target:
   url: ldap://ldap.example.edu:389
   start_tls: true
-  ca_file: /etc/dolly/ldap-ca.pem     # optional; see README "TLS certificates"
+  ca_file: ldap-ca.pem                 # optional; see README "TLS certificates"
   bind_dn: cn=dolly,dc=example,dc=edu
-  bind_password_file: /etc/dolly/ldap.secret
+  bind_password_file: ldap.secret
   users_base: ou=people,dc=example,dc=edu
   groups_base: ou=groups,dc=example,dc=edu
 
@@ -52,4 +53,4 @@ sync:
   disabled_accounts: skip           # skip | include | lock
   prune: false                      # delete Dolly-managed target entries missing from AD
                                     # (group members removed in AD are always removed)
-  state_file: /var/lib/dolly/state.json
+  # state_file: ~/.local/state/dolly/state.json   # default: $XDG_STATE_HOME/dolly/state.json
