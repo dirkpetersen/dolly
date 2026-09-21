@@ -123,6 +123,19 @@ mapping:
 
 To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, and `empty_group_member` isn't used.
 
+## Config validation
+
+Dolly validates `dolly.yaml` before connecting to anything:
+
+- Unknown keys are a config error.
+- `mapping.users.required` and `mapping.groups.required` must each include at least the spec's minimum attributes (`uid`, `uidNumber`, `gidNumber` for users; `name`, `gidNumber` for groups).
+- `mapping.users.rdn` must map to the same value as `uid`.
+- Every `create_only` entry must also be a mapped attribute.
+- An empty `notify.smtp_host` disables notifications.
+- `source.page_size` defaults to `500` if omitted.
+- Listing `member` in `mapping.groups.membership` requires `target.empty_group_member` to be set.
+- `target.users_base` and `target.groups_base` must differ, since Dolly tells users from groups by their container.
+
 ## `source`
 
 Connection and search settings for Active Directory. Dolly only ever reads from this side.

@@ -1,0 +1,36 @@
+# Fixture for `dolly sync --dry-run --fixture` tests. Bases match dolly.yaml.template.
+now: 2024-06-01T00:00:00Z
+ad:
+  users:
+    - guid: 00000000-0000-0000-0000-000000000001
+      dn: CN=Doe\, Jane,OU=People,DC=example,DC=edu
+      attrs: {uid: [jdoe], uidNumber: ["1001"], gidNumber: ["100"], gecos: [Jane Doé]}
+      userAccountControl: 512
+    - guid: 00000000-0000-0000-0000-000000000002
+      dn: CN=Smith\, Al,OU=People,DC=example,DC=edu
+      attrs: {uid: [asmith], uidNumber: ["1002"], gidNumber: ["100"], loginShell: [/bin/zsh]}
+      userAccountControl: 514
+    - guid: 00000000-0000-0000-0000-000000000003
+      dn: CN=No Gid,OU=People,DC=example,DC=edu
+      attrs: {uid: [nogid], uidNumber: ["1003"]}
+  groups:
+    - guid: 00000000-0000-0000-0000-0000000000a1
+      dn: CN=hpc-users,OU=Groups,DC=example,DC=edu
+      attrs: {name: [hpc-users], gidNumber: ["5000"]}
+      members:
+        - CN=Doe\, Jane,OU=People,DC=example,DC=edu
+        - CN=Smith\, Al,OU=People,DC=example,DC=edu
+        - CN=ws01,OU=Computers,DC=example,DC=edu
+target:
+  entries:
+    - dn: ou=people,dc=local
+      attrs: {objectClass: [organizationalUnit], ou: [people]}
+    - dn: ou=group,dc=local
+      attrs: {objectClass: [organizationalUnit], ou: [group]}
+    - dn: cn=hpc-users,ou=group,dc=local
+      attrs:
+        objectClass: [groupOfNames, posixGroup]
+        cn: [hpc-users]
+        gidNumber: ["5000"]
+        member: [uid=local1,ou=people,dc=local]
+        memberUid: [local1]

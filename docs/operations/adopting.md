@@ -14,6 +14,8 @@ A tree written by ad2openldap (or created by hand) has no ownership records unde
 - creates an ownership record for that entry, and
 - for each group, marks the members that are also currently in the AD group as Dolly-owned, and treats every other existing member as local.
 
+Adopt claims every AD user that has a `uid` — even one missing `uidNumber` or `gidNumber` — rather than applying the full [required-attributes](../how-it-works/ownership.md#required-attributes) check that `sync` uses. That way, the following `dolly sync` can treat those users as gone (removing their memberships, and pruning them if `sync.prune_users` is on) instead of never claiming them in the first place. Groups still need to pass their own required-attribute check (`name` and `gidNumber`) to be adopted. Adopt flattens through every child group exactly as `sync` does, and counts disabled AD accounts (`userAccountControl` bit `0x2`) as members when deciding which existing target members are Dolly-owned.
+
 After adoption, `dolly sync` behaves normally: it only adds and removes membership it manages, and leaves everything marked local alone. See [Ownership](../how-it-works/ownership.md) for the full rule set adoption sets up.
 
 Always review `dolly adopt --dry-run` before running it for real — adoption only happens once, and the decisions it makes (Dolly-owned vs. local) are hard to undo cleanly afterward.
@@ -24,7 +26,7 @@ If a user was removed from an AD group shortly before you run `dolly adopt`, tha
 
 ## Caveat: users without `gidNumber` are now ignored
 
-This is an intended behavior change from ad2openldap, not a bug. The old tool defaulted a missing `gidNumber` to `65534`. Dolly has no such default: users without `gidNumber` — and any member that only arrived through a child group whose own `gidNumber` is missing — are ignored entirely, per the [required attributes](../how-it-works/ownership.md#required-attributes) rule.
+This is an intended behavior change from ad2openldap, not a bug. The old tool defaulted a missing `gidNumber` to `65534`. Dolly has no such default: users without `gidNumber` — and any member that only arrived through a child group whose own `gidNumber` is missing — are ignored entirely by `sync`, per the [required attributes](../how-it-works/ownership.md#required-attributes) rule. `dolly adopt` itself still claims these users, as described above, so they get ownership records before their first sync drops their memberships.
 
 `dolly adopt --dry-run` lists these entries. On the first real sync:
 

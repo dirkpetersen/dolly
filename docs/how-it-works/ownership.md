@@ -15,7 +15,11 @@ ou=dolly,dc=local
 └── cn=status             last successful run, current failure, last notification
 ```
 
-Each record's RDN is `cn=<objectGUID>` — the AD object's `objectGUID`, formatted as a canonical hyphenated string (AD returns it as 16 mixed-endian bytes, so Dolly normalizes it once to a single consistent format). `seeAlso` points at the managed target entry. On group records, `roleOccupant` lists the members Dolly itself added to that group, always as a DN built as `<rdn>=<uid>,<users_base>` (for example `uid=jdoe,ou=people,dc=local`), even when the group's schema uses `memberUid` only; `memberUid` ownership is derived from those DNs rather than tracked separately. With `memberUid` only, that DN is just an identifier inside the ownership record — the user entry it points at doesn't have to exist on the target. User records also carry small `description` values in `key=value` form, such as `missing-since=2024-01-01` or a saved shell to restore later.
+Each record's RDN is `cn=<objectGUID>` — the AD object's `objectGUID`, formatted as a canonical hyphenated string (AD returns it as 16 mixed-endian bytes, so Dolly normalizes it once to a single consistent format). `seeAlso` points at the managed target entry. On group records, `roleOccupant` lists the members Dolly itself added to that group, always as a DN built as `<rdn>=<uid>,<users_base>` (for example `uid=jdoe,ou=people,dc=local`), even when the group's schema uses `memberUid` only; `memberUid` ownership is derived from those DNs rather than tracked separately. With `memberUid` only, that DN is just an identifier inside the ownership record — the user entry it points at doesn't have to exist on the target. User records also carry small `description` values in `key=value` form:
+
+- `missing-since` — an RFC 3339 UTC timestamp (for example `missing-since=2026-09-21T19:00:00Z`) recording when a user went missing from AD.
+- `saved-shell` — the shell to restore after a disabled account is re-enabled.
+- `renaming-from=<old DN>` — present only while a rename is in progress; see [Renames](#renames).
 
 Dolly creates `state_base` and its children if they're missing. It never creates `users_base` or `groups_base` — if those don't exist, it stops with a clear error.
 
@@ -26,6 +30,7 @@ Dolly creates `state_base` and its children if they're missing. It never creates
 - Membership is never replaced wholesale. Dolly never computes "the target group's members = AD's list"; it adds and removes individual `member` and `memberUid` values, and only ever touches the attributes listed in the mapping.
 - With `member` in `mapping.groups.membership` (`groupOfNames`), a new AD group with no resolvable members isn't created until it has one. With `memberUid` only, `posixGroup` may be empty, so the group is created right away — see [Group schema](../configuration.md#group-schema-rfc2307bis-or-rfc-2307).
 - With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, so a groups-only run (`--groups`) never touches them.
+- In a `--groups` run, a member's target DN is read from the user's own ownership record (`seeAlso`), not recomputed from a fresh AD-to-target mapping. A user rename that's still pending (its own `--users` sync hasn't run yet) therefore causes no group churn — the group keeps pointing at the DN the record already has. With `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it. With `memberUid` only, no user entry is needed.
 
 ## Local wins
 
@@ -33,13 +38,26 @@ A member already present in a target group without an ownership record was added
 
 ## Conflicts
 
-A target user or group that matches an AD entry by name (`uid` or `cn`) but has no ownership record is a conflict: something with that name already existed on the target before Dolly touched it, or was created outside Dolly. Dolly logs an error and skips it rather than guessing. `dolly adopt`, run once, is the only thing that claims existing unowned entries — see [Adopting an existing tree](../operations/adopting.md).
+A target user or group that matches an AD entry by name (`uid` or `cn`) but has no ownership record is a conflict: something with that name already existed on the target before Dolly touched it, or was created outside Dolly. Dolly logs an error and leaves the entry untouched rather than guessing. A conflicting user is still eligible to be a group member by DN — group membership doesn't require an owned user entry — so it can appear in `member`/`roleOccupant` lists even though its own entry is left alone. `dolly adopt`, run once, is the only thing that claims existing unowned entries — see [Adopting an existing tree](../operations/adopting.md).
+
+## Duplicate uid
+
+When two AD users map to the same `uid`, Dolly picks one winner and logs the other as a warning. The order of preference:
+
+1. the current owner — an existing ownership record already points at this AD user;
+2. failing that, any AD user with an ownership record;
+3. failing that, an in-scope AD user;
+4. failing that, the one with the lowest DN.
 
 ## Renames
 
 Identity is `objectGUID`, not name. A user or group renamed in AD (same `objectGUID`, different name) becomes a `modrdn` on the target, followed by updating every `member` and `memberUid` value that referenced the old DN, and the `seeAlso` and `roleOccupant` values in its own and any group's ownership records.
 
-If a rename would collide with an entry that already exists at the new name, that's a conflict: Dolly logs it and skips the rename.
+This happens in a crash-safe order: the ownership record is updated first, adding a `renaming-from=<old DN>` note; only then does Dolly perform the `modrdn` and the `member`/`memberUid`/`seeAlso`/`roleOccupant` fix-ups; the note is removed last. If Dolly crashes mid-rename, the note alone is enough to resume or recover on the next run.
+
+Renames happen in place — Dolly never moves an entry to a different parent under the target tree. An owned entry that turns up somewhere other than directly under its configured base (`users_base` or `groups_base`) is reported as a conflict, not moved.
+
+If a rename would collide with an entry that already exists at the new name, that's also a conflict: Dolly logs it and skips the rename.
 
 ## Deleted and pruned users
 
@@ -51,7 +69,9 @@ A disabled AD account (`userAccountControl` bit `0x2`) keeps its target entry. D
 
 - removes it from every group where it's Dolly-owned (local memberships are untouched),
 - sets `loginShell` to `sync.disabled_shell` — this overrides `create_only` protection, because an SSH key would otherwise still let the account in,
-- saves the previous shell in the user's ownership record, and restores it when the account is re-enabled.
+- saves the previous shell in the user's ownership record as `saved-shell`, and restores it when the account is re-enabled — but only if `loginShell` is still `disabled_shell` at that point. If an admin changed the shell directly while the account was disabled, the admin's value stays and the `saved-shell` note is dropped instead of being applied.
+
+A user who is already disabled the first time Dolly creates their entry is created with `disabled_shell` right away, and their mapped shell (what the mapping would otherwise have written) is saved as `saved-shell` for a later re-enable.
 
 ## Groups are never deleted
 
@@ -94,7 +114,7 @@ Duplicate `uidNumber` or `gidNumber` values — between AD entries, or against a
 
 ## ASCII-only attributes
 
-Attributes with IA5String syntax, such as `gecos`, must be ASCII. Values are transliterated to ASCII before being written, because OpenLDAP rejects non-ASCII characters in these attributes outright.
+Attributes with IA5String syntax — `gecos`, `homeDirectory`, and `loginShell` — must be ASCII. Values are transliterated to ASCII before being written, because OpenLDAP rejects non-ASCII characters in these attributes outright.
 
 ## Per-entry errors
 

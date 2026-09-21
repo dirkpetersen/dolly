@@ -8,9 +8,9 @@ Dolly takes the run lock in the target LDAP, at `cn=lock,<state_base>`. If anoth
 
 ## 2. Bleat
 
-Dolly binds to AD and runs paged searches for all in-scope users and groups. Large `member` attributes are fetched with ranged retrieval (`member;range=…`), so AD's 1500-value limit on a single attribute read never silently truncates a large group. Group members outside the configured search bases are followed and fetched individually by DN.
+Dolly binds to AD and runs paged searches for all in-scope users and groups, on every run. Large `member` attributes are fetched with ranged retrieval (`member;range=…`), so AD's 1500-value limit on a single attribute read never silently truncates a large group. Group members outside the configured search bases are followed and fetched individually by DN.
 
-A groups-only run (`--groups`) still reads the AD users, read-only, in order to resolve group members to target users.
+A groups-only run (`--groups`) still reads the AD users, read-only, in order to resolve group members to target users. Symmetrically, a users-only run (`--users`) still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced by a group and must therefore still be followed. In a `--users` run, the only group values that change are `member`/`memberUid` fix-ups for a user rename or prune; removing owned memberships happens only in a run that includes groups (`dolly sync` or `--groups`).
 
 !!! warning "Never plan from partial data"
     If any read from AD or the target fails, or comes back truncated (for example `sizeLimitExceeded`), the run aborts immediately. Dolly never computes a plan from an incomplete read. OpenLDAP's `olcSizeLimit` (500 by default) applies to every bind DN except the rootdn, so a non-rootdn bind DN that hits it will trip this abort — see [Permissions](../operations/permissions.md).
@@ -36,7 +36,11 @@ Before writing anything, Dolly counts planned removals across the whole run, sep
 - either count exceeds **both** `max_delete_min` and `max_delete_percent` of what Dolly owns, or
 - AD returned zero users or zero groups at all.
 
+Local memberships removed by a prune are reported in the summary but don't count toward the guard.
+
 `--force` overrides the guard and applies the run anyway. This is the safety net against a misconfigured filter, an AD outage that looks like "everyone got deleted," or a search base typo.
+
+This guard runs on every `dolly sync`, including `--dry-run`: a dry run that would trip it still reports what it would have tripped on and exits `2`, even though it writes nothing regardless. `--force` makes that case exit `0` instead. The "AD returned zero users or zero groups" check applies to every sync, dry-run or not — but not to `dolly adopt`, which has no guard of its own.
 
 ## 6. Clone
 

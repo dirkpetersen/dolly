@@ -181,6 +181,17 @@ To check which one a server uses, look up `posixGroup` in its schema (`ldapsearc
 
 Attribute values are plain AD attribute names or Go templates. Dolly only writes the attributes listed in the mapping, so other attributes on an entry are left alone. To exclude users or groups, use the search `filter`, for example `(!(memberOf=CN=ExcludedFromLDAPSync,OU=Groups,DC=example,DC=edu))`.
 
+**Config validation.** Dolly validates `dolly.yaml` before connecting to anything:
+
+- Unknown keys are a config error.
+- `mapping.users.required` and `mapping.groups.required` must each include at least the spec's minimum attributes (`uid`, `uidNumber`, `gidNumber` for users; `name`, `gidNumber` for groups).
+- `mapping.users.rdn` must map to the same value as `uid`.
+- Every `create_only` entry must also be a mapped attribute.
+- An empty `notify.smtp_host` disables notifications.
+- `page_size` defaults to `500` if omitted.
+- Listing `member` in `mapping.groups.membership` requires `empty_group_member` to be set.
+- `users_base` and `groups_base` must differ, since Dolly tells users from groups by their container.
+
 ### File locations (XDG)
 
 | What | Default path |
@@ -198,8 +209,8 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | Command | What it does |
 |---|---|
 | `dolly sync` | Reads all in-scope users and groups from AD and applies the differences |
-| `dolly sync --users` | Syncs users only |
-| `dolly sync --groups` | Syncs groups only (the default without either flag is both) |
+| `dolly sync --users` | Syncs users only. AD groups are still read, since Dolly needs them to resolve out-of-scope users; the only group values that change are `member`/`memberUid` fix-ups for a renamed or pruned user. Removing owned memberships happens only in a run that includes groups |
+| `dolly sync --groups` | Syncs groups only (the default without either flag is both). A member's target DN comes from the user's ownership record (`seeAlso`), not a fresh AD lookup, so a pending user rename causes no churn With `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it. With `memberUid` only, no user entry is needed. |
 | `dolly sync --dry-run` | Prints planned adds, modifies, renames, and removals without writing |
 | `dolly sync --force` | Applies the run even if it trips the mass-deletion guard |
 | `dolly adopt` | One-time takeover of an existing tree, such as one written by ad2openldap. See "Adopting an existing tree" |
@@ -209,15 +220,15 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `dolly uninstall` | Removes the units and binary, and keeps the config |
 | `dolly version` | Prints the version |
 
-Exit codes: `0` for success, or when another host holds the lock. `1` for an error. `2` when the mass-deletion guard stopped the run.
+Exit codes: `0` for success, or when another host holds the lock. `1` for an error. `2` when the mass-deletion guard stopped (or, for `--dry-run`, would have stopped) the run — `--force` makes that case exit `0` instead. The "AD returned zero users or zero groups" guard applies to every `dolly sync`, dry-run or not, but not to `dolly adopt`.
 
 ## How it works
 
 1. **Lock.** Dolly takes the run lock in the target LDAP. If another host holds it, Dolly exits quietly with code 0. `--dry-run` takes no lock. See "Run lock".
-2. **Bleat.** Dolly binds to AD and runs paged searches for all in-scope users and groups. Large `member` attributes are fetched with ranged retrieval (`member;range=…`). Group members outside the configured search bases are followed and fetched by DN. A groups-only run still reads the AD users, read-only, to resolve members. If any read from AD or the target fails or comes back truncated (for example `sizeLimitExceeded`), the run aborts. Dolly never plans from partial data.
+2. **Bleat.** Dolly binds to AD and runs paged searches for all in-scope users and groups on every run — a `--users` run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced by a group, and a `--groups` run still reads AD users, read-only, to resolve members. Large `member` attributes are fetched with ranged retrieval (`member;range=…`). Group members outside the configured search bases are followed and fetched by DN. If any read from AD or the target fails or comes back truncated (for example `sizeLimitExceeded`), the run aborts. Dolly never plans from partial data.
 3. **Shear.** Each entry is mapped through the configured attribute rules. Entries missing a `required` attribute are ignored, and the run summary lists them once rather than warning every run. Nested groups are flattened. Members are resolved by DN to the user's `objectGUID` and then to the target DN and uid, never by CN, because CNs aren't unique and can contain escaped commas.
 4. **Compare.** Dolly reads the target entries and its ownership records under `state_base`, then plans adds, attribute modifies, renames (`modrdn`), and member additions and removals.
-5. **Guard.** Dolly counts removals across the whole run, separately for memberships and for users. If either count is above `max_delete_min` and above `max_delete_percent` of what Dolly owns, or if AD returned no users or no groups at all, Dolly aborts, sends a notification, and changes nothing. `--force` overrides the guard.
+5. **Guard.** Dolly counts removals across the whole run, separately for memberships and for users. If either count is above `max_delete_min` and above `max_delete_percent` of what Dolly owns, or if AD returned no users or no groups at all, Dolly aborts, sends a notification, and changes nothing. Local memberships removed by a prune are reported in the summary but don't count toward the guard. This applies to every `dolly sync`, including `--dry-run` (which reports what the guard would trip on, exits `2`, and writes nothing regardless). `--force` overrides the guard and makes a would-be trip exit `0`. `dolly adopt` has no guard.
 6. **Clone.** Dolly applies the plan in a crash-safe order: it writes the ownership record *before* adding an entry or member, and removes the entry or member *before* removing its record. A crash can then never leave a Dolly-added member looking like a local one. Finally it updates the status entry and releases the lock.
 
 ### Ownership records
@@ -237,21 +248,22 @@ ou=dolly,dc=local
 └── cn=status             last successful run, current failure, last notification
 ```
 
-Dolly creates `state_base` and its children if they're missing. It doesn't create `users_base` or `groups_base`. If those are missing, it stops with a clear error. User records also keep small `description` values, such as the date a user went missing from AD and the shell to restore after a disabled account is re-enabled.
+Dolly creates `state_base` and its children if they're missing. It doesn't create `users_base` or `groups_base`. If those are missing, it stops with a clear error. User records also keep small `description` key=value notes: `missing-since`, an RFC 3339 UTC timestamp (for example `2026-09-21T19:00:00Z`) recording when a user went missing from AD; `saved-shell`, the shell to restore after a disabled account is re-enabled; and `renaming-from=<old DN>`, present only while a rename is in progress (see below).
 
 The rules:
 
 - A user in the AD group but not in the target group is added and recorded as Dolly-owned.
 - A Dolly-owned member who left the AD group, or was deleted from AD, is removed from the target group and from the record.
 - A member who is already in the target group without a record was added locally. Dolly never removes that member, even if the same user is also in the AD group.
-- A target user or group with the same `uid` or `cn` as an AD entry but no ownership record is a conflict. Dolly logs an error and skips it.
-- A user or group renamed in AD (same `objectGUID`) is renamed in place, and its `member` and `memberUid` values are updated in every group.
+- A target user or group with the same `uid` or `cn` as an AD entry but no ownership record is a conflict. Dolly logs an error and leaves it untouched; a conflict user can still be added as a group member by DN, since that doesn't require an owned user entry.
+- When two AD users map to the same `uid`, the winner is chosen in order: the current owner (an ownership record already points at this AD user), then any entry with an ownership record, then an in-scope entry, then the lowest DN. The other user is a warning, nothing more.
+- A user or group renamed in AD (same `objectGUID`) is renamed in place, and its `member` and `memberUid` values are updated in every group. The record gets a `renaming-from=<old DN>` note first; only then does Dolly perform the `modrdn` and fix up `member`, `memberUid`, `seeAlso`, and `roleOccupant` values; the note is removed last. A crash mid-rename is recoverable from the note alone. Renames happen in place — Dolly never moves an entry to a different parent. An owned entry found somewhere other than directly under its configured base is reported as a conflict, not moved.
 - A user who is gone from AD (deleted, moved out of scope, or missing a `required` attribute) loses all Dolly-owned memberships right away. The user entry is deleted only when `prune_users` is on and the user has been gone for `prune_after_days`. At that point Dolly also removes the user from groups where they were added locally, so no group points at a user that no longer exists.
 - A group deleted from AD loses its Dolly-owned members and its ownership record. The group itself stays.
 - Ownership records always name members by DN in `roleOccupant`, built as `<rdn>=<uid>,<users_base>`, even when groups use `memberUid` only. With `memberUid` only, that DN is just an identifier, and the user entry doesn't have to exist on the target.
 - With `member` in the membership list (`groupOfNames`), a new AD group with no resolvable members isn't created until it has one, because `groupOfNames` needs at least one `member`. With `memberUid` only, `posixGroup` may be empty, so the group is created right away.
 - With `member` in the membership list, if removing Dolly-owned members would leave a group with no members at all, Dolly adds the `empty_group_member` placeholder instead of breaking the `groupOfNames` schema. It removes the placeholder once the group has a real member again.
-- A disabled AD account (`userAccountControl` bit `0x2`) keeps its user entry, but Dolly removes it from every group where it's Dolly-owned and sets `loginShell` to `disabled_shell`, because an SSH key would otherwise still work. Local memberships are untouched. When the account is re-enabled, Dolly restores the previous shell.
+- A disabled AD account (`userAccountControl` bit `0x2`) keeps its user entry, but Dolly removes it from every group where it's Dolly-owned and sets `loginShell` to `disabled_shell`, because an SSH key would otherwise still work. Local memberships are untouched. When the account is re-enabled, Dolly restores the saved shell only if `loginShell` is still `disabled_shell`; if an admin changed it in the meantime, the admin's value stays and the `saved-shell` note is dropped. A user who is already disabled the first time Dolly creates them is created with `disabled_shell` directly, and their mapped shell is saved in the record for a later re-enable.
 - Attributes in `create_only` are written when Dolly creates the user and never again, so a shell or home directory changed on the LDAP server stays changed. `disabled_shell` is the one exception.
 - The AD primary group (`primaryGroupID`, usually Domain Users) is ignored, because AD doesn't list it in the group's `member` attribute.
 - Users need `uid`, `uidNumber`, and `gidNumber`, and groups need `name` and `gidNumber`. Anything without them is ignored everywhere, inside or outside the search bases. An ignored child group isn't flattened into its parent either.
@@ -260,7 +272,7 @@ The rules:
 - The spelling of `uid` is kept exactly as it is in AD, including uppercase letters.
 - Duplicate `uidNumber` or `gidNumber` values, between AD entries or against local entries, don't block the run. They're listed as warnings in the run summary.
 - A changed `uidNumber` or `gidNumber` is applied, and it's always reported, because file ownership depends on it.
-- Values for ASCII-only attributes such as `gecos` are transliterated to ASCII, because OpenLDAP rejects non-ASCII characters there.
+- Values for ASCII-only attributes — `gecos`, `homeDirectory`, and `loginShell` — are transliterated to ASCII, because OpenLDAP rejects non-ASCII characters there.
 - One bad entry doesn't stop the run. If the server rejects a change, Dolly logs it, carries on with the rest, reports it in the summary, and exits with code 1.
 
 ### Run lock
@@ -276,9 +288,11 @@ If a run crashes and leaves the lock behind:
 
 A tree written by ad2openldap has no ownership records. Run `dolly adopt` once before the first sync. For every AD user and group that matches a target entry by `uid` or `cn`, it creates an ownership record. In each group it marks the members who are also in the AD group as Dolly-owned, and treats every other member as local.
 
+Adopt claims every AD user that has a `uid`, even one missing `uidNumber` or `gidNumber`, so the following `dolly sync` can then treat those users as gone — removing their memberships, and pruning them if `prune_users` is enabled — instead of never claiming them at all. Groups still need to pass the full required-attribute check (`name` and `gidNumber`) to be adopted. Adopt flattens through every child group, the same way `sync` does, and counts disabled AD accounts as members when deciding which existing target members are Dolly-owned.
+
 One caveat: a user removed from an AD group shortly before the adoption looks local, so Dolly will never remove them. Check `dolly adopt --dry-run` for surprises.
 
-A second, intended difference from ad2openldap: users without a `gidNumber` (the old tool gave them 65534) and members that only arrived through a child group without a `gidNumber` are now ignored. `dolly adopt --dry-run` lists them. On the first sync they lose their memberships, the guard may ask for `--force`, and with `prune_users` on they're deleted after `prune_after_days`.
+A second, intended difference from ad2openldap: users without a `gidNumber` (the old tool gave them 65534) and members that only arrived through a child group without a `gidNumber` are ignored by `sync`, per the required-attributes rule. Adopt still claims them, as above, so `dolly adopt --dry-run` lists them. On the first sync they lose their memberships, the guard may ask for `--force`, and with `prune_users` on they're deleted after `prune_after_days`.
 
 ## Running it on a schedule
 

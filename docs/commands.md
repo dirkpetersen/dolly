@@ -23,7 +23,11 @@ dolly sync --force        # apply even if the mass-deletion guard trips
 
 There is no `dolly diff` — use `dolly sync --dry-run` instead.
 
-A groups-only run still reads AD users (read-only) to resolve group members. `--users` and `--groups` each work standalone and never assume the other ran in the same invocation.
+A groups-only run still reads AD users (read-only) to resolve group members. A users-only run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced; the only group values a `--users` run changes are `member`/`memberUid` fix-ups for a renamed or pruned user. Removing owned memberships from a group happens only in a run that includes groups.
+
+In a `--groups` run, a member's target DN comes from the user's own ownership record (`seeAlso`), not a fresh AD lookup, so a user rename still pending its own `--users` sync causes no group churn. With `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it. With `memberUid` only, no user entry is needed.
+
+`--users` and `--groups` each work standalone and never assume the other ran in the same invocation.
 
 ## `dolly adopt`
 
@@ -89,4 +93,6 @@ dolly version
 |---|---|
 | `0` | Success, or another host already holds the run lock (a quiet, expected outcome). |
 | `1` | An error occurred. |
-| `2` | The [mass-deletion guard](how-it-works/index.md#guard) stopped the run. Use `--force` to override if the removals are expected. |
+| `2` | The [mass-deletion guard](how-it-works/index.md#guard) stopped the run, or would have on a `--dry-run`. Use `--force` to override if the removals are expected — this also turns a would-be `2` from `--dry-run` into `0`. |
+
+The "AD returned zero users or zero groups" guard applies to every `dolly sync`, dry-run or not, but not to `dolly adopt`, which has no guard.

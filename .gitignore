@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Binary built by `go build ./cmd/dolly` in the repo root
+/dolly
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -38,3 +41,8 @@ dolly.yaml
 site/
 .cache/
 .venv/
+
+# Editor swap/backup files (may contain secrets from dolly.yaml)
+*.swp
+*.swo
+*~
