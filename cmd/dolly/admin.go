@@ -79,7 +79,9 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	fs := newFlags("install", "Copy this binary to ~/.local/bin/dolly, create the config from the built-in template if it\n"+
 		"doesn't exist (never overwritten), and write dolly.service and dolly.timer to\n"+
 		"$XDG_CONFIG_HOME/systemd/user/ (rewritten only when their content changes). The timer is\n"+
-		"not enabled. --users/--groups and --config are baked into the service's ExecStart.\n"+
+		"not enabled. --users/--groups and --config are baked into the service's ExecStart. If the\n"+
+		"systemd user manager has another HOME than $HOME (AD/SSSD hosts), everything still stays under\n"+
+		"$HOME: the units are registered with systemctl --user link and ExecStart uses absolute paths.\n"+
 		"Safe to re-run; needs no root.", stderr, "")
 	cfgPath := fs.String("config", "", "config file for the service (made absolute; created from the template if missing)")
 	users := fs.Bool("users", false, "the timer syncs users only (dolly sync --users)")

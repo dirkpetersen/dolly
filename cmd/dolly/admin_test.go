@@ -83,12 +83,12 @@ func TestInstallCLI(t *testing.T) {
 	if err != nil || !strings.HasPrefix(string(cfg), "# Dolly configuration template.") {
 		t.Errorf("config from the embedded template: %v", err)
 	}
-	if strings.Join(sc.calls, ";") != "daemon-reload" {
+	if strings.Join(sc.calls, ";") != "show-environment;daemon-reload" {
 		t.Errorf("systemctl calls %v", sc.calls)
 	}
 
 	code, out, _ = runCLI("uninstall")
-	if code != 0 || strings.Join(sc.calls, ";") != "daemon-reload;disable --now dolly.timer;daemon-reload" {
+	if code != 0 || strings.Join(sc.calls, ";") != "show-environment;daemon-reload;show-environment;disable --now dolly.timer;daemon-reload" {
 		t.Errorf("uninstall: exit %d, calls %v\n%s", code, sc.calls, out)
 	}
 	if _, err := os.Stat(filepath.Join(env.Home, ".local", "bin", "dolly")); err == nil {

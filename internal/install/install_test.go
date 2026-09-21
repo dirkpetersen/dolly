@@ -18,6 +18,11 @@ type fakeSystemctl struct {
 		out string
 		err error
 	}
+	// showEnv is the output of show-environment.
+	showEnv string
+	// linkDir, if set, is the manager's unit directory: link <path>
+	// creates linkDir/<base> -> path there, as systemd does.
+	linkDir string
 }
 
 func (f *fakeSystemctl) Run(env []string, args ...string) (string, error) {
@@ -27,7 +32,21 @@ func (f *fakeSystemctl) Run(env []string, args ...string) (string, error) {
 	if r, ok := f.fail[c]; ok {
 		return r.out, r.err
 	}
+	switch {
+	case c == "show-environment":
+		return f.showEnv, nil
+	case len(args) == 2 && args[0] == "link" && f.linkDir != "":
+		if err := os.MkdirAll(f.linkDir, 0o755); err != nil {
+			return "", err
+		}
+		return "Created symlink.", os.Symlink(args[1], filepath.Join(f.linkDir, filepath.Base(args[1])))
+	}
 	return "", nil
+}
+
+// setManagerHome makes show-environment report home as the manager's HOME.
+func (f *fixture) setManagerHome(home string, extra ...string) {
+	f.sc.showEnv = strings.Join(append([]string{"HOME=" + home, "LANG=C.UTF-8", "PATH=/usr/bin"}, extra...), "\n") + "\n"
 }
 
 type fixture struct {
@@ -53,6 +72,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{home: home, sc: &fakeSystemctl{}}
+	f.setManagerHome(home)
 	f.env = Env{
 		GOOS: "linux", Home: home, Path: "/usr/bin:" + filepath.Join(home, ".local", "bin"),
 		RuntimeDir: filepath.Join(runUser, "1234"), Environ: []string{"HOME=" + home, "PATH=/usr/bin"},
@@ -166,7 +186,7 @@ func TestInstallFreshAndIdempotent(t *testing.T) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
 	}
-	if strings.Join(f.sc.calls, ";") != "daemon-reload" || f.sc.envs[0] != nil {
+	if strings.Join(f.sc.calls, ";") != "show-environment;daemon-reload" || f.sc.envs[0] != nil || strings.Contains(out, "note:") {
 		t.Errorf("systemctl calls %v (env %v); the timer must not be enabled", f.sc.calls, f.sc.envs)
 	}
 
@@ -317,6 +337,7 @@ func TestNextStepsQuoting(t *testing.T) {
 	f := newFixture(t)
 	f.env.Path = "/usr/bin"
 	f.env.Home = filepath.Join(f.home, "my home")
+	f.setManagerHome(f.env.Home)
 	o := f.opts()
 	o.ConfigPath = filepath.Join(f.env.Home, "it's $x.yaml")
 	if err := Install(f.env, o); err != nil {
@@ -400,7 +421,7 @@ func TestUninstall(t *testing.T) {
 	if err := Uninstall(f.env, f.opts()); err != nil {
 		t.Fatalf("%v\n%s", err, f.out.String())
 	}
-	if strings.Join(f.sc.calls, ";") != "disable --now dolly.timer;daemon-reload" {
+	if strings.Join(f.sc.calls, ";") != "show-environment;disable --now dolly.timer;daemon-reload" {
 		t.Errorf("calls %v", f.sc.calls)
 	}
 	for _, x := range []string{p.Binary, p.Service, p.Timer} {
@@ -422,7 +443,7 @@ func TestUninstall(t *testing.T) {
 	if err := Uninstall(f.env, f.opts()); err != nil {
 		t.Fatalf("second uninstall: %v\n%s", err, f.out.String())
 	}
-	if strings.Join(f.sc.calls, ";") != "disable --now dolly.timer" || !strings.Contains(f.out.String(), "was not loaded") {
+	if strings.Join(f.sc.calls, ";") != "show-environment;disable --now dolly.timer" || !strings.Contains(f.out.String(), "was not loaded") {
 		t.Errorf("calls %v\n%s", f.sc.calls, f.out.String())
 	}
 
@@ -455,4 +476,241 @@ func currentUmask() os.FileMode {
 	m := syscall.Umask(0)
 	syscall.Umask(m)
 	return os.FileMode(m)
+}
+
+// splitFixture is a host where the systemd user manager has another HOME
+// than the shell (AD/SSSD: /home/<DOMAIN>/<user> vs /home/<user>).
+func splitFixture(t *testing.T) (*fixture, string) {
+	f := newFixture(t)
+	mhome := filepath.Join(filepath.Dir(f.home), "home-DOMAIN", "svc-dolly")
+	f.setManagerHome(mhome)
+	f.sc.linkDir = filepath.Join(mhome, ".config", "systemd", "user")
+	return f, mhome
+}
+
+// "$HOME always wins": files stay under the shell's HOME, the units are
+// linked into the manager's unit directory, and ExecStart is absolute.
+func TestInstallSplitHome(t *testing.T) {
+	f, mhome := splitFixture(t)
+	p := f.paths()
+	if err := Install(f.env, f.opts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if want := strings.Join([]string{"show-environment", "link " + p.Service, "link " + p.Timer, "daemon-reload"}, ";"); strings.Join(f.sc.calls, ";") != want {
+		t.Errorf("calls %v, want %s", f.sc.calls, want)
+	}
+	execStart := p.Binary + " sync --config " + filepath.Join(f.home, ".config", "dolly", "dolly.yaml")
+	service, _ := Units(execStart)
+	if read(t, p.Service) != service || read(t, p.Config) != "template: yes\n" || read(t, p.Binary) != "binary v1" {
+		t.Errorf("service:\n%s", read(t, p.Service))
+	}
+	out := f.out.String()
+	for _, want := range []string{"ExecStart=" + execStart + "\n", "systemd user manager uses HOME=" + mhome + ", the shell uses HOME=" + f.home,
+		"linked into " + f.sc.linkDir, "systemctl --user enable --now dolly.timer"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	// Nothing written by Dolly into the manager's HOME but systemd's links.
+	for _, name := range []string{"dolly.service", "dolly.timer"} {
+		if ok, err := linksTo(filepath.Join(f.sc.linkDir, name), filepath.Join(p.UnitDir, name)); err != nil || !ok {
+			t.Errorf("%s: link %v %v", name, ok, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(mhome, ".local")); err == nil {
+		t.Error("the binary must not go to the manager's HOME")
+	}
+
+	// Re-run with --groups: the file is rewritten, the links are kept.
+	f.sc.calls = nil
+	f.out.Reset()
+	o := f.opts()
+	o.Groups = true
+	if err := Install(f.env, o); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if strings.Join(f.sc.calls, ";") != "show-environment;daemon-reload" || !strings.Contains(f.out.String(), "links to it already") {
+		t.Errorf("re-run calls %v\n%s", f.sc.calls, f.out.String())
+	}
+	if !strings.Contains(read(t, filepath.Join(f.sc.linkDir, "dolly.service")), p.Binary+" sync --groups --config ") {
+		t.Error("the link must show the rewritten unit")
+	}
+
+	// A missing link is re-created.
+	if err := os.Remove(filepath.Join(f.sc.linkDir, "dolly.timer")); err != nil {
+		t.Fatal(err)
+	}
+	f.sc.calls = nil
+	if err := Install(f.env, o); err != nil || strings.Join(f.sc.calls, ";") != "show-environment;link "+p.Timer+";daemon-reload" {
+		t.Errorf("relink: %v, calls %v", err, f.sc.calls)
+	}
+
+	// An explicit --config is used as is.
+	cfg := filepath.Join(f.home, "t", "a.yaml")
+	o.ConfigPath = cfg
+	f.out.Reset()
+	if err := Install(f.env, o); err != nil || !strings.Contains(f.out.String(), "ExecStart="+p.Binary+" sync --groups --config "+cfg+"\n") {
+		t.Errorf("--config: %v\n%s", err, f.out.String())
+	}
+}
+
+// A regular file (or a foreign link) in the manager's unit directory is
+// left alone, with a warning.
+func TestInstallSplitHomeForeignUnit(t *testing.T) {
+	f, _ := splitFixture(t)
+	p := f.paths()
+	if err := os.MkdirAll(f.sc.linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(f.sc.linkDir, "dolly.service")
+	if err := os.WriteFile(mine, []byte("[Service]\nExecStart=/bin/true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Install(f.env, f.opts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if read(t, mine) != "[Service]\nExecStart=/bin/true\n" || !strings.Contains(f.out.String(), "warning: "+mine+" exists and is not a link") {
+		t.Errorf("foreign unit touched or no warning:\n%s", f.out.String())
+	}
+	if strings.Join(f.sc.calls, ";") != "show-environment;link "+p.Timer+";daemon-reload" {
+		t.Errorf("calls %v", f.sc.calls)
+	}
+
+	// Uninstall removes only the link to our timer, never the foreign file.
+	f.sc.calls = nil
+	f.out.Reset()
+	if err := Uninstall(f.env, f.opts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if read(t, mine) != "[Service]\nExecStart=/bin/true\n" {
+		t.Error("uninstall removed a foreign unit")
+	}
+	if _, err := os.Lstat(filepath.Join(f.sc.linkDir, "dolly.timer")); err == nil {
+		t.Error("timer link not removed")
+	}
+	for _, x := range []string{p.Service, p.Timer, p.Binary} {
+		if _, err := os.Stat(x); err == nil {
+			t.Errorf("%s still exists", x)
+		}
+	}
+	out := f.out.String()
+	if !strings.Contains(out, "✓ removed the link "+filepath.Join(f.sc.linkDir, "dolly.timer")) || !strings.Contains(out, "warning: "+mine+" is not a link") {
+		t.Errorf("uninstall output:\n%s", out)
+	}
+	if strings.Join(f.sc.calls, ";") != "show-environment;disable --now dolly.timer;daemon-reload" {
+		t.Errorf("calls %v", f.sc.calls)
+	}
+}
+
+// Uninstall also copes with systemctl disable having removed the links
+// already, and leaves a link that points elsewhere.
+func TestUninstallSplitHomeLinksGone(t *testing.T) {
+	f, _ := splitFixture(t)
+	if err := Install(f.env, f.opts()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(f.sc.linkDir, "dolly.timer")); err != nil { // as disable does
+		t.Fatal(err)
+	}
+	other := filepath.Join(f.sc.linkDir, "dolly.service")
+	if err := os.Remove(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/elsewhere/dolly.service", other); err != nil {
+		t.Fatal(err)
+	}
+	f.out.Reset()
+	if err := Uninstall(f.env, f.opts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if dest, err := os.Readlink(other); err != nil || dest != "/elsewhere/dolly.service" {
+		t.Errorf("foreign link touched: %q %v", dest, err)
+	}
+	if _, err := os.Stat(f.paths().Service); err == nil {
+		t.Error("our service not removed")
+	}
+}
+
+// Same HOME but another XDG_CONFIG_HOME in the manager: %h stays, the
+// units are linked, and --config is baked in.
+func TestInstallManagerXDGConfigHome(t *testing.T) {
+	f := newFixture(t)
+	mxdg := filepath.Join(f.home, "mgr-xdg")
+	f.setManagerHome(f.home, "XDG_CONFIG_HOME="+mxdg)
+	f.sc.linkDir = filepath.Join(mxdg, "systemd", "user")
+	p := f.paths()
+	if err := Install(f.env, f.opts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	want := "%h/.local/bin/dolly sync --config " + p.Config
+	if service, _ := Units(want); read(t, p.Service) != service {
+		t.Errorf("service:\n%s", read(t, p.Service))
+	}
+	if !strings.Contains(strings.Join(f.sc.calls, ";"), "link "+p.Service) || strings.Contains(f.out.String(), "uses HOME=") {
+		t.Errorf("calls %v\n%s", f.sc.calls, f.out.String())
+	}
+}
+
+// The manager's HOME is the shell's through a symlink: nothing changes.
+func TestInstallManagerHomeSymlink(t *testing.T) {
+	f := newFixture(t)
+	if err := os.MkdirAll(f.home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(filepath.Dir(f.home), "alias")
+	if err := os.Symlink(f.home, alias); err != nil {
+		t.Fatal(err)
+	}
+	f.setManagerHome(alias)
+	if err := Install(f.env, f.opts()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(f.sc.calls, ";") != "show-environment;daemon-reload" || !strings.Contains(f.out.String(), "ExecStart=%h/.local/bin/dolly sync\n") {
+		t.Errorf("calls %v\n%s", f.sc.calls, f.out.String())
+	}
+}
+
+// show-environment failing (or without HOME) falls back to the shell's
+// view: %h, no links.
+func TestInstallShowEnvironmentFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*fakeSystemctl)
+	}{
+		{"error", func(sc *fakeSystemctl) {
+			sc.fail = map[string]struct {
+				out string
+				err error
+			}{"show-environment": {"Failed to connect to bus", errors.New("exit status 1")}}
+		}},
+		{"no HOME", func(sc *fakeSystemctl) { sc.showEnv = "LANG=C\n" }},
+	} {
+		f := newFixture(t)
+		tc.set(f.sc)
+		p := f.paths()
+		if err := Install(f.env, f.opts()); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		service, _ := Units("%h/.local/bin/dolly sync")
+		if read(t, p.Service) != service || strings.Join(f.sc.calls, ";") != "show-environment;daemon-reload" ||
+			!strings.Contains(f.out.String(), "note: couldn't read the systemd user manager's environment") {
+			t.Errorf("%s: calls %v\n%s", tc.name, f.sc.calls, f.out.String())
+		}
+		f.sc.calls = nil
+		if err := Uninstall(f.env, f.opts()); err != nil {
+			t.Errorf("%s: uninstall %v", tc.name, err)
+		}
+		if _, err := os.Stat(p.Service); err == nil {
+			t.Errorf("%s: service not removed", tc.name)
+		}
+	}
+}
+
+func TestParseEnvironment(t *testing.T) {
+	got := parseEnvironment("HOME=/home/DOM/a\nXDG_CONFIG_HOME=$'/x/a b\\'c'\nQ=\"/q r\"\nS='/s t'\nE=/p\\ q\nbad\n")
+	for k, want := range map[string]string{"HOME": "/home/DOM/a", "XDG_CONFIG_HOME": "/x/a b'c", "Q": "/q r", "S": "/s t", "E": "/p q"} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want %q", k, got[k], want)
+		}
+	}
 }

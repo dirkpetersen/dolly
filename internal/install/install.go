@@ -107,9 +107,16 @@ func PathsFor(env Env, configPath string) Paths {
 }
 
 // ExecStart returns the service's command line: dolly sync with --users or
-// --groups (neither for a full sync) and --config if given.
+// --groups (neither for a full sync) and --config if given, running
+// %h/.local/bin/dolly.
 func ExecStart(users, groups bool, configPath string) string {
-	s := "%h/.local/bin/dolly sync"
+	return execStartFor("%h/.local/bin/dolly", users, groups, configPath)
+}
+
+// execStartFor is ExecStart with bin (already escaped for a unit file) as
+// the binary.
+func execStartFor(bin string, users, groups bool, configPath string) string {
+	s := bin + " sync"
 	switch {
 	case users && !groups:
 		s += " --users"
@@ -234,6 +241,15 @@ func Install(env Env, o Options) error {
 	w := o.Out
 	p := PathsFor(env, o.ConfigPath)
 	var errs []error
+	systemd := hasSystemd(env)
+	var mv managerView
+	if systemd {
+		var err error
+		var nm *NoManagerError
+		if mv, err = queryManager(env, o.Systemctl); err != nil && !errors.As(err, &nm) {
+			fmt.Fprintf(w, "  note: couldn't read the systemd user manager's environment (%v); assuming it uses HOME=%s\n", err, env.Home)
+		}
+	}
 
 	// Binary.
 	switch msg, err := installBinary(env.Executable, p); {
@@ -258,9 +274,31 @@ func Install(env Env, o Options) error {
 		fmt.Fprintf(w, "✓ config: %s exists, left unchanged (dolly install never overwrites a config)\n", p.Config)
 	}
 
-	// Units.
+	// Units. They always live under the shell's $HOME ("$HOME always
+	// wins"); a manager with another HOME gets them linked into its unit
+	// directory by systemctl --user link, and absolute paths in ExecStart,
+	// because it would expand %h to its own HOME.
 	execStart := ExecStart(o.Users, o.Groups, o.ConfigPath)
-	systemd := hasSystemd(env)
+	splitHome := mv.known() && !sameDir(mv.Home, env.Home)
+	link := mv.known() && !sameDir(mv.unitDir(), p.UnitDir)
+	if mv.known() {
+		bin := "%h/.local/bin/dolly"
+		if splitHome {
+			bin = unitQuote(p.Binary)
+		}
+		cfg := o.ConfigPath
+		if cfg == "" && !sameConfig(mv.defaultConfig(), p.Config) {
+			cfg = p.Config // the service's own default lookup would miss it
+		}
+		execStart = execStartFor(bin, o.Users, o.Groups, cfg)
+	}
+	if systemd && splitHome {
+		fmt.Fprintf(w, "  note: the systemd user manager uses HOME=%s, the shell uses HOME=%s; the units stay in %s and are linked into %s with systemctl --user link; ExecStart uses absolute paths\n",
+			mv.Home, env.Home, p.UnitDir, mv.unitDir())
+	} else if systemd && link {
+		fmt.Fprintf(w, "  note: the systemd user manager reads units from %s, not %s; the units are linked there with systemctl --user link\n",
+			mv.unitDir(), p.UnitDir)
+	}
 	if !systemd {
 		why := "not Linux (" + env.GOOS + ")"
 		if env.GOOS == "linux" {
@@ -285,9 +323,14 @@ func Install(env Env, o Options) error {
 			}
 		}
 		fmt.Fprintf(w, "  ExecStart=%s\n", execStart)
+		senv, err := SystemctlEnv(env)
+		if err == nil && link {
+			for _, u := range []string{p.Service, p.Timer} {
+				errs = append(errs, linkUnit(w, o.Systemctl, senv, mv.unitDir(), u))
+			}
+		}
 		// Reload on every install, not only after a change: a previous
 		// install may have written the units but failed to reload.
-		senv, err := SystemctlEnv(env)
 		if err != nil {
 			fmt.Fprintf(w, "✗ systemctl --user daemon-reload: %v\n", err)
 			errs = append(errs, err)
@@ -342,6 +385,7 @@ func Uninstall(env Env, o Options) error {
 	p := PathsFor(env, o.ConfigPath)
 	var errs []error
 	if hasSystemd(env) {
+		mv, _ := queryManager(env, o.Systemctl) // on error: nothing is linked we could know of
 		senv, envErr := SystemctlEnv(env)
 		if envErr != nil {
 			// No user manager is running, so nothing is loaded to stop.
@@ -359,6 +403,29 @@ func Uninstall(env Env, o Options) error {
 			}
 		}
 		removed := false
+		// Links into another manager unit directory (systemctl disable
+		// often removes them already): only symlinks to our files.
+		if mv.known() && !sameDir(mv.unitDir(), p.UnitDir) {
+			for _, f := range []string{p.Timer, p.Service} {
+				l := filepath.Join(mv.unitDir(), filepath.Base(f))
+				switch ours, err := linksTo(l, f); {
+				case errors.Is(err, fs.ErrNotExist):
+				case err != nil:
+					fmt.Fprintf(w, "✗ %v\n", err)
+					errs = append(errs, err)
+				case !ours:
+					fmt.Fprintf(w, "  warning: %s is not a link to %s; left alone\n", l, f)
+				default:
+					if err := os.Remove(l); err != nil {
+						fmt.Fprintf(w, "✗ %v\n", err)
+						errs = append(errs, err)
+					} else {
+						removed = true
+						fmt.Fprintf(w, "✓ removed the link %s\n", l)
+					}
+				}
+			}
+		}
 		for _, f := range []string{p.Timer, p.Service} {
 			switch err := os.Remove(f); {
 			case err == nil:
@@ -396,6 +463,179 @@ func Uninstall(env Env, o Options) error {
 		fmt.Fprintf(w, "No config at %s; nothing kept.\n", p.Config)
 	}
 	return errors.Join(errs...)
+}
+
+// managerView is the systemd user manager's environment, which can differ
+// from the shell's: on AD/SSSD hosts the login shell's $HOME may be
+// /home/<user> while the passwd entry, and so the manager, has
+// /home/<DOMAIN>/<user>. The manager reads units from its own
+// $XDG_CONFIG_HOME/systemd/user (or <its HOME>/.config/systemd/user) and
+// expands %h to its own HOME. The zero value means unknown: assume the
+// shell's view.
+type managerView struct {
+	Home       string // the manager's HOME, absolute (the shell's spelling if the same directory)
+	ConfigHome string // the manager's XDG_CONFIG_HOME if absolute, else ""
+}
+
+func (m managerView) known() bool { return m.Home != "" }
+
+func (m managerView) configHome() string {
+	if m.ConfigHome != "" {
+		return m.ConfigHome
+	}
+	return filepath.Join(m.Home, ".config")
+}
+
+// unitDir is where the manager reads user units.
+func (m managerView) unitDir() string { return filepath.Join(m.configHome(), "systemd", "user") }
+
+// defaultConfig is the config the service finds without --config.
+func (m managerView) defaultConfig() string {
+	return filepath.Join(m.configHome(), "dolly", "dolly.yaml")
+}
+
+// sameConfig reports whether a and b are the same config path (or the
+// same directory under another name).
+func sameConfig(a, b string) bool {
+	return filepath.Clean(a) == filepath.Clean(b) || filepath.Base(a) == filepath.Base(b) && sameFile(filepath.Dir(a), filepath.Dir(b))
+}
+
+// queryManager asks the user manager for its HOME and XDG_CONFIG_HOME via
+// systemctl --user show-environment. On any error (no manager, no
+// systemctl, no absolute HOME in the output) the view is unknown.
+func queryManager(env Env, sc Systemctl) (managerView, error) {
+	senv, err := SystemctlEnv(env)
+	if err != nil {
+		return managerView{}, err
+	}
+	out, err := sc.Run(senv, "show-environment")
+	if err != nil {
+		return managerView{}, fmt.Errorf("systemctl --user show-environment: %v%s", err, outputSuffix(out))
+	}
+	vars := parseEnvironment(out)
+	m := managerView{Home: vars["HOME"], ConfigHome: vars["XDG_CONFIG_HOME"]}
+	if m.Home == "" || !filepath.IsAbs(m.Home) {
+		return managerView{}, errors.New("systemctl --user show-environment has no absolute HOME")
+	}
+	m.Home = filepath.Clean(m.Home)
+	if m.ConfigHome != "" && filepath.IsAbs(m.ConfigHome) {
+		m.ConfigHome = filepath.Clean(m.ConfigHome)
+	} else {
+		m.ConfigHome = "" // unset, or relative and so invalid
+	}
+	if sameDir(m.Home, env.Home) {
+		// The same directory, maybe under another name (a symlink): keep
+		// the shell's spelling so the paths compare.
+		if m.ConfigHome == filepath.Join(m.Home, ".config") {
+			m.ConfigHome = ""
+		}
+		m.Home = env.Home
+	}
+	return m, nil
+}
+
+// parseEnvironment parses show-environment output: one KEY=VALUE per line,
+// the value possibly shell-quoted by systemd ("...", '...', or $'...').
+func parseEnvironment(out string) map[string]string {
+	vars := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimRight(line, "\r"), "=")
+		if ok && k != "" {
+			vars[k] = unquoteValue(v)
+		}
+	}
+	return vars
+}
+
+func unquoteValue(v string) string {
+	switch {
+	case len(v) >= 3 && strings.HasPrefix(v, "$'") && strings.HasSuffix(v, "'"):
+		v = v[2 : len(v)-1]
+	case len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"':
+		v = v[1 : len(v)-1]
+	case len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'':
+		return v[1 : len(v)-1]
+	}
+	if !strings.Contains(v, `\`) {
+		return v
+	}
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\\' && i+1 < len(v) {
+			i++
+			switch v[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			default:
+				b.WriteByte(v[i])
+			}
+			continue
+		}
+		b.WriteByte(v[i])
+	}
+	return b.String()
+}
+
+// sameDir reports whether a and b name the same directory (equal paths, or
+// the same inode through a symlink).
+func sameDir(a, b string) bool {
+	return filepath.Clean(a) == filepath.Clean(b) || sameFile(a, b)
+}
+
+func sameFile(a, b string) bool {
+	sa, err1 := os.Stat(a)
+	sb, err2 := os.Stat(b)
+	return err1 == nil && err2 == nil && os.SameFile(sa, sb)
+}
+
+// linksTo reports whether l is a symlink to target. A missing l is
+// fs.ErrNotExist; anything else at l (a regular file, a link elsewhere)
+// is false.
+func linksTo(l, target string) (bool, error) {
+	st, err := os.Lstat(l)
+	if err != nil {
+		return false, err
+	}
+	if st.Mode()&fs.ModeSymlink == 0 {
+		return false, nil
+	}
+	dest, err := os.Readlink(l)
+	if err != nil {
+		return false, err
+	}
+	if !filepath.IsAbs(dest) {
+		dest = filepath.Join(filepath.Dir(l), dest)
+	}
+	return filepath.Clean(dest) == filepath.Clean(target) || sameFile(dest, target), nil
+}
+
+// linkUnit makes sure the manager's unit directory has a link to unit,
+// with systemctl --user link (systemd writes the link, Dolly never writes
+// into the manager's HOME). A link already there is kept; a regular file
+// or a link elsewhere is left alone with a warning.
+func linkUnit(w io.Writer, sc Systemctl, senv []string, dir, unit string) error {
+	l := filepath.Join(dir, filepath.Base(unit))
+	switch ours, err := linksTo(l, unit); {
+	case err == nil && ours:
+		fmt.Fprintf(w, "✓ unit: %s links to it already\n", l)
+		return nil
+	case err == nil:
+		fmt.Fprintf(w, "  warning: %s exists and is not a link to %s; left alone, so the user manager won't run Dolly's unit until you remove it and re-run dolly install\n", l, unit)
+		return nil
+	case !errors.Is(err, fs.ErrNotExist):
+		err = fmt.Errorf("checking %s: %w", l, err)
+		fmt.Fprintf(w, "✗ unit: %v\n", err)
+		return err
+	}
+	if out, err := sc.Run(senv, "link", unit); err != nil {
+		err = fmt.Errorf("systemctl --user link %s: %v%s", unit, err, outputSuffix(out))
+		fmt.Fprintf(w, "✗ %v\n", err)
+		return err
+	}
+	fmt.Fprintf(w, "✓ systemctl --user link %s\n", unit)
+	return nil
 }
 
 // notLoaded reports whether systemctl said the timer doesn't exist.
