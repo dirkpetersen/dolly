@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Dolly is a Go tool (Go 1.22+, built on `github.com/go-ldap/ldap`) that replicates users and groups one way from Active Directory to OpenLDAP. The repo currently holds the spec (`README.md`), `dolly.yaml.template`, the CI and release workflows, and `.goreleaser.yaml`. No Go code exists yet. `README.md` is the spec: CLI surface, config schema (`dolly.yaml`), and sync algorithm. Keep it in sync when behavior changes.
+Dolly is a Go tool (Go 1.22+, built on `github.com/go-ldap/ldap`) that replicates users and groups one way from Active Directory to OpenLDAP. The repo currently holds the spec (`README.md`), the user docs (`docs/`, `zensical.toml`), `dolly.yaml.template`, the CI, release, and docs workflows, and `.goreleaser.yaml`. No Go code exists yet. `README.md` is the spec: CLI surface, config schema (`dolly.yaml`), and sync algorithm. Keep it in sync when behavior changes.
 
 Planned layout and commands (from README):
 
@@ -25,7 +25,25 @@ Exit codes: `0` success or lock held elsewhere, `1` error, `2` guard tripped. Th
 - **Native LDAP only.** All reads and writes go through `go-ldap`. Never shell out to `ldapmodify`, `slapadd`, or similar, and never write LDIF files. The only external command is `systemctl --user` in `dolly install`.
 - **The planner is a pure function:** (AD snapshot, target snapshot, ownership records, config) → ordered plan of operations. It does no I/O. All the ownership rules live there, covered by table-driven tests, one per rule in the README's "Ownership records" list. `--dry-run` prints the same plan that a real run applies.
 - **AD access sits behind a `Source` interface** with an in-memory fake for tests, because no test AD exists yet (a test OU and test LDAP server are TBD).
-- **Integration tests** for the target side (apply, ownership records, lock, modrdn, size-limit detection) run against a real OpenLDAP container behind the `integration` build tag. Add the CI job together with the first code, not before: CI triggers on workflow changes and fails without a `go.mod`.
+- **Integration tests** for the target side (apply, ownership records, lock, modrdn, size-limit detection) run against a real OpenLDAP container behind the `integration` build tag. Add the CI job together with the first code, not before. `ci.yml` fails without a `go.mod`, so its `paths` trigger excludes the workflow files for now. In the commit that adds `go.mod`, add `.github/workflows/ci.yml` and `release.yml` back to its `paths`.
+
+## Documentation
+
+User documentation is a [Zensical](https://zensical.org) site: config in `zensical.toml` (nav lives there), pages in `docs/`, and output in `site/` (git-ignored). `.github/workflows/docs.yml` builds it and publishes it to GitHub Pages (https://dirkpetersen.github.io/dolly/) on every push to `main` that touches `docs/` or `zensical.toml`. The repo's Pages source must be set to "GitHub Actions".
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install zensical
+.venv/bin/zensical serve          # preview at localhost:8000
+.venv/bin/zensical build --clean --strict  # --strict fails on warnings; must pass before committing
+```
+
+`README.md` stays the spec. `docs/` is the user-facing version of it. When behavior changes, update both in the same commit. A new page must also be added to `nav` in `zensical.toml`.
+
+## Model routing for agent work
+
+- **Coding:** delegate to a background agent on **Opus** (`model: "opus"`).
+- **Documentation** (`docs/`, README prose): delegate to an agent on **Sonnet** (`model: "sonnet"`).
+- **Before every commit and push:** have an agent on **Fable** (`model: "fable"`) review the diff for correctness, spec consistency (README, `docs/`, template, CLAUDE.md), and anything that shouldn't be committed. Fix what it finds, then commit and push.
 
 ## Hard requirements
 

@@ -1,0 +1,55 @@
+[project]
+site_name = "Dolly"
+site_description = "One-way replication of Active Directory users and groups into OpenLDAP."
+site_url = "https://dirkpetersen.github.io/dolly/"
+site_author = "Dirk Petersen"
+copyright = "&copy; Dirk Petersen. MIT licensed."
+repo_url = "https://github.com/dirkpetersen/dolly"
+repo_name = "dirkpetersen/dolly"
+edit_uri = "edit/main/docs/"
+docs_dir = "docs"
+site_dir = "site"
+nav = [
+  { "Home" = "index.md" },
+  { "Getting started" = "getting-started.md" },
+  { "Configuration" = "configuration.md" },
+  { "Commands" = "commands.md" },
+  { "How it works" = [
+    "how-it-works/index.md",
+    "how-it-works/ownership.md",
+    "how-it-works/run-lock.md",
+  ] },
+  { "Operations" = [
+    "operations/adopting.md",
+    "operations/scheduling.md",
+    "operations/notifications.md",
+    "operations/tls.md",
+    "operations/permissions.md",
+  ] },
+  { "Development" = "development.md" },
+]
+
+[project.theme]
+features = [
+  "navigation.instant",
+  "navigation.tracking",
+  "navigation.sections",
+  "navigation.indexes",
+  "navigation.top",
+  "toc.follow",
+  "content.code.copy",
+  "content.action.edit",
+  "search.highlight",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"

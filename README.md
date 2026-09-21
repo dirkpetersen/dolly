@@ -212,10 +212,10 @@ ou=dolly,dc=local
 ├── ou=users
 │   └── cn=<objectGUID>   objectClass: organizationalRole
 │                         seeAlso: uid=jdoe,ou=people,dc=local
-└── ou=groups
-    └── cn=<objectGUID>   objectClass: organizationalRole
-                          seeAlso: cn=hpc-users,ou=group,dc=local
-                          roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added)
+├── ou=groups
+│   └── cn=<objectGUID>   objectClass: organizationalRole
+│                         seeAlso: cn=hpc-users,ou=group,dc=local
+│                         roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added)
 ├── cn=lock                                                              (only while a run is active)
 └── cn=status             last successful run, current failure, last notification
 ```
@@ -304,7 +304,7 @@ loginctl enable-linger "$USER"   # keep the timer running while you're logged ou
 
 ## Notifications
 
-Dolly sends at most **one email per run**. It's a summary of everything that happened: counts, then the adds, removals, renames, changed ID numbers, warnings, and errors. A hundred changed users is still one mail.
+With `on: changes`, Dolly mails when a run made changes. Failures are always reported, whichever setting you choose. Dolly sends at most **one email per run**. It's a summary of everything that happened: counts, then the adds, removals, renames, changed ID numbers, warnings, and errors. A hundred changed users is still one mail.
 
 Dolly keeps a `cn=status` entry under `state_base` with the last successful run, the current failure, and when it last sent mail. With `on: failure` it sends one mail when a failure first appears, a reminder at most every `remind_every` while it persists, and one mail when the run succeeds again. So an AD outage overnight is two or three mails, not 96. Ignored entries and conflicts are listed in the run summary and mailed only when the list changes.
 

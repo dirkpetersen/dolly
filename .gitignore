@@ -33,3 +33,8 @@ go.work.sum
 
 # Local Dolly config (may contain passwords); dolly.yaml.template is the checked-in example
 dolly.yaml
+
+# Zensical build output
+site/
+.cache/
+.venv/

@@ -3,9 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
-    paths: ["**.go", "go.mod", "go.sum", ".goreleaser.yaml", ".github/workflows/**"]
+    paths: ["**.go", "go.mod", "go.sum", ".goreleaser.yaml"]
   pull_request:
-    paths: ["**.go", "go.mod", "go.sum", ".goreleaser.yaml", ".github/workflows/**"]
+    paths: ["**.go", "go.mod", "go.sum", ".goreleaser.yaml"]
 
 permissions:
   contents: read
