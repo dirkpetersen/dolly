@@ -2,14 +2,14 @@
 
 ## Active Directory
 
-A regular, read-only service account is enough for `source.bind_dn`. Dolly never writes to AD — it only binds and searches. The account needs read access to the configured `users.base` and `groups.base`, and to any out-of-scope entries referenced as group members (see [out-of-scope members](../how-it-works/ownership.md#out-of-scope-members)).
+A regular, read-only service account is enough for `source.bind_dn`. Dolly never writes to AD — it only binds and searches. The account needs read access to the configured `users.base` and `groups.base`, and to any entries referenced as group members (see [out-of-scope members](../how-it-works/ownership.md#out-of-scope-members)).
 
 ## Target LDAP
 
 The `target.bind_dn` needs:
 
-- **Write access** to `users_base`, `groups_base`, and `state_base`, and ideally nothing else.
-- **Read access to every entry** under those bases — not a filtered or size-limited view.
+- **Write access** to `users_base`, `groups_base`, and `state_base`, and ideally nothing else. A groups-only deployment (`dolly sync --groups` only) never writes to `users_base`, so read access is enough there.
+- **Read access to every entry** under `groups_base` and `state_base`, and under `users_base` for runs that sync users — not a filtered or size-limited view. A `--groups` run never reads all of `users_base`: it looks up only the uids it needs, 50 per search, so a `users_base` larger than the size limit is fine for it.
 
 ## `olcSizeLimit` and `olcLimits`
 

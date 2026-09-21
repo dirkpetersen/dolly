@@ -71,12 +71,20 @@ func (o *ADObject) Missing(required []string) []string {
 	return miss
 }
 
-// ADSnapshot is a complete read of AD: every in-scope user and group, plus
-// every out-of-scope object reachable as a group member.
+// ADSnapshot is a complete read of AD: every in-scope group, every in-scope
+// user (if UsersRead), plus every object reachable as a group member.
 type ADSnapshot struct {
 	Objects []*ADObject
 	// Unresolved lists member DNs that AD could not find.
 	Unresolved []string
+	// Filtered lists member DNs that exist in AD but match neither the
+	// users nor the groups search filter; they are skipped like objects
+	// outside the configured scope.
+	Filtered []string
+	// UsersRead is true when the users search base was read. A groups-only
+	// run doesn't read it: it fetches group members by DN instead, and
+	// every user in the snapshot is then out of scope (InScope false).
+	UsersRead bool
 }
 
 // Count returns the number of in-scope objects of kind k.

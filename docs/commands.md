@@ -23,9 +23,9 @@ dolly sync --force        # apply even if the mass-deletion guard trips
 
 There is no `dolly diff` — use `dolly sync --dry-run` instead.
 
-A groups-only run still reads AD users (read-only) to resolve group members. A users-only run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced; the only group values a `--users` run changes are `member`/`memberUid` fix-ups for a renamed or pruned user. Removing owned memberships from a group happens only in a run that includes groups.
+A groups-only run doesn't read the AD users base or the target's `users_base` in full: it fetches each group member from AD by DN and looks up only the uids it needs on the target, so it works with a huge or size-limited `users_base`. See [Groups-only deployments](configuration.md#groups-only-deployments). A users-only run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced; the only group values a `--users` run changes are `member`/`memberUid` fix-ups for a renamed or pruned user. Removing owned memberships from a group happens only in a run that includes groups.
 
-In a `--groups` run, a member's target DN comes from the user's own ownership record (`seeAlso`), not a fresh AD lookup, so a user rename still pending its own `--users` sync causes no group churn. With `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it. With `memberUid` only, no user entry is needed.
+In a `--groups` run, a member's target DN comes from the user's own ownership record (`seeAlso`), not a fresh AD lookup, so a user rename still pending its own `--users` sync causes no group churn. With `sync.require_member_on_target` (the default), a member is added only if its entry exists under `users_base`. With it off and `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it; with `memberUid` only, no user entry is needed.
 
 `--users` and `--groups` each work standalone and never assume the other ran in the same invocation.
 

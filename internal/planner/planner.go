@@ -2,8 +2,10 @@ package planner
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,9 @@ func Build(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records,
 	if err != nil {
 		return nil, err
 	}
+	if opt.Groups && !opt.Adopt && !tgt.UsersRead && tgt.ExistingUsers == nil && (cfg.Sync.RequireMemberOnTarget || p.memberMode) {
+		return nil, fmt.Errorf("planning groups needs the target's users: read users_base or look up the member uids (TargetSnapshot.ExistingUsers)")
+	}
 	p.prepare(ad)
 	p.containers(tgt)
 	switch {
@@ -52,7 +57,7 @@ func Build(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records,
 	return p.plan, nil
 }
 
-// adUser is a managed AD user, mapped to its target form.
+// adUser is an AD user with a mapped uid, mapped to its target form.
 type adUser struct {
 	obj      *model.ADObject
 	attrs    map[string][]string // mapped target attributes
@@ -84,12 +89,16 @@ type planner struct {
 
 	// AD side
 	byDN         map[string]*model.ADObject // DNKey -> object
-	validUsers   map[string]*adUser         // GUID -> users with required attrs (before dedup)
-	users        map[string]*adUser         // GUID -> managed users (dedup winners)
+	memberUsers  map[string]*adUser         // GUID -> users with a mapped uid (before dedup)
+	validUsers   map[string]*adUser         // GUID -> users with all required attrs (before dedup)
+	members      map[string]*adUser         // GUID -> users that can be group members (dedup winners)
+	users        map[string]*adUser         // GUID -> managed user entries (dedup winners with all required attrs)
 	groups       map[string]*adGroup        // GUID -> synced in-scope groups (dedup winners)
 	groupMembers map[string][]*model.ADObject
 	ignoredWhy   map[string]string // GUID -> why an object is not managed
 	unresolved   map[string]bool
+	filtered     map[string]bool // DNKey -> in AD, but matching neither search filter
+	filteredSeen map[string]bool // filtered members referenced by a synced group
 	skipped      map[string]bool
 	reported     map[string]bool // GUIDs already listed as ignored
 
@@ -97,6 +106,9 @@ type planner struct {
 	userEntries, groupEntries   map[string]*model.Entry  // DNKey -> entry
 	userRecs, groupRecs         map[string]*model.Record // GUID -> record
 	userRecBySee, groupRecBySee map[string]string        // DNKey(seeAlso) -> GUID
+	existing                    *model.UserSet           // users found by targeted lookups (groups-only runs)
+	entryUIDs                   map[string]bool          // lowercased uids of userEntries, built on first use
+	missingReported             map[string]bool          // members reported as missing on the target
 
 	removedPairs, addedPairs map[string]bool
 	localRemovedPairs        map[string]bool    // local memberships removed by a prune
@@ -115,12 +127,16 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		uidMode:      cfg.Mapping.Groups.HasMemberUID(),
 		placeholder:  cfg.Target.EmptyGroupMember,
 		byDN:         map[string]*model.ADObject{},
+		memberUsers:  map[string]*adUser{},
 		validUsers:   map[string]*adUser{},
+		members:      map[string]*adUser{},
 		users:        map[string]*adUser{},
 		groups:       map[string]*adGroup{},
 		groupMembers: map[string][]*model.ADObject{},
 		ignoredWhy:   map[string]string{},
 		unresolved:   map[string]bool{},
+		filtered:     map[string]bool{},
+		filteredSeen: map[string]bool{},
 		skipped:      map[string]bool{},
 		reported:     map[string]bool{},
 		userEntries:  map[string]*model.Entry{},
@@ -130,6 +146,8 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		userRecBySee: map[string]string{}, groupRecBySee: map[string]string{},
 		removedPairs: map[string]bool{}, addedPairs: map[string]bool{},
 		localRemovedPairs: map[string]bool{}, pendingUsers: map[string]bool{},
+		missingReported: map[string]bool{},
+		existing:        tgt.ExistingUsers,
 	}
 	for name, src := range cfg.Mapping.Users.Attributes {
 		v, err := config.CompileValue(name, src)
@@ -184,6 +202,8 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 	}
 	p.plan.Counts.TargetUsers = len(tgt.Users)
 	p.plan.Counts.TargetGroups = len(tgt.Groups)
+	p.plan.TargetUsersRead = tgt.UsersRead
+	p.plan.ADUsersRead = ad.UsersRead
 	return p, nil
 }
 
@@ -201,26 +221,49 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 	for _, dn := range ad.Unresolved {
 		p.unresolved[model.MustDNKey(dn)] = true
 	}
+	for _, dn := range ad.Filtered {
+		p.filtered[model.MustDNKey(dn)] = true
+	}
 	p.plan.Counts.ADUsers = ad.Count(model.KindUser)
 	p.plan.Counts.ADGroups = ad.Count(model.KindGroup)
 
-	// Users with all required attributes, in or out of scope.
+	// spec: every user with a mapped uid can be a group member; only users
+	// that also have every required attribute (uidNumber, gidNumber, ...)
+	// get a user entry. A groups-only deployment therefore works with AD
+	// users that have no Unix numbers at all.
 	for _, o := range objs {
 		if o.Kind != model.KindUser {
 			continue
 		}
-		if miss := o.Missing(p.cfg.Mapping.Users.Required); len(miss) > 0 {
-			p.ignoredWhy[o.GUID] = "missing required attribute " + strings.Join(miss, ", ")
+		miss := o.Missing(p.cfg.Mapping.Users.Required)
+		u, err := p.mapUser(o)
+		switch {
+		case errors.Is(err, errNoUID):
+			why := "has no uid"
+			if len(miss) > 0 {
+				why = "missing required attribute " + strings.Join(miss, ", ")
+			}
+			p.ignoredWhy[o.GUID] = why
 			if o.InScope {
-				p.ignore(o, p.ignoredWhy[o.GUID])
+				p.ignore(o, why)
 			}
 			continue
-		}
-		u, err := p.mapUser(o)
-		if err != nil {
+		case err != nil:
 			p.ignoredWhy[o.GUID] = err.Error()
 			p.reported[o.GUID] = true
 			p.warn(WarnInvalid, o.DN, err.Error())
+			continue
+		}
+		p.memberUsers[o.GUID] = u
+		why := badIDs(u.attrs, "uidNumber", "gidNumber")
+		if len(miss) > 0 {
+			why = "missing required attribute " + strings.Join(miss, ", ")
+		}
+		if why != "" {
+			p.ignoredWhy[o.GUID] = why
+			if o.InScope {
+				p.ignoreEntry(o)
+			}
 			continue
 		}
 		p.validUsers[o.GUID] = u
@@ -243,6 +286,11 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 			p.warn(WarnInvalid, o.DN, err.Error())
 			continue
 		}
+		if why := badIDs(g.attrs, "gidNumber"); why != "" {
+			p.ignoredWhy[o.GUID] = why
+			p.ignore(o, why)
+			continue
+		}
 		cands = append(cands, g)
 	}
 	for _, g := range dedup(cands, func(g *adGroup) (string, string, string, int) {
@@ -254,24 +302,26 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 		p.groups[g.obj.GUID] = g
 	}
 
-	// Flatten every synced group. Valid users reached this way are managed,
-	// also when they are outside the users search base.
-	managed := map[string]*adUser{}
+	// Flatten every synced group. Users reached this way are members, and
+	// the valid ones are managed, also when they are outside the users
+	// search base. Duplicate uids are resolved once over both sets, so a
+	// name means the same AD user as a member and as an entry.
+	byGUID := map[string]*adUser{}
 	for guid, u := range p.validUsers {
 		if u.obj.InScope {
-			managed[guid] = u
+			byGUID[guid] = u
 		}
 	}
 	for _, guid := range model.SortedKeys(p.groups) {
 		ms := p.flatten(p.groups[guid].obj, false)
 		p.groupMembers[guid] = ms
 		for _, m := range ms {
-			managed[m.GUID] = p.validUsers[m.GUID]
+			byGUID[m.GUID] = p.memberUsers[m.GUID]
 		}
 	}
 	var ucands []*adUser
-	for _, guid := range model.SortedKeys(managed) {
-		ucands = append(ucands, managed[guid])
+	for _, guid := range model.SortedKeys(byGUID) {
+		ucands = append(ucands, byGUID[guid])
 	}
 	for _, u := range dedup(ucands, func(u *adUser) (string, string, string, int) {
 		return u.uid, u.obj.GUID, u.dn, p.rank(p.userRecs, p.userRecBySee, u.obj.GUID, u.dn, u.obj.InScope)
@@ -279,9 +329,13 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 		p.ignoredWhy[loser.obj.GUID] = "duplicate uid " + loser.uid
 		p.warn(WarnDuplicate, loser.obj.DN, fmt.Sprintf("uid %q is also used by %s, which wins", loser.uid, winner.obj.DN))
 	}) {
-		p.users[u.obj.GUID] = u
+		p.members[u.obj.GUID] = u
+		if p.validUsers[u.obj.GUID] != nil {
+			p.users[u.obj.GUID] = u
+		}
 	}
 	p.plan.Counts.UnresolvedMembers = len(p.unresolved)
+	p.plan.Counts.FilteredMembers = len(p.filteredSeen)
 	p.plan.Counts.SkippedMembers = len(p.skipped)
 }
 
@@ -353,16 +407,22 @@ func (p *planner) flatten(g *model.ADObject, loose bool) []*model.ADObject {
 			}
 			o := p.byDN[k]
 			switch {
+			case o == nil && p.filtered[k]:
+				if !loose {
+					p.filteredSeen[k] = true
+				}
 			case o == nil:
 				if !loose {
 					p.unresolved[k] = true
 				}
 			case o.Kind == model.KindUser:
-				ok := p.validUsers[o.GUID] != nil
+				ok := p.memberUsers[o.GUID] != nil
 				if loose {
 					ok = p.looseUID(o) != ""
 				} else if !ok && p.ignoredWhy[o.GUID] != "" {
 					p.ignore(o, p.ignoredWhy[o.GUID])
+				} else if ok && p.validUsers[o.GUID] == nil {
+					p.ignoreEntry(o)
 				}
 				if ok && !seen[o.GUID] {
 					seen[o.GUID] = true
@@ -373,8 +433,8 @@ func (p *planner) flatten(g *model.ADObject, loose bool) []*model.ADObject {
 					continue
 				}
 				if !loose {
-					if miss := o.Missing(p.cfg.Mapping.Groups.Required); len(miss) > 0 {
-						p.ignore(o, "missing required attribute "+strings.Join(miss, ", ")+"; not flattened into "+g.DN)
+					if why := p.groupProblem(o); why != "" {
+						p.ignore(o, why+"; not flattened into "+g.DN)
 						continue
 					}
 				}
@@ -392,10 +452,54 @@ func (p *planner) flatten(g *model.ADObject, loose bool) []*model.ADObject {
 	return out
 }
 
+// groupProblem returns why a group can't be used (a missing required
+// attribute or an invalid gidNumber), or "".
+func (p *planner) groupProblem(o *model.ADObject) string {
+	if miss := o.Missing(p.cfg.Mapping.Groups.Required); len(miss) > 0 {
+		return "missing required attribute " + strings.Join(miss, ", ")
+	}
+	if attrs, err := p.mapAttrs(o, p.groupVals, p.groupAttrs); err == nil {
+		return badIDs(attrs, "gidNumber")
+	}
+	return ""
+}
+
+// maxID is the largest valid uid or gid: Linux uid_t and gid_t are
+// unsigned 32-bit, and 4294967295 is reserved ((uid_t)-1).
+const maxID = 4294967294
+
+// badIDs checks mapped ID attributes Dolly would write. It returns why one
+// is invalid (not a single integer from 0 to maxID), or "". A missing
+// attribute is the required list's business, not this check's.
+//
+// spec: an entry with an invalid uidNumber or gidNumber is ignored and
+// listed once, like one missing a required attribute (AD may hold values
+// such as 11-digit university IDs that no Unix system can use).
+func badIDs(attrs map[string][]string, names ...string) string {
+	for _, n := range names {
+		var vs []string
+		for k, v := range attrs {
+			if strings.EqualFold(k, n) {
+				vs = v
+			}
+		}
+		switch {
+		case len(vs) == 0:
+			continue
+		case len(vs) > 1:
+			return fmt.Sprintf("%s has %d values, want one", n, len(vs))
+		}
+		if v, err := strconv.ParseUint(vs[0], 10, 64); err != nil || v > maxID {
+			return fmt.Sprintf("%s %q is not a valid ID (an integer from 0 to %d)", n, vs[0], uint64(maxID))
+		}
+	}
+	return ""
+}
+
 // looseUID returns the uid an AD user would have on the target, ignoring
 // the required-attribute rule (for adopt).
 func (p *planner) looseUID(o *model.ADObject) string {
-	if u := p.validUsers[o.GUID]; u != nil {
+	if u := p.memberUsers[o.GUID]; u != nil {
 		return u.uid
 	}
 	attrs, err := p.mapAttrs(o, p.userVals, p.userAttrs)
@@ -405,6 +509,10 @@ func (p *planner) looseUID(o *model.ADObject) string {
 	return first(attrs[p.cfg.Mapping.Users.RDN])
 }
 
+// errNoUID means the mapped uid (or RDN) is empty: the AD user lacks the
+// attribute uid is mapped from and can't be a member or an entry.
+var errNoUID = errors.New("mapped uid is empty")
+
 func (p *planner) mapUser(o *model.ADObject) (*adUser, error) {
 	attrs, err := p.mapAttrs(o, p.userVals, p.userAttrs)
 	if err != nil {
@@ -412,7 +520,7 @@ func (p *planner) mapUser(o *model.ADObject) (*adUser, error) {
 	}
 	rdn := first(attrs[p.cfg.Mapping.Users.RDN])
 	if rdn == "" || first(attrs["uid"]) == "" {
-		return nil, fmt.Errorf("mapped uid is empty")
+		return nil, errNoUID
 	}
 	return &adUser{obj: o, attrs: attrs, uid: rdn, dn: model.BuildDN(p.cfg.Mapping.Users.RDN, rdn, p.cfg.Target.UsersBase), disabled: o.Disabled()}, nil
 }
@@ -502,10 +610,11 @@ func (p *planner) finish() {
 	g.LocalRemovals = len(p.localRemovedPairs)
 	g.MaxDeleteMin = p.cfg.Sync.MaxDeleteMin
 	g.MaxDeletePercent = p.cfg.Sync.MaxDeletePercent
+	g.UsersRead = p.plan.ADUsersRead
 	if !p.opt.Adopt {
 		g.evaluate()
 	}
-	order := map[WarningKind]int{WarnConflict: 0, WarnIDChanged: 1, WarnDuplicateID: 2, WarnDuplicate: 3, WarnInvalid: 4, WarnIgnored: 5, WarnPending: 6}
+	order := map[WarningKind]int{WarnConflict: 0, WarnIDChanged: 1, WarnDuplicateID: 2, WarnDuplicate: 3, WarnInvalid: 4, WarnIgnored: 5, WarnPending: 6, WarnMissingOnTarget: 7}
 	sort.SliceStable(p.plan.Warnings, func(i, j int) bool {
 		a, b := p.plan.Warnings[i], p.plan.Warnings[j]
 		if order[a.Kind] != order[b.Kind] {
@@ -522,7 +631,8 @@ func (p *planner) finish() {
 
 // evaluate applies the mass-deletion guard: a removal count trips it when
 // it exceeds both max_delete_min and max_delete_percent of what Dolly owns.
-// AD returning no users or no groups trips it too. Local memberships
+// AD returning no users or no groups trips it too (no users only when the
+// users base was read; a groups-only run doesn't read it). Local memberships
 // removed by a prune (LocalRemovals) are reported but don't count: Dolly
 // doesn't own them, so they are no part of the percentage's denominator.
 func (g *Guard) evaluate() {
@@ -534,7 +644,7 @@ func (g *Guard) evaluate() {
 	}
 	check("membership", g.MembershipRemovals, g.OwnedMemberships)
 	check("user", g.UserRemovals, g.OwnedUsers)
-	if g.ADUsers == 0 {
+	if g.UsersRead && g.ADUsers == 0 {
 		g.Reasons = append(g.Reasons, "AD returned no users")
 	}
 	if g.ADGroups == 0 {
@@ -558,6 +668,14 @@ func (p *planner) ignore(o *model.ADObject, why string) {
 }
 
 func (p *planner) conflict(dn, msg string) { p.warn(WarnConflict, dn, msg) }
+
+// ignoreEntry lists, in runs that manage user entries, a user that can be a
+// group member but lacks a required attribute for its own entry.
+func (p *planner) ignoreEntry(o *model.ADObject) {
+	if p.plan.Users {
+		p.ignore(o, p.ignoredWhy[o.GUID]+"; no user entry is managed for it (it can still be a group member)")
+	}
+}
 
 // --- ID checks ---
 

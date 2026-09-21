@@ -36,8 +36,10 @@ func (p *planner) userDN(u *adUser) string {
 // the user has no ownership record and no entry on the target, so a member
 // value would be a dangling DN. With memberUid only, members are bare uids
 // and need no user entry. The skip is reported once per user as pending.
-func (p *planner) notOnTarget(u *adUser) bool {
-	if p.opt.Users || !p.memberMode || p.userRecs[u.obj.GUID] != nil || p.userEntries[model.MustDNKey(u.dn)] != nil {
+// With sync.require_member_on_target (the default) the stricter
+// missingOnTarget check runs first, so this only matters when it is off.
+func (p *planner) notOnTarget(u *adUser, dn string) bool {
+	if p.opt.Users || !p.memberMode || p.userRecs[u.obj.GUID] != nil || p.onTarget(dn, u.uid) {
 		return false
 	}
 	if !p.pendingUsers[u.obj.GUID] {
@@ -47,26 +49,119 @@ func (p *planner) notOnTarget(u *adUser) bool {
 	return true
 }
 
+// onTarget reports whether the target has an entry for a member: with
+// member in the membership list, an entry at dn; with memberUid only, any
+// entry under users_base with that uid. Entries come from the full read of
+// users_base (including users this plan creates or renames first) or, in a
+// groups-only run, from the targeted uid lookups.
+func (p *planner) onTarget(dn, uid string) bool {
+	if p.memberMode {
+		return p.userEntries[model.MustDNKey(dn)] != nil || p.existing.HasDN(dn)
+	}
+	if p.entryUIDs == nil {
+		p.entryUIDs = map[string]bool{}
+		for _, e := range p.userEntries {
+			for _, v := range e.Get("uid") {
+				p.entryUIDs[strings.ToLower(v)] = true
+			}
+		}
+	}
+	return p.entryUIDs[strings.ToLower(uid)] || p.existing.HasUID(uid)
+}
+
+// missingOnTarget reports a member skipped by require_member_on_target,
+// once per user and run.
+func (p *planner) missingOnTarget(dn, uid string) {
+	k := model.MustDNKey(dn)
+	if p.missingReported[k] {
+		return
+	}
+	p.missingReported[k] = true
+	if p.memberMode {
+		p.warn(WarnMissingOnTarget, dn, "no entry at this DN under users_base; not added to groups (sync.require_member_on_target)")
+		return
+	}
+	p.warn(WarnMissingOnTarget, uid, "no entry with this uid under users_base; not added to groups (sync.require_member_on_target)")
+}
+
 // desired returns the members a group should have: its flattened AD
-// members that are managed and enabled, sorted by DN.
-func (p *planner) desired(g *adGroup) []member {
-	var out []member
+// members that can be members and are enabled, sorted by DN. keep holds
+// members that are wanted but missing on the target: they aren't added,
+// and a Dolly-owned value for them isn't removed either (it goes only when
+// the user leaves the AD group).
+//
+// spec: with require_member_on_target, a member is added only if its entry
+// exists under users_base, Dolly-owned or local.
+func (p *planner) desired(g *adGroup) (want []member, keep map[string]bool) {
+	keep = map[string]bool{}
 	for _, o := range p.groupMembers[g.obj.GUID] {
-		u := p.users[o.GUID]
-		if u == nil || u.disabled || p.notOnTarget(u) {
+		u := p.members[o.GUID]
+		if u == nil || u.disabled {
 			continue
 		}
 		dn := p.userDN(u)
-		out = append(out, member{dn: dn, uid: model.RDNValue(dn)})
+		uid := model.RDNValue(dn)
+		if p.cfg.Sync.RequireMemberOnTarget && !p.onTarget(dn, uid) {
+			p.missingOnTarget(dn, uid)
+			keep[model.MustDNKey(dn)] = true
+			continue
+		}
+		if p.notOnTarget(u, dn) {
+			continue
+		}
+		want = append(want, member{dn: dn, uid: uid})
 	}
-	sort.Slice(out, func(i, j int) bool { return model.MustDNKey(out[i].dn) < model.MustDNKey(out[j].dn) })
-	return out
+	sort.Slice(want, func(i, j int) bool { return model.MustDNKey(want[i].dn) < model.MustDNKey(want[j].dn) })
+	return want, keep
+}
+
+// MemberCandidate is an AD user a groups phase may add to a target group.
+type MemberCandidate struct {
+	UID string // the member's uid (memberUid value)
+	DN  string // the member's target DN (member value, roleOccupant)
+}
+
+// MemberCandidates returns every enabled AD user that a groups phase would
+// want as a member of a synced group, before the require_member_on_target
+// check, sorted by uid. A groups-only run doesn't read users_base (it may be
+// large and size-limited), so the command layer looks these uids up on the
+// target and passes what it finds in TargetSnapshot.ExistingUsers. Like
+// Build, it does no I/O.
+func MemberCandidates(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records, cfg *config.Config) ([]MemberCandidate, error) {
+	p, err := newPlanner(ad, tgt, recs, cfg, Options{Groups: true})
+	if err != nil {
+		return nil, err
+	}
+	p.prepare(ad)
+	seen := map[string]bool{}
+	var out []MemberCandidate
+	for _, g := range p.sortedGroups() {
+		for _, o := range p.groupMembers[g.obj.GUID] {
+			u := p.members[o.GUID]
+			if u == nil || u.disabled {
+				continue
+			}
+			dn := p.userDN(u)
+			if k := model.MustDNKey(dn); !seen[k] {
+				seen[k] = true
+				out = append(out, MemberCandidate{UID: model.RDNValue(dn), DN: dn})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := strings.ToLower(out[i].UID), strings.ToLower(out[j].UID)
+		if a != b {
+			return a < b
+		}
+		return out[i].DN < out[j].DN
+	})
+	return out, nil
 }
 
 func (p *planner) syncGroup(g *adGroup) {
 	guid := g.obj.GUID
 	key := model.MustDNKey(g.dn)
-	want := p.desired(g)
+	want, keep := p.desired(g)
 	rec := p.groupRecs[guid]
 	if rec == nil {
 		if e := p.groupEntries[key]; e != nil {
@@ -112,7 +207,7 @@ func (p *planner) syncGroup(g *adGroup) {
 		return
 	}
 	p.updateGroupAttrs(g, cur)
-	p.syncMembers(cur, rec, want)
+	p.syncMembers(cur, rec, want, keep)
 }
 
 func (p *planner) groupConflict(e *model.Entry, guid string) {
@@ -199,7 +294,8 @@ func (p *planner) updateGroupAttrs(g *adGroup, cur *model.Entry) {
 // syncMembers adds members newly in the AD group and removes Dolly-owned
 // members that left it. A member already present without a roleOccupant is
 // local: it is never removed and never claimed, even if it is also in AD.
-func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member) {
+// Owned members in keep (in the AD group, but missing on the target) stay.
+func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member, keep map[string]bool) {
 	// Index the current values once; each wanted member is looked up once
 	// and additions never affect another member's lookup.
 	occ, mem, uids := map[string]bool{}, map[string]bool{}, map[string]bool{}
@@ -242,7 +338,7 @@ func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member) 
 
 	wantKeys := memberKeys(want)
 	for _, o := range append([]string(nil), rec.Occupants...) {
-		if wantKeys[model.MustDNKey(o)] {
+		if wantKeys[model.MustDNKey(o)] || keep[model.MustDNKey(o)] {
 			continue
 		}
 		p.removeMembership(g, rec, o, model.RDNValue(o), false, false, p.leftWhy(o))
@@ -256,7 +352,7 @@ func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member) 
 func (p *planner) leftWhy(dn string) string {
 	if p.byUserDN == nil {
 		p.byUserDN = map[string]*adUser{}
-		for _, u := range p.users {
+		for _, u := range p.members {
 			p.byUserDN[model.MustDNKey(p.userDN(u))] = u
 		}
 	}

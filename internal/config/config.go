@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+	"text/template/parse"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -116,6 +117,9 @@ type Sync struct {
 	LockTTL          Duration `yaml:"lock_ttl"`
 	RunTimeout       Duration `yaml:"run_timeout"`
 	NetworkTimeout   Duration `yaml:"network_timeout"`
+	// RequireMemberOnTarget adds an AD user to a target group only if an
+	// entry with its uid exists under users_base. Defaults to true.
+	RequireMemberOnTarget bool `yaml:"require_member_on_target"`
 }
 
 // Notify configures email notifications. An empty SMTPHost disables them.
@@ -181,7 +185,9 @@ func Load(path string) (*Config, error) {
 // Parse decodes and validates config data. path is the config file's
 // absolute path, used to resolve relative paths; it is not read.
 func Parse(data []byte, path string) (*Config, error) {
-	c := &Config{Path: path}
+	// Defaults for booleans whose zero value isn't the default are set
+	// before decoding; yaml.v3 leaves fields absent from the file untouched.
+	c := &Config{Path: path, Sync: Sync{RequireMemberOnTarget: true}}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(c); err != nil {
@@ -289,6 +295,70 @@ func CompileValue(name, src string) (Value, error) {
 		return Value{}, fmt.Errorf("%q is neither an AD attribute name nor a Go template", src)
 	}
 	return Value{Attr: s}, nil
+}
+
+// Sources returns the AD attributes the value reads: the plain attribute, or
+// every field a template references (.name). The AD reader requests exactly
+// these, so it never has to fetch every attribute of every object.
+func (v Value) Sources() []string {
+	if v.Tmpl == nil {
+		if v.Attr == "" {
+			return nil
+		}
+		return []string{v.Attr}
+	}
+	var out []string
+	seen := map[string]bool{}
+	var walk func(n parse.Node)
+	walk = func(n parse.Node) {
+		switch n := n.(type) {
+		case *parse.ListNode:
+			if n == nil {
+				return
+			}
+			for _, c := range n.Nodes {
+				walk(c)
+			}
+		case *parse.ActionNode:
+			walk(n.Pipe)
+		case *parse.PipeNode:
+			if n == nil {
+				return
+			}
+			for _, c := range n.Cmds {
+				walk(c)
+			}
+		case *parse.CommandNode:
+			for _, a := range n.Args {
+				walk(a)
+			}
+		case *parse.FieldNode:
+			if len(n.Ident) > 0 && !seen[strings.ToLower(n.Ident[0])] {
+				seen[strings.ToLower(n.Ident[0])] = true
+				out = append(out, n.Ident[0])
+			}
+		case *parse.ChainNode:
+			walk(n.Node)
+		case *parse.IfNode:
+			walk(n.Pipe)
+			walk(n.List)
+			walk(n.ElseList)
+		case *parse.WithNode:
+			walk(n.Pipe)
+			walk(n.List)
+			walk(n.ElseList)
+		case *parse.RangeNode:
+			walk(n.Pipe)
+			walk(n.List)
+			walk(n.ElseList)
+		case *parse.TemplateNode:
+			walk(n.Pipe)
+		}
+	}
+	if v.Tmpl.Tree != nil {
+		walk(v.Tmpl.Tree.Root)
+	}
+	return out
 }
 
 // Validate checks the config for structural errors and returns all of them.
@@ -443,11 +513,25 @@ func (c *Config) validateMapping(add func(string, ...any)) {
 		add("mapping.users.object_classes: required")
 	}
 	// spec: required attributes are absolute (CLAUDE.md), so the list may add
-	// attributes but never drop these.
-	hasAll("mapping.users", "required", u.Required, "uid", "uidNumber", "gidNumber")
+	// attributes but never drop the AD attributes that uid, uidNumber, and
+	// gidNumber are mapped from. A value mapped through a template has no
+	// single source attribute, so it can't be checked here; an empty result
+	// still makes the user unusable (uid) or incomplete (the numbers).
 	uidSrc, ok := lookup(u.Attributes, "uid")
 	if !ok {
 		add("mapping.users.attributes: uid is required (it names members and ownership records)")
+	}
+	for _, name := range []string{"uid", "uidNumber", "gidNumber"} {
+		src, ok := lookup(u.Attributes, name)
+		if !ok {
+			if name != "uid" {
+				add("mapping.users.attributes: %s is required (posixAccount needs it)", name)
+			}
+			continue
+		}
+		if v, err := CompileValue(name, src); err == nil && v.Attr != "" {
+			hasAll("mapping.users", "required", u.Required, v.Attr)
+		}
 	}
 	if u.RDN == "" {
 		add("mapping.users.rdn: required")

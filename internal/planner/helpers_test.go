@@ -49,6 +49,10 @@ func uidOnly(c *config.Config) {
 	c.Mapping.Groups.Membership = []config.Membership{{Attribute: config.AttrMemberUID}}
 }
 
+// lax turns off sync.require_member_on_target, for tests of rules that
+// predate it or of what happens without it.
+func lax(c *config.Config) { c.Sync.RequireMemberOnTarget = false }
+
 func guid(n int) string { return fmt.Sprintf("00000000-0000-0000-0000-%012x", n) }
 
 // rec returns the short name opStr uses for a record DN.
@@ -142,7 +146,7 @@ func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
 			fake.InScopeUsers = append(fake.InScopeUsers, o)
 		}
 	}
-	snap, err := source.Read(context.Background(), fake)
+	snap, err := source.Read(context.Background(), fake, opt.Users || opt.Adopt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,6 +155,7 @@ func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tgt.UsersRead = true
 	if opt.Now.IsZero() {
 		opt.Now = now
 	}

@@ -46,3 +46,6 @@ site/
 *.swp
 *.swo
 *~
+
+# Password files referenced from dolly.yaml (bind_password_file, password_file)
+*.secret

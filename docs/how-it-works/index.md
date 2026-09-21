@@ -8,18 +8,18 @@ Dolly takes the run lock in the target LDAP, at `cn=lock,<state_base>`. If anoth
 
 ## 2. Bleat
 
-Dolly binds to AD and runs paged searches for all in-scope users and groups, on every run. Large `member` attributes are fetched with ranged retrieval (`member;range=…`), so AD's 1500-value limit on a single attribute read never silently truncates a large group. Group members outside the configured search bases are followed and fetched individually by DN.
+Dolly binds to AD, trying `source.urls` in order, and runs paged searches for all in-scope groups on every run, and for all in-scope users in every run that syncs users. Large `member` attributes are fetched with ranged retrieval (`member;range=…`), so AD's 1500-value limit on a single attribute read never silently truncates a large group. Group members the searches didn't return, such as members outside the configured search bases, are fetched individually by DN (base-scope lookups, several at a time). They must match `source.users.filter` or `source.groups.filter`, just like the searches. A member that matches neither is skipped as filtered, as if it were out of scope.
 
-A groups-only run (`--groups`) still reads the AD users, read-only, in order to resolve group members to target users. Symmetrically, a users-only run (`--users`) still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced by a group and must therefore still be followed. In a `--users` run, the only group values that change are `member`/`memberUid` fix-ups for a user rename or prune; removing owned memberships happens only in a run that includes groups (`dolly sync` or `--groups`).
+A groups-only run (`--groups`) doesn't search the AD users base at all. It fetches every group member by DN and follows nested groups the same way, so its cost depends on the size of the synced groups, not of the users base. On the target it reads `groups_base` and `state_base`, but not `users_base`. Instead it looks up only the uids of the members it would add, 50 per search (`(|(uid=a)(uid=b)…)`), so a `users_base` larger than the server's size limit is no problem. A users-only run (`--users`) still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced by a group and must therefore still be followed. In a `--users` run, the only group values that change are `member`/`memberUid` fix-ups for a user rename or prune; removing owned memberships happens only in a run that includes groups (`dolly sync` or `--groups`).
 
 !!! warning "Never plan from partial data"
     If any read from AD or the target fails, or comes back truncated (for example `sizeLimitExceeded`), the run aborts immediately. Dolly never computes a plan from an incomplete read. OpenLDAP's `olcSizeLimit` (500 by default) applies to every bind DN except the rootdn, so a non-rootdn bind DN that hits it will trip this abort — see [Permissions](../operations/permissions.md).
 
-Every run reads *all* in-scope users and groups — there's no `uSNChanged` incremental mode, because it would miss deletions and nested-group membership changes. Reading around 10,000 groups is cheap, on the order of seconds.
+Every run reads *all* in-scope groups, and all in-scope users when it syncs users. There's no `uSNChanged` incremental mode, because it would miss deletions and nested-group membership changes. Reading around 10,000 groups is cheap, on the order of seconds.
 
 ## 3. Shear
 
-Each AD entry is mapped through the configured [attribute rules](../configuration.md#mapping). Entries missing a `required` attribute are ignored — not just skipped with a warning every run, but listed once in the run summary. Nested groups are flattened into direct user members, with a cycle guard against loops in the parent chain. A group whose only members are other groups is still emitted once flattening resolves it to actual users.
+Each AD entry is mapped through the configured [attribute rules](../configuration.md#mapping). Entries missing a `required` attribute, or with a `uidNumber` or `gidNumber` outside 0 to 4294967294, are ignored — not just skipped with a warning every run, but listed once in the run summary. A user missing `uidNumber` or `gidNumber` only gets no entry of its own; it can still be a group member (see [Required attributes](ownership.md#required-attributes)). Nested groups are flattened into direct user members, with a cycle guard against loops in the parent chain. A group whose only members are other groups is still emitted once flattening resolves it to actual users.
 
 Members are resolved by DN, never by CN: AD member DNs are mapped through a `distinguishedName → objectGUID` map to the correct user, because CNs aren't unique and can contain escaped commas (`CN=Gow\, Edward L,...`).
 
@@ -34,7 +34,7 @@ Dolly reads the target's current entries and its own ownership records under `st
 Before writing anything, Dolly counts planned removals across the whole run, separately for group memberships and for users. The run aborts with **no writes**, exits with code `2`, and sends a notification if:
 
 - either count exceeds **both** `max_delete_min` and `max_delete_percent` of what Dolly owns, or
-- AD returned zero users or zero groups at all.
+- AD returned zero users or zero groups at all. (A `--groups` run doesn't read the users base, so only zero groups counts there.)
 
 Local memberships removed by a prune are reported in the summary but don't count toward the guard.
 

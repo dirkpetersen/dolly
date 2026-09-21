@@ -3,17 +3,23 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 	"time"
 
 	"github.com/dirkpetersen/dolly/internal/config"
 	"github.com/dirkpetersen/dolly/internal/fixture"
+	"github.com/dirkpetersen/dolly/internal/model"
 	"github.com/dirkpetersen/dolly/internal/planner"
+	"github.com/dirkpetersen/dolly/internal/source"
+	"github.com/dirkpetersen/dolly/internal/target"
 )
 
 // Set by GoReleaser via -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
@@ -124,10 +130,10 @@ func parse(fs *flag.FlagSet, args []string) (int, bool) {
 }
 
 const fixtureHelp = `
-Development only (until the AD and target readers exist):
+Development only:
   --fixture FILE  Plan from a YAML or JSON snapshot file instead of reading AD
-                  and the target. Only valid with --dry-run. In this build,
-                  --dry-run requires it. See internal/fixture for the format.
+                  and the target. Only valid with --dry-run. See
+                  internal/fixture for the format.
 `
 
 func runSync(args []string, stdout, stderr io.Writer) int {
@@ -173,11 +179,12 @@ func plan(cmd, cfgPath, fix string, dryRun, force bool, opt planner.Options, std
 		fmt.Fprintf(stderr, "dolly %s: not implemented yet: this build can only plan; use --dry-run\n", cmd)
 		return exitError
 	}
-	if fix == "" {
-		fmt.Fprintf(stderr, "dolly %s: not implemented yet: reading AD and the target; use --dry-run --fixture FILE\n", cmd)
-		return exitError
+	var snaps *fixture.Snapshots
+	if fix != "" {
+		snaps, err = fixture.Load(fix, cfg, opt.Users || opt.Adopt)
+	} else {
+		snaps, err = readLive(cfg, opt, stderr)
 	}
-	snaps, err := fixture.Load(fix, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
 		return exitError
@@ -203,6 +210,89 @@ func plan(cmd, cfgPath, fix string, dryRun, force bool, opt planner.Options, std
 		return exitGuard
 	}
 	return exitOK
+}
+
+// readLive reads AD and the target for a plan, printing progress to
+// stderr. It is read-only: no lock, no writes.
+//
+// spec: a run that syncs users (and adopt) reads the AD users base and the
+// target's users_base in full. A groups-only run reads neither: AD members
+// are fetched by DN, and the target is asked only about the uids those
+// members need (batched lookups), so a huge or size-limited users_base
+// never has to be read.
+func readLive(cfg *config.Config, opt planner.Options, stderr io.Writer) (*fixture.Snapshots, error) {
+	start := time.Now()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, cfg.Sync.RunTimeout.Duration)
+	defer cancel()
+	step := time.Now()
+	progress := func(format string, a ...any) {
+		now := time.Now()
+		fmt.Fprintf(stderr, "dolly: "+format+" (%s)\n", append(a, now.Sub(step).Round(time.Millisecond))...)
+		step = now
+	}
+	readUsers := opt.Users || opt.Adopt
+
+	ad, err := source.DialAD(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer ad.Close()
+	progress("connected to AD %s as %s", ad.URL, cfg.Source.BindDN)
+	snap, err := source.Read(ctx, ad, readUsers)
+	if err != nil {
+		return nil, err
+	}
+	fetched := 0
+	for _, o := range snap.Objects {
+		if !o.InScope {
+			fetched++
+		}
+	}
+	if readUsers {
+		progress("read AD: %d users and %d groups in scope, %d objects fetched by DN, %d unresolved, %d filtered",
+			snap.Count(model.KindUser), snap.Count(model.KindGroup), fetched, len(snap.Unresolved), len(snap.Filtered))
+	} else {
+		progress("read AD: %d groups in scope (users base not read), %d members fetched by DN, %d unresolved, %d filtered",
+			snap.Count(model.KindGroup), fetched, len(snap.Unresolved), len(snap.Filtered))
+	}
+
+	tr, err := target.Dial(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer tr.Close()
+	progress("connected to target %s as %s", tr.URL, cfg.Target.BindDN)
+	tgt, recs, err := tr.Read(ctx, readUsers)
+	if err != nil {
+		return nil, err
+	}
+	users := fmt.Sprint(len(tgt.Users), " user entries")
+	if !readUsers {
+		users = "users_base not read"
+	}
+	progress("read target: %d group entries, %s, %d user and %d group ownership records",
+		len(tgt.Groups), users, len(recs.Users), len(recs.Groups))
+
+	if opt.Groups && !opt.Adopt && !readUsers && (cfg.Sync.RequireMemberOnTarget || cfg.Mapping.Groups.HasMember()) {
+		cands, err := planner.MemberCandidates(snap, tgt, recs, cfg)
+		if err != nil {
+			return nil, err
+		}
+		uids := make([]string, len(cands))
+		for i, c := range cands {
+			uids[i] = c.UID
+		}
+		set, err := tr.LookupUsers(ctx, uids)
+		if err != nil {
+			return nil, err
+		}
+		tgt.ExistingUsers = set
+		progress("looked up %d member uids under %s: %d found", len(uids), cfg.Target.UsersBase, len(set.UIDs))
+	}
+	fmt.Fprintf(stderr, "dolly: read complete in %s\n", time.Since(start).Round(time.Millisecond))
+	return &fixture.Snapshots{AD: snap, Target: tgt, Records: recs}, nil
 }
 
 // notImplemented returns a command that accepts its documented flags and

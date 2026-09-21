@@ -27,10 +27,19 @@ func (p *Plan) Print(w io.Writer) {
 	}
 	c := p.Counts
 	fmt.Fprintf(w, "Plan: dolly %s (%s)\n", p.Mode, strings.Join(phases, " and "))
-	fmt.Fprintf(w, "AD: %d users, %d groups in scope; %d out-of-scope objects followed; %d unresolved and %d non-user members skipped\n",
-		c.ADUsers, c.ADGroups, c.Followed, c.UnresolvedMembers, c.SkippedMembers)
-	fmt.Fprintf(w, "Target: %d user entries, %d group entries; Dolly owns %d users and %d memberships\n",
-		c.TargetUsers, c.TargetGroups, p.Guard.OwnedUsers, p.Guard.OwnedMemberships)
+	if p.ADUsersRead {
+		fmt.Fprintf(w, "AD: %d users, %d groups in scope; %d out-of-scope objects followed; %d unresolved, %d filtered, and %d non-user members skipped\n",
+			c.ADUsers, c.ADGroups, c.Followed, c.UnresolvedMembers, c.FilteredMembers, c.SkippedMembers)
+	} else {
+		fmt.Fprintf(w, "AD: %d groups in scope; users base not read, %d members fetched by DN; %d unresolved, %d filtered, and %d non-user members skipped\n",
+			c.ADGroups, c.Followed, c.UnresolvedMembers, c.FilteredMembers, c.SkippedMembers)
+	}
+	users := fmt.Sprintf("%d user entries", c.TargetUsers)
+	if !p.TargetUsersRead {
+		users = "users_base not read"
+	}
+	fmt.Fprintf(w, "Target: %s, %d group entries; Dolly owns %d users and %d memberships\n",
+		users, c.TargetGroups, p.Guard.OwnedUsers, p.Guard.OwnedMemberships)
 
 	for _, sec := range sectionOrder {
 		var steps []int

@@ -87,6 +87,9 @@ const (
 	WarnIDChanged   WarningKind = "id-changed"   // uidNumber/gidNumber changed
 	WarnPending     WarningKind = "pending"      // groupOfNames group without members, or a user not yet on the target
 	WarnInvalid     WarningKind = "invalid"      // mapping failed for an entry
+	// WarnMissingOnTarget: an AD group member with no entry under
+	// users_base, not added (sync.require_member_on_target).
+	WarnMissingOnTarget WarningKind = "missing-on-target"
 )
 
 // Warning is one line in the run summary. Warnings don't stop the run.
@@ -104,17 +107,19 @@ type Counts struct {
 	MembersAdded, MembersRemoved, MembersRenamed           int
 	RecordsAdded, RecordsUpdated, RecordsDeleted           int
 	UnresolvedMembers, SkippedMembers, IgnoredEntries      int
+	FilteredMembers                                        int // members in AD that match neither search filter
 	ADUsers, ADGroups, TargetUsers, TargetGroups, Followed int
 }
 
 // Guard is the mass-deletion guard evaluation.
 type Guard struct {
-	MembershipRemovals int // owned (group, user) pairs removed this run
-	LocalRemovals      int // local (group, user) pairs removed by a prune; reported, not guarded
-	OwnedMemberships   int // roleOccupant values before the run
-	UserRemovals       int // user entries deleted this run
-	OwnedUsers         int // user records before the run
-	ADUsers, ADGroups  int // in-scope objects AD returned
+	MembershipRemovals int  // owned (group, user) pairs removed this run
+	LocalRemovals      int  // local (group, user) pairs removed by a prune; reported, not guarded
+	OwnedMemberships   int  // roleOccupant values before the run
+	UserRemovals       int  // user entries deleted this run
+	OwnedUsers         int  // user records before the run
+	ADUsers, ADGroups  int  // in-scope objects AD returned
+	UsersRead          bool // the AD users base was read (ADUsers is meaningful)
 	MaxDeleteMin       int
 	MaxDeletePercent   float64
 	Tripped            bool
@@ -130,6 +135,10 @@ type Plan struct {
 	Warnings []Warning
 	Counts   Counts
 	Guard    Guard
+	// ADUsersRead and TargetUsersRead say whether the AD users base and the
+	// target's users_base were read in full. A groups-only run reads
+	// neither: it fetches AD members by DN and looks up the uids it needs.
+	ADUsersRead, TargetUsersRead bool
 }
 
 // Empty reports whether the plan makes no changes.

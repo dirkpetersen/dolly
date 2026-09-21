@@ -59,7 +59,7 @@ mapping:
   users:
     rdn: uid
     object_classes: [account, posixAccount]
-    required: [uid, uidNumber, gidNumber]   # AD users missing any of these are ignored
+    required: [uid, uidNumber, gidNumber]   # needed for a user entry; a group member needs only uid's source
     create_only: [loginShell, homeDirectory]  # set on creation, then never overwritten (local overrides survive)
     attributes:
       uid: uid
@@ -90,6 +90,7 @@ sync:
   lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
   run_timeout: 45m                    # a run aborts itself after this long; must be shorter than lock_ttl
   network_timeout: 30s                # connect and per-operation timeout
+  require_member_on_target: true      # add a group member only if an entry with its uid exists under users_base
 
 notify:
   smtp_host: mx.example.edu
@@ -121,14 +122,24 @@ mapping:
       - attribute: memberUid
 ```
 
-To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, and `empty_group_member` isn't used.
+To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. With `memberUid` only, Dolly doesn't need to write user entries on the target to manage groups, and `empty_group_member` isn't used.
+
+## Groups-only deployments
+
+Dolly can manage groups without ever creating users. Run `dolly sync --groups` (for example in the systemd unit): the user entries then come from somewhere else, and Dolly only adds and removes group members.
+
+- `target.users_base` can be read-only for Dolly, and larger than the server's search size limit. A `--groups` run never reads it in full; it looks up only the uids of the members it would add, 50 per search.
+- AD users need only the attribute `uid` is mapped from to be group members. If your Unix identity is `sAMAccountName` and the Unix numbers live only on the target, map `uid: sAMAccountName` (and `cn: sAMAccountName`) and put `sAMAccountName` in `mapping.users.required` instead of `uid`. `uidNumber` and `gidNumber` stay in the list; they only matter for user entries, which a groups-only run never creates.
+- With `sync.require_member_on_target` (the default), a member is added only if an entry with its uid already exists under `users_base`. Members without one are skipped and listed once per run as `missing-on-target`.
+- The AD users base isn't searched either: every member is fetched from AD by DN, and must still match `source.users.filter`.
 
 ## Config validation
 
 Dolly validates `dolly.yaml` before connecting to anything:
 
 - Unknown keys are a config error.
-- `mapping.users.required` and `mapping.groups.required` must each include at least the spec's minimum attributes (`uid`, `uidNumber`, `gidNumber` for users; `name`, `gidNumber` for groups).
+- `mapping.users.required` must include the AD attributes that `uid`, `uidNumber`, and `gidNumber` are mapped from, when they're mapped from a plain attribute. With the defaults that's `uid`, `uidNumber`, `gidNumber`; with `uid: sAMAccountName` it's `sAMAccountName` instead of `uid`. `uidNumber` and `gidNumber` must be mapped.
+- `mapping.groups.required` must include `name` and `gidNumber`.
 - `mapping.users.rdn` must map to the same value as `uid`.
 - Every `create_only` entry must also be a mapped attribute.
 - An empty `notify.smtp_host` disables notifications.
@@ -142,15 +153,15 @@ Connection and search settings for Active Directory. Dolly only ever reads from 
 
 | Key | Default / example | Meaning |
 |---|---|---|
-| `urls` | `[ldaps://dc01.example.edu:636, ldaps://dc02.example.edu:636]` | Domain controllers, tried in order. Use `ldaps://` URLs for encrypted binds. |
+| `urls` | `[ldaps://dc01.example.edu:636, ldaps://dc02.example.edu:636]` | Domain controllers, tried in order: a connect or bind failure moves on to the next one (invalid credentials don't, to spare the account's lockout counter). An `ldap://` URL is always upgraded with StartTLS. |
 | `ca_file` | `ad-ca.pem` (optional) | CA certificate to trust for AD's TLS chain. See [TLS certificates](operations/tls.md). |
 | `bind_dn` | `CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu` | The AD service account to bind as. A UPN such as `svc-dolly@example.edu` also works. |
 | `bind_password` | `""` | Inline bind password. Set only one of `bind_password` / `bind_password_file`. See [Passwords](#passwords). |
 | `bind_password_file` | `ad.secret` | Path to a file holding the bind password. Resolved against the config file's directory if relative. |
 | `users.base` | `OU=People,DC=example,DC=edu` | Search base for users. |
-| `users.filter` | `(&(objectClass=user)(objectCategory=person))` | LDAP filter selecting in-scope users. See [Excluding entries](#excluding-entries-with-filters). |
+| `users.filter` | `(&(objectClass=user)(objectCategory=person))` | LDAP filter selecting in-scope users. It also applies to users fetched by DN as group members. See [Excluding entries](#excluding-entries-with-filters). |
 | `groups.base` | `OU=Groups,DC=example,DC=edu` | Search base for groups. |
-| `groups.filter` | `(objectClass=group)` | LDAP filter selecting in-scope groups. |
+| `groups.filter` | `(objectClass=group)` | LDAP filter selecting in-scope groups. It also applies to nested groups fetched by DN. |
 | `page_size` | `500` | Page size for paged AD searches. Large `member` attributes are also fetched with ranged retrieval regardless of this setting. |
 
 ## `target`
@@ -180,9 +191,9 @@ How AD attributes become target entries. Attribute values are plain AD attribute
 |---|---|---|
 | `rdn` | `uid` | The attribute used as the RDN for user entries. |
 | `object_classes` | `[account, posixAccount]` | Object classes written on new user entries. |
-| `required` | `[uid, uidNumber, gidNumber]` | AD users missing any of these attributes are ignored everywhere, including for group flattening. |
+| `required` | `[uid, uidNumber, gidNumber]` | Needed for a user entry. A user missing one gets no entry, but can still be a group member as long as it has the attribute `uid` is mapped from. |
 | `create_only` | `[loginShell, homeDirectory]` | Written only when the user is created; never overwritten afterward, so local admin overrides survive. `disabled_shell` is the one exception (see [Ownership](how-it-works/ownership.md)). |
-| `attributes.uid` | `uid` | Source is AD's `uid` attribute, not `sAMAccountName`. |
+| `attributes.uid` | `uid` | Source is AD's `uid` attribute by default (as with ad2openldap). Map `sAMAccountName` instead if that's your Unix identity, and list it in `required`. |
 | `attributes.cn` | `uid` | |
 | `attributes.uidNumber` | `uidNumber` | |
 | `attributes.gidNumber` | `gidNumber` | |
@@ -216,6 +227,7 @@ Run behavior: pruning, the mass-deletion guard, and timeouts.
 | `lock_ttl` | `60m` | A run lock older than this (by the server's `createTimestamp`) is treated as stale and broken. |
 | `run_timeout` | `45m` | A run aborts itself after this long. Must be shorter than `lock_ttl` so a live run's lock is never mistaken for stale. |
 | `network_timeout` | `30s` | Connect and per-operation timeout against both AD and the target. |
+| `require_member_on_target` | `true` | Add an AD user to a target group only if an entry with its uid exists under `users_base` (Dolly-owned or local; with `member` in the membership list, an entry at the member DN). Skipped members are listed once per run as `missing-on-target`. |
 
 See [How it works](how-it-works/index.md#guard) for the mass-deletion guard in detail, and [Run lock](how-it-works/run-lock.md) for locking.
 
@@ -243,7 +255,7 @@ Any attribute value under `mapping` can be a Go `text/template` string instead o
 
 ## Excluding entries with filters
 
-There's no separate exclude list. To keep users or groups out of scope entirely, extend `source.users.filter` or `source.groups.filter`. For example, to exclude a group of accounts that shouldn't be replicated:
+There's no separate exclude list. To keep users or groups out of scope entirely, extend `source.users.filter` or `source.groups.filter`. The filters also apply to group members Dolly fetches by DN, so a member that doesn't match is skipped (and counted as filtered in the summary), wherever it lives in AD. For example, to exclude a group of accounts that shouldn't be replicated:
 
 ```text
 (!(memberOf=CN=ExcludedFromLDAPSync,OU=Groups,DC=example,DC=edu))

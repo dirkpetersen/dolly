@@ -131,8 +131,10 @@ func TestRuleRenameCollisionIsConflict(t *testing.T) {
 	wantWarning(t, p, WarnConflict, "was renamed, but "+udn("bob")+" already exists")
 }
 
-// Rule: a user gone from AD (deleted, out of scope, or missing a required
-// attribute) loses all Dolly-owned memberships right away; the entry stays.
+// Rule: a user gone from AD (deleted, out of scope, or missing the attribute
+// its uid is mapped from) loses all Dolly-owned memberships right away; the
+// entry stays. (A user missing only uidNumber or gidNumber stays a member:
+// see TestRuleRelaxedMemberRequirements.)
 func TestRuleGoneUserLosesOwnedMemberships(t *testing.T) {
 	bob := mkUser(2, "bob")
 	cases := map[string]func() []*model.ADObject{
@@ -147,9 +149,9 @@ func TestRuleGoneUserLosesOwnedMemberships(t *testing.T) {
 			delete(unsynced.Attrs, "gidNumber")
 			return []*model.ADObject{u, unsynced}
 		},
-		"missing required": func() []*model.ADObject {
+		"missing uid": func() []*model.ADObject {
 			u := mkUser(1, "jdoe")
-			delete(u.Attrs, "gidNumber")
+			delete(u.Attrs, "uid")
 			return []*model.ADObject{u}
 		},
 	}
@@ -159,7 +161,7 @@ func TestRuleGoneUserLosesOwnedMemberships(t *testing.T) {
 			ad := []*model.ADObject{bob, hpc}
 			for _, o := range extra() {
 				ad = append(ad, o)
-				if name == "missing required" {
+				if name == "missing uid" {
 					hpc.Members = append(hpc.Members, o.DN)
 				}
 			}
@@ -241,7 +243,7 @@ func TestRuleGroupGoneFromAD(t *testing.T) {
 // also with memberUid only, where the user entry needn't exist.
 func TestRuleOccupantIsDNWithMemberUIDOnly(t *testing.T) {
 	jdoe := mkUser(1, "jdoe")
-	p := build(t, cfg(t, uidOnly), world{
+	p := build(t, cfg(t, uidOnly, lax), world{
 		ad:     []*model.ADObject{jdoe, mkGroup(10, "hpc", jdoe.DN)},
 		target: []*model.Entry{tGroupUID(10, "hpc", "local1"), gRec(10, "hpc")},
 	}, Options{Groups: true})
@@ -627,7 +629,7 @@ func TestUsersAndGroupsIndependently(t *testing.T) {
 	t.Run("groups only skips users not yet created", func(t *testing.T) {
 		bob := mkUser(2, "bob")
 		ad := []*model.ADObject{jdoe, bob, mkGroup(10, "hpc", jdoe.DN, bob.DN)}
-		p := build(t, cfg(t), world{ad: ad, target: []*model.Entry{tUser(1, "jdoe"), uRec(1, "jdoe")}}, Options{Groups: true})
+		p := build(t, cfg(t, lax), world{ad: ad, target: []*model.Entry{tUser(1, "jdoe"), uRec(1, "jdoe")}}, Options{Groups: true})
 		wantOps(t, p,
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("jdoe"),
 			"add-entry "+gdn("hpc")+" member="+udn("jdoe")+" memberUid=jdoe")
@@ -636,11 +638,11 @@ func TestUsersAndGroupsIndependently(t *testing.T) {
 			t.Errorf("pending warnings = %d, want 1: %v", n, p.Warnings)
 		}
 
-		p = build(t, cfg(t), world{ad: ad}, Options{Groups: true})
+		p = build(t, cfg(t, lax), world{ad: ad}, Options{Groups: true})
 		wantOps(t, p) // no member resolves to an entry, so the group waits too
 		wantWarning(t, p, WarnPending, gdn("hpc")+": AD group has no resolvable members")
 
-		p = build(t, cfg(t, uidOnly), world{ad: ad}, Options{Groups: true})
+		p = build(t, cfg(t, uidOnly, lax), world{ad: ad}, Options{Groups: true})
 		wantOps(t, p,
 			"add-record rec:a seeAlso="+gdn("hpc")+" roleOccupant="+udn("bob")+"|"+udn("jdoe"),
 			"add-entry "+gdn("hpc")+" memberUid=bob|jdoe")

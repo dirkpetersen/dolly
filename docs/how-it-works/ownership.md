@@ -29,8 +29,9 @@ Dolly creates `state_base` and its children if they're missing. It never creates
 - A Dolly-owned member who left the AD group, or was deleted from AD, is removed from the target group and from the record.
 - Membership is never replaced wholesale. Dolly never computes "the target group's members = AD's list"; it adds and removes individual `member` and `memberUid` values, and only ever touches the attributes listed in the mapping.
 - With `member` in `mapping.groups.membership` (`groupOfNames`), a new AD group with no resolvable members isn't created until it has one. With `memberUid` only, `posixGroup` may be empty, so the group is created right away — see [Group schema](../configuration.md#group-schema-rfc2307bis-or-rfc-2307).
-- With `memberUid` only, Dolly doesn't need to read or write user entries on the target to manage groups, so a groups-only run (`--groups`) never touches them.
-- In a `--groups` run, a member's target DN is read from the user's own ownership record (`seeAlso`), not recomputed from a fresh AD-to-target mapping. A user rename that's still pending (its own `--users` sync hasn't run yet) therefore causes no group churn — the group keeps pointing at the DN the record already has. With `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it. With `memberUid` only, no user entry is needed.
+- A groups-only run (`--groups`) never writes user entries, so `users_base` may be read-only for Dolly.
+- With `sync.require_member_on_target` (the default), an AD user is added to a target group only if an entry with its uid exists under `users_base`, Dolly-owned or local. With `member` in the membership list, the entry must be at the member DN. A user created earlier in the same run counts. Otherwise the member is skipped and listed once per run as `missing-on-target`. A Dolly-owned member whose entry has disappeared is left in place, not removed, until the user leaves the AD group.
+- In a `--groups` run, a member's target DN is read from the user's own ownership record (`seeAlso`), not recomputed from a fresh AD-to-target mapping. A user rename that's still pending (its own `--users` sync hasn't run yet) therefore causes no group churn — the group keeps pointing at the DN the record already has. With `require_member_on_target` off and `member` in the membership list, an AD user that has neither an ownership record nor a target entry yet is skipped in a `--groups` run and listed as pending until a users sync creates it. With `memberUid` only, no user entry is needed then.
 
 ## Local wins
 
@@ -61,7 +62,7 @@ If a rename would collide with an entry that already exists at the new name, tha
 
 ## Deleted and pruned users
 
-A user gone from AD — deleted, moved out of scope, or now missing a `required` attribute — immediately loses all Dolly-owned group memberships. The user entry itself is deleted only when `sync.prune_users` is enabled and the user has been gone for `sync.prune_after_days` (tracked as `missing-since` in the user's ownership record). At prune time, Dolly also removes the user from any group where they were added *locally* — the one exception to "local wins" — so no group is left pointing at an entry that no longer exists.
+A user gone from AD — deleted, moved out of scope, filtered out, or now missing the attribute `uid` is mapped from — immediately loses all Dolly-owned group memberships. A user that still has a uid but lost another `required` attribute (for example `uidNumber`) counts as gone only for its user entry: the prune clock starts, but its memberships stay. The user entry itself is deleted only when `sync.prune_users` is enabled and the user has been gone for `sync.prune_after_days` (tracked as `missing-since` in the user's ownership record). At prune time, Dolly also removes the user from any group where they were added *locally* — the one exception to "local wins" — so no group is left pointing at an entry that no longer exists.
 
 ## Disabled accounts
 
@@ -93,16 +94,18 @@ With `memberUid` only (RFC 2307, structural `posixGroup`), none of this applies:
 
 ## Required attributes
 
-Users need `uid`, `uidNumber`, and `gidNumber`. Groups need `name` and `gidNumber` (`mapping.users.required` / `mapping.groups.required`). An AD entry missing any of its required attributes is ignored everywhere — including as a source for flattening a nested group — not just skipped with output on every run. Ignored entries are listed once in the run summary instead.
+To be a group member, an AD user needs only the attribute its `uid` is mapped from (`uid` by default, `sAMAccountName` in many groups-only setups). A user entry needs every attribute in `mapping.users.required` (`uid`, `uidNumber`, and `gidNumber` by default): a user missing one gets no entry, and in runs that sync users it's listed once in the run summary, but it can still be a member. Groups need `name` and `gidNumber` (`mapping.groups.required`). A group missing a required attribute, or a user without a uid, is ignored everywhere — including as a source for flattening a nested group — not just skipped with output on every run. Ignored entries are listed once in the run summary instead.
+
+A `uidNumber` or `gidNumber` Dolly would write must be an integer from 0 to 4294967294: Linux `uid_t` and `gid_t` are unsigned 32-bit, and 4294967295 is reserved as -1. An entry with any other value, such as an 11-digit university ID, is ignored and listed once in the summary, like one missing a required attribute.
 
 ## Out-of-scope members
 
-A group member outside the configured `users.base` / `groups.base` search bases, but with the required attributes, is still followed:
+A group member outside the configured `users.base` / `groups.base` search bases is still followed if it matches `source.users.filter` or `source.groups.filter` and has the required attributes:
 
-- an out-of-scope **user** becomes a normal Dolly-managed user,
+- an out-of-scope **user** becomes a normal Dolly-managed user (a member, and, with every required attribute, a user entry),
 - an out-of-scope **child group** is flattened into its parent but is not itself created on the target.
 
-Members that are neither users nor groups — computers, contacts, foreign security principals — are skipped.
+Members that are neither users nor groups — computers, contacts, foreign security principals — are skipped. So is a member that exists in AD but matches neither search filter; the run summary counts it as filtered.
 
 ## `uid` case
 

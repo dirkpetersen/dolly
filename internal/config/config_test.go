@@ -194,3 +194,62 @@ func TestFind(t *testing.T) {
 		})
 	}
 }
+
+func TestRequireMemberOnTargetDefault(t *testing.T) {
+	c, err := Parse(dolly.ConfigTemplate, "/x/dolly.yaml")
+	if err != nil || !c.Sync.RequireMemberOnTarget {
+		t.Fatalf("template: %v, %v", c.Sync.RequireMemberOnTarget, err)
+	}
+	line := "  require_member_on_target: true      # add a group member only if an entry with its uid exists under users_base\n"
+	c, err = Parse(edit(t, line, ""), "/x/dolly.yaml")
+	if err != nil || !c.Sync.RequireMemberOnTarget {
+		t.Errorf("omitted: %v, %v; want the default true", c.Sync.RequireMemberOnTarget, err)
+	}
+	c, err = Parse(edit(t, line, "  require_member_on_target: false\n"), "/x/dolly.yaml")
+	if err != nil || c.Sync.RequireMemberOnTarget {
+		t.Errorf("false: %v, %v", c.Sync.RequireMemberOnTarget, err)
+	}
+}
+
+// The users required list must hold the AD attributes uid, uidNumber, and
+// gidNumber are mapped from, whatever they are called.
+func TestRequiredFollowsUIDSource(t *testing.T) {
+	sam := []string{"      uid: uid\n      cn: uid\n", "      uid: sAMAccountName\n      cn: sAMAccountName\n"}
+	_, err := Parse(edit(t, sam...), "/x/dolly.yaml")
+	if err == nil || !strings.Contains(err.Error(), "mapping.users.required: must include sAMAccountName") {
+		t.Errorf("uid from sAMAccountName, required without it: %v", err)
+	}
+	c, err := Parse(edit(t, append(sam, "required: [uid, uidNumber, gidNumber]", "required: [sAMAccountName, uidNumber, gidNumber]")...), "/x/dolly.yaml")
+	if err != nil {
+		t.Fatalf("required with sAMAccountName: %v", err)
+	}
+	if got := c.Mapping.Users.Required; strings.Join(got, ",") != "sAMAccountName,uidNumber,gidNumber" {
+		t.Errorf("required = %v", got)
+	}
+	_, err = Parse(edit(t, "      uidNumber: uidNumber\n", "      uidNumber: employeeNumber\n"), "/x/dolly.yaml")
+	if err == nil || !strings.Contains(err.Error(), "must include employeeNumber") {
+		t.Errorf("uidNumber from employeeNumber: %v", err)
+	}
+	_, err = Parse(edit(t, "      uidNumber: uidNumber\n      gidNumber: gidNumber\n", "      uidNumber: uidNumber\n"), "/x/dolly.yaml")
+	if err == nil || !strings.Contains(err.Error(), "gidNumber is required") {
+		t.Errorf("unmapped gidNumber: %v", err)
+	}
+}
+
+func TestValueSources(t *testing.T) {
+	for src, want := range map[string]string{
+		"uid": "uid",
+		`{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}`: "unixHomeDirectory,uid",
+		`{{ if .a }}{{ .b }}{{ else }}{{ .c }}{{ end }}`:       "a,b,c",
+		`{{ with .x }}{{ . }}{{ end }}{{ .X }}`:                "x",
+		`static`:                                               "static",
+	} {
+		v, err := CompileValue("n", src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(v.Sources(), ","); got != want {
+			t.Errorf("%s: sources = %q, want %q", src, got, want)
+		}
+	}
+}

@@ -8,11 +8,14 @@ import (
 
 // Fake is an in-memory Source for tests and fixtures. InScopeUsers and
 // InScopeGroups are what the searches return; Others are reachable only
-// through Lookup. Err, if set, is returned by every call.
+// through Lookup. Filtered objects exist in AD but match neither search
+// filter: Lookup reports their DNs as filtered. Err, if set, is returned by
+// every call.
 type Fake struct {
 	InScopeUsers  []*model.ADObject
 	InScopeGroups []*model.ADObject
 	Others        []*model.ADObject
+	Filtered      []*model.ADObject
 	Err           error
 	// Lookups records the DNs passed to Lookup, for tests.
 	Lookups [][]string
@@ -30,12 +33,13 @@ func (f *Fake) Groups(context.Context) ([]*model.ADObject, error) {
 
 // Lookup implements Source. It searches all three lists, like a base-scoped
 // search by DN would.
-func (f *Fake) Lookup(_ context.Context, dns []string) ([]*model.ADObject, error) {
+func (f *Fake) Lookup(_ context.Context, dns []string) ([]*model.ADObject, []string, error) {
 	if f.Err != nil {
-		return nil, f.Err
+		return nil, nil, f.Err
 	}
 	f.Lookups = append(f.Lookups, dns)
 	var out []*model.ADObject
+	var filtered []string
 	for _, dn := range dns {
 		for _, list := range [][]*model.ADObject{f.Others, f.InScopeUsers, f.InScopeGroups} {
 			for _, o := range list {
@@ -44,6 +48,11 @@ func (f *Fake) Lookup(_ context.Context, dns []string) ([]*model.ADObject, error
 				}
 			}
 		}
+		for _, o := range f.Filtered {
+			if model.DNEqual(o.DN, dn) {
+				filtered = append(filtered, dn)
+			}
+		}
 	}
-	return out, nil
+	return out, filtered, nil
 }

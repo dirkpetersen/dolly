@@ -9,6 +9,7 @@
 //	  users:  [ {guid, dn, attrs: {uid: [jdoe], ...}, userAccountControl} ]
 //	  groups: [ {guid, dn, attrs: {name: [...], gidNumber: [...]}, members: [dn, ...]} ]
 //	  others: [ {guid, dn, kind: user|group|other, attrs, members} ]  # out of scope, found by DN only
+//	  filtered: [ {guid, dn} ]     # in AD, but matching neither search filter
 //	target:
 //	  entries: [ {dn, attrs} ]     # everything under users_base, groups_base, and state_base
 package fixture
@@ -31,9 +32,10 @@ import (
 type File struct {
 	Now *time.Time `yaml:"now"`
 	AD  struct {
-		Users  []*model.ADObject `yaml:"users"`
-		Groups []*model.ADObject `yaml:"groups"`
-		Others []*model.ADObject `yaml:"others"`
+		Users    []*model.ADObject `yaml:"users"`
+		Groups   []*model.ADObject `yaml:"groups"`
+		Others   []*model.ADObject `yaml:"others"`
+		Filtered []*model.ADObject `yaml:"filtered"`
 	} `yaml:"ad"`
 	Target struct {
 		Entries []*model.Entry `yaml:"entries"`
@@ -49,8 +51,11 @@ type Snapshots struct {
 }
 
 // Load reads a fixture and builds the snapshots the planner needs, reading
-// AD through source.Read on a source.Fake like a real run would.
-func Load(path string, cfg *config.Config) (*Snapshots, error) {
+// AD through source.Read on a source.Fake like a real run would. With
+// readUsers false (a groups-only run), AD users are found only by DN,
+// exactly as the real source would. The target entries always count as a
+// full read of users_base.
+func Load(path string, cfg *config.Config, readUsers bool) (*Snapshots, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -64,7 +69,7 @@ func Load(path string, cfg *config.Config) (*Snapshots, error) {
 	for _, list := range []struct {
 		objs []*model.ADObject
 		kind model.Kind
-	}{{f.AD.Users, model.KindUser}, {f.AD.Groups, model.KindGroup}, {f.AD.Others, model.KindOther}} {
+	}{{f.AD.Users, model.KindUser}, {f.AD.Groups, model.KindGroup}, {f.AD.Others, model.KindOther}, {f.AD.Filtered, model.KindOther}} {
 		for _, o := range list.objs {
 			g, err := model.ParseGUID(o.GUID)
 			if err != nil {
@@ -76,8 +81,8 @@ func Load(path string, cfg *config.Config) (*Snapshots, error) {
 			}
 		}
 	}
-	fake := &source.Fake{InScopeUsers: f.AD.Users, InScopeGroups: f.AD.Groups, Others: f.AD.Others}
-	ad, err := source.Read(context.Background(), fake)
+	fake := &source.Fake{InScopeUsers: f.AD.Users, InScopeGroups: f.AD.Groups, Others: f.AD.Others, Filtered: f.AD.Filtered}
+	ad, err := source.Read(context.Background(), fake, readUsers)
 	if err != nil {
 		return nil, err
 	}
@@ -87,6 +92,7 @@ func Load(path string, cfg *config.Config) (*Snapshots, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fixture %s: %w", path, err)
 	}
+	tgt.UsersRead = true
 	s := &Snapshots{AD: ad, Target: tgt, Records: recs}
 	if f.Now != nil {
 		s.Now = *f.Now

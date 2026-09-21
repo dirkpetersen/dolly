@@ -94,7 +94,7 @@ func TestExitCodes(t *testing.T) {
 		msg  string
 	}{
 		{[]string{"sync", "--config", template}, 1, "not implemented yet"},
-		{[]string{"sync", "--dry-run", "--config", template}, 1, "not implemented yet"},
+		{[]string{"sync", "--dry-run", "--config", template}, 1, "reading password file"}, // reads AD for real; the template names no existing secret
 		{[]string{"adopt", "--config", template}, 1, "not implemented yet"},
 		{[]string{"unlock", "--yes"}, 1, "not implemented yet"},
 		{[]string{"check"}, 1, "not implemented yet"},
