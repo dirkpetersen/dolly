@@ -33,6 +33,7 @@ source:
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
+  bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
@@ -47,6 +48,7 @@ target:
   start_tls: true
   ca_file: ldap-ca.pem                # optional, see "TLS certificates"
   bind_dn: cn=admin,dc=local
+  bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ldap.secret
   users_base: ou=people,dc=local
   groups_base: ou=group,dc=local
@@ -94,6 +96,7 @@ notify:
   smtp_port: 25
   start_tls: true
   username: ""                        # optional SMTP auth
+  password: ""                        # inline, or use password_file (set only one)
   password_file: ""
   from: "Dolly <dolly-noreply@example.edu>"
   to: [ldap-admins@example.edu]
@@ -102,6 +105,9 @@ notify:
   remind_every: 24h                   # while a failure persists, remind at most this often
 ```
 
+## Passwords
+
+Each password can be given inline (`bind_password`, `password`) or in a separate file (`bind_password_file`, `password_file`). Setting both to a non-empty value is a config error; an empty value counts as unset. If `dolly.yaml` contains an inline password, Dolly refuses to run unless the file is readable only by its owner (mode `0600` or stricter), the same way `ssh` treats private keys. `dolly.yaml` is git-ignored, so an inline password never ends up in the repository.
 
 ## `source`
 
@@ -112,6 +118,7 @@ Connection and search settings for Active Directory. Dolly only ever reads from 
 | `urls` | `[ldaps://dc01.example.edu:636, ldaps://dc02.example.edu:636]` | Domain controllers, tried in order. Use `ldaps://` URLs for encrypted binds. |
 | `ca_file` | `ad-ca.pem` (optional) | CA certificate to trust for AD's TLS chain. See [TLS certificates](operations/tls.md). |
 | `bind_dn` | `CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu` | The AD service account to bind as. A UPN such as `svc-dolly@example.edu` also works. |
+| `bind_password` | `""` | Inline bind password. Set only one of `bind_password` / `bind_password_file`. See [Passwords](#passwords). |
 | `bind_password_file` | `ad.secret` | Path to a file holding the bind password. Resolved against the config file's directory if relative. |
 | `users.base` | `OU=People,DC=example,DC=edu` | Search base for users. |
 | `users.filter` | `(&(objectClass=user)(objectCategory=person))` | LDAP filter selecting in-scope users. See [Excluding entries](#excluding-entries-with-filters). |
@@ -129,6 +136,7 @@ Connection settings and base DNs for the target LDAP server. Dolly reads and wri
 | `start_tls` | `true` | Upgrade the connection with StartTLS. |
 | `ca_file` | `ldap-ca.pem` (optional) | CA certificate to trust for the target's TLS chain. |
 | `bind_dn` | `cn=admin,dc=local` | The bind DN used to read and write the target. See [Permissions](operations/permissions.md) for the access it needs. |
+| `bind_password` | `""` | Inline bind password. Set only one of `bind_password` / `bind_password_file`. See [Passwords](#passwords). |
 | `bind_password_file` | `ldap.secret` | Path to a file holding the bind password. |
 | `users_base` | `ou=people,dc=local` | Where user entries live. Dolly never creates this container. |
 | `groups_base` | `ou=group,dc=local` | Where group entries live. Dolly never creates this container. |
@@ -194,6 +202,7 @@ SMTP settings and when to send mail. See [Notifications](operations/notification
 | `smtp_port` | `25` | SMTP port. |
 | `start_tls` | `true` | Upgrade the SMTP connection with StartTLS. |
 | `username` | `""` | Optional SMTP auth username. |
+| `password` | `""` | Inline SMTP auth password. Set only one of `password` / `password_file`. See [Passwords](#passwords). |
 | `password_file` | `""` | Optional path to a file holding the SMTP auth password. |
 | `from` | `"Dolly <dolly-noreply@example.edu>"` | Envelope and header `From` address. |
 | `to` | `[ldap-admins@example.edu]` | Recipient list. |
@@ -220,7 +229,7 @@ Combine it with the existing filter using `(&...)`.
 | What | Default path |
 |---|---|
 | Binary | `~/.local/bin/dolly` |
-| Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`) |
+| Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`), created by `dolly install` with mode `0600` |
 | Secrets and CA files | next to the config, mode `0600` |
 | systemd units | `$XDG_CONFIG_HOME/systemd/user/dolly.{service,timer}` |
 | Logs | journald (`journalctl --user -u dolly`) |

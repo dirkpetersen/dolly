@@ -9,6 +9,7 @@ source:
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
+  bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
@@ -23,6 +24,7 @@ target:
   start_tls: true
   ca_file: ldap-ca.pem                # optional, see "TLS certificates"
   bind_dn: cn=admin,dc=local
+  bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ldap.secret
   users_base: ou=people,dc=local
   groups_base: ou=group,dc=local
@@ -70,6 +72,7 @@ notify:
   smtp_port: 25
   start_tls: true
   username: ""                        # optional SMTP auth
+  password: ""                        # inline, or use password_file (set only one)
   password_file: ""
   from: "Dolly <dolly-noreply@example.edu>"
   to: [ldap-admins@example.edu]

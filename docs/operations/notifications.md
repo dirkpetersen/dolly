@@ -12,6 +12,7 @@ notify:
   smtp_port: 25
   start_tls: true
   username: ""                        # optional SMTP auth
+  password: ""                        # inline, or use password_file (set only one)
   password_file: ""
   from: "Dolly <dolly-noreply@example.edu>"
   to: [ldap-admins@example.edu]
@@ -20,7 +21,7 @@ notify:
   remind_every: 24h                   # while a failure persists, remind at most this often
 ```
 
-See [Configuration](../configuration.md#notify) for the full key reference. `username` and `password_file` are optional — leave them empty for an SMTP relay that doesn't require auth. `dolly check` also tests the SMTP connection, so you can validate this section without waiting for a real run; see [Commands](../commands.md#dolly-check).
+See [Configuration](../configuration.md#notify) for the full key reference. `username` and `password`/`password_file` are optional — leave them empty for an SMTP relay that doesn't require auth. See [Passwords](../configuration.md#passwords) for the rules on inline vs. file passwords. `dolly check` also tests the SMTP connection, so you can validate this section without waiting for a real run; see [Commands](../commands.md#dolly-check).
 
 ## What a mail contains
 

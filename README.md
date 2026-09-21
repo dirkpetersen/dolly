@@ -93,6 +93,7 @@ source:
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
+  bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
@@ -107,6 +108,7 @@ target:
   start_tls: true
   ca_file: ldap-ca.pem                # optional, see "TLS certificates"
   bind_dn: cn=admin,dc=local
+  bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ldap.secret
   users_base: ou=people,dc=local
   groups_base: ou=group,dc=local
@@ -154,6 +156,7 @@ notify:
   smtp_port: 25
   start_tls: true
   username: ""                        # optional SMTP auth
+  password: ""                        # inline, or use password_file (set only one)
   password_file: ""
   from: "Dolly <dolly-noreply@example.edu>"
   to: [ldap-admins@example.edu]
@@ -162,6 +165,8 @@ notify:
   remind_every: 24h                   # while a failure persists, remind at most this often
 ```
 
+**Passwords.** Each password can be given inline (`bind_password`, `password`) or in a separate file (`bind_password_file`, `password_file`). Setting both to a non-empty value is a config error; an empty value counts as unset. If `dolly.yaml` contains an inline password, Dolly refuses to run unless the file is readable only by its owner (mode `0600` or stricter), the same way `ssh` treats private keys. `dolly.yaml` is git-ignored, so an inline password never ends up in the repository.
+
 Attribute values are plain AD attribute names or Go templates. Dolly only writes the attributes listed in the mapping, so other attributes on an entry are left alone. To exclude users or groups, use the search `filter`, for example `(!(memberOf=CN=ExcludedFromLDAPSync,OU=Groups,DC=example,DC=edu))`.
 
 ### File locations (XDG)
@@ -169,7 +174,7 @@ Attribute values are plain AD attribute names or Go templates. Dolly only writes
 | What | Default path |
 |---|---|
 | Binary | `~/.local/bin/dolly` |
-| Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`) |
+| Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`), created by `dolly install` with mode `0600` |
 | Secrets and CA files | next to the config, mode `0600` |
 | systemd units | `$XDG_CONFIG_HOME/systemd/user/dolly.{service,timer}` |
 | Logs | journald (`journalctl --user -u dolly`) |

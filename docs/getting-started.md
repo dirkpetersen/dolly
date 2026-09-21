@@ -28,7 +28,7 @@ This copies the binary to `~/.local/bin`, creates `$XDG_CONFIG_HOME/dolly/dolly.
 $EDITOR ~/.config/dolly/dolly.yaml
 ```
 
-At minimum, fill in your AD source (URLs, bind DN, bind password file, user and group bases and filters) and your target LDAP server (URL, bind DN, bind password file, and the base DNs for users, groups, and Dolly's own state). See [Configuration](configuration.md) for the full annotated file and a reference table for every key.
+At minimum, fill in your AD source (URLs, bind DN, bind password, user and group bases and filters) and your target LDAP server (URL, bind DN, bind password, and the base DNs for users, groups, and Dolly's own state). Each bind password can be set inline (`bind_password`) or in a separate file (`bind_password_file`) — see [Passwords](configuration.md#passwords). If you use an inline password, run `chmod 600 ~/.config/dolly/dolly.yaml` so Dolly will run with it. See [Configuration](configuration.md) for the full annotated file and a reference table for every key.
 
 ## Check connectivity
 
