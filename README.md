@@ -15,7 +15,7 @@ It is deliberately simple. Dolly is not a bidirectional sync engine, an identity
 Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/dirkpetersen/ad2openldap), a 15-year-old project that still runs reliably in production. A local checkout lives at `../ad2openldap`. Use `ad2openldap3` (`../ad2openldap/ad2openldap/ad2openldap3`) as the main reference.
 
 - **Learn from the old code's corner cases, not its issues.** ad2openldap has known problems, so don't copy its design wholesale. It does handle many real-world edge cases, though, and Dolly should handle them too.
-- **Reliable incremental replication.** Normal operation must never require wiping the target and rebuilding it from scratch.
+- **No rebuilds.** Every run makes small, targeted changes to a live server. Normal operation never wipes the target and starts from scratch.
 - **Only touch what Dolly manages.** Target groups may contain extra members that were added directly on the LDAP server and don't exist in AD. Dolly only changes the members it previously replicated from AD:
   - A user added to the group in AD is added to the target group.
   - A user removed from the group in AD, or deleted from AD, is removed from the target group.
@@ -28,16 +28,18 @@ Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/
 ## Features
 
 - **One-way replication** of users and groups from AD to a target LDAP server
-- **Configurable attribute mapping**, e.g. `sAMAccountName` → `uid` and `user` → `inetOrgPerson` + `posixAccount`
-- **Group membership rewriting**, which translates AD member DNs into target DNs (`member`, `uniqueMember`, or `memberUid`)
-- **Non-destructive group membership**, where only members Dolly replicated from AD are added or removed, and members added directly on the LDAP server are left alone
+- **Non-destructive group membership.** Only members Dolly added are ever removed. Members added directly on the LDAP server are left alone.
+- **Ownership records stored in the target LDAP**, so what Dolly manages survives host rebuilds and doesn't depend on a local file
+- **Full comparison every run.** Dolly reads all in-scope users and groups each time, so deletions and nested-group changes are never missed. About 10,000 groups is a few seconds of reading.
+- **Nested groups are flattened** into direct user members, with loop protection
+- **Rename handling** by tracking AD's `objectGUID`, so a renamed user or group is renamed in place rather than deleted and re-created
+- **Mass-deletion guard** that refuses runs removing more than a set share of managed members or users
+- **Run lock stored in LDAP**, so two hosts never sync at once. Stale locks expire, and `dolly unlock` clears one by hand
+- **Email notifications** on failure, on changes, or always
 - **Users and groups sync separately**, so you can run users only, groups only, or both
-- **Incremental sync** using `uSNChanged`, so only changed entries are fetched after the first run
-- **Full reconcile mode** that detects entries removed from AD and can optionally prune them. It only ever deletes entries that Dolly itself created.
-- **Scoped sync** through search bases and LDAP filters, so you replicate only the OUs and groups you want
-- **Disabled-account handling**, which skips, flags, or locks accounts based on `userAccountControl`
+- **Configurable attribute mapping** with Go templates for defaults and derived values
 - **Dry-run mode** that shows exactly what would change before anything is touched
-- **Paged searches**, so AD's 1000-result limit doesn't silently truncate your directory
+- **Paged searches and ranged attribute retrieval**, so neither AD's 1000-result limit nor its 1500-value limit on large groups silently truncates data
 - **LDAPS and StartTLS** support on both ends
 - Single static binary with no runtime dependencies
 
@@ -45,7 +47,8 @@ Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/
 
 - **Passwords.** AD doesn't expose password hashes over LDAP, and that's a good thing. Point your target systems at AD or Kerberos for authentication, or use SASL pass-through.
 - **Write back to AD.** Changes flow in one direction only.
-- **Replicate arbitrary object types.** It handles users and groups only, not computers, GPOs, or contacts.
+- **Replicate arbitrary object types.** It handles users and groups only, not computers, GPOs, contacts, NIS netgroups, or automount maps.
+- **Delete groups.** A group removed from AD loses its AD-sourced members, but the group itself stays on the target.
 
 ---
 
@@ -58,6 +61,11 @@ go install github.com/dirkpetersen/dolly/cmd/dolly@latest
 # Self-install for the current (unprivileged) user: binary, config, systemd --user units
 dolly install
 $EDITOR ~/.config/dolly/dolly.yaml
+dolly check
+
+# Taking over a tree written by ad2openldap? Adopt it once first:
+dolly adopt --dry-run
+dolly adopt
 
 # See what would happen
 dolly sync --dry-run
@@ -71,12 +79,14 @@ Dolly runs as a regular user by default and needs no root.
 
 ## Configuration
 
+The defaults match the tree that ad2openldap produced, so existing clients keep working.
+
 ```yaml
 source:
   url: ldaps://dc01.example.edu:636
-  ca_file: ad-ca.pem                   # optional, see "TLS certificates"
+  ca_file: ad-ca.pem                  # optional, see "TLS certificates"
   bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu
-  bind_password_file: ad.secret         # relative paths resolve against the config file's directory
+  bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
     base: OU=People,DC=example,DC=edu
     filter: (&(objectClass=user)(objectCategory=person))
@@ -88,45 +98,57 @@ source:
 target:
   url: ldap://ldap.example.edu:389
   start_tls: true
-  ca_file: ldap-ca.pem                 # optional, see "TLS certificates"
-  bind_dn: cn=dolly,dc=example,dc=edu
+  ca_file: ldap-ca.pem                # optional, see "TLS certificates"
+  bind_dn: cn=admin,dc=local
   bind_password_file: ldap.secret
-  users_base: ou=people,dc=example,dc=edu
-  groups_base: ou=groups,dc=example,dc=edu
+  users_base: ou=people,dc=local
+  groups_base: ou=group,dc=local
+  state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
+  empty_group_member: cn=empty,dc=local   # placeholder member for groups that would otherwise be empty
 
 mapping:
   users:
     rdn: uid
-    object_classes: [inetOrgPerson, posixAccount, shadowAccount]
+    object_classes: [account, posixAccount]
+    required: [uid, uidNumber]        # AD users missing any of these are skipped with a warning
     attributes:
-      uid: sAMAccountName
-      cn: displayName
-      givenName: givenName
-      sn: sn
-      mail: mail
-      uidNumber: uidNumber          # from AD's RFC2307 attributes
-      gidNumber: gidNumber
-      homeDirectory: "/home/{{ .sAMAccountName }}"
-      loginShell: "/bin/bash"
+      uid: uid
+      cn: uid
+      uidNumber: uidNumber
+      gidNumber: '{{ or .gidNumber "65534" }}'
+      homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
+      loginShell: '{{ or .loginShell "/bin/bash" }}'
+      gecos: gecos
   groups:
     rdn: cn
-    object_classes: [posixGroup, groupOfNames]
+    object_classes: [groupOfNames, posixGroup]
+    required: [name, gidNumber]       # AD groups missing any of these are skipped with a warning
     attributes:
-      cn: sAMAccountName
+      cn: name
       gidNumber: gidNumber
-      description: description
     membership:
-      - attribute: member           # full DN, rewritten to target tree
-      - attribute: memberUid        # bare uid, for posixGroup
+      - attribute: member             # full DN of the target user
+      - attribute: memberUid          # bare uid
+    flatten_nested: true
 
 sync:
-  disabled_accounts: skip           # skip | include | lock
-  prune: false                      # delete Dolly-managed target entries missing from AD
-                                    # (group members removed in AD are always removed)
-  # state_file: ~/.local/state/dolly/state.json   # default: $XDG_STATE_HOME/dolly/state.json
+  prune_users: false                  # delete Dolly-owned users that are gone from AD (groups are never deleted)
+  max_delete_percent: 10              # abort if a run would remove more than this share; --force overrides
+  lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
+
+notify:
+  smtp_host: mx.example.edu
+  smtp_port: 25
+  start_tls: true
+  username: ""                        # optional SMTP auth
+  password_file: ""
+  from: "Dolly <dolly-noreply@example.edu>"
+  to: [ldap-admins@example.edu]
+  subject_prefix: "[dolly]"
+  on: failure                         # failure | changes | always
 ```
 
-Attribute values can be plain AD attribute names or Go templates for derived values. Relative paths (`ca_file`, `bind_password_file`, `state_file`) resolve against the config file's directory.
+Attribute values are plain AD attribute names or Go templates. Dolly only writes the attributes listed in the mapping, so other attributes on an entry are left alone. To exclude users or groups, use the search `filter`, for example `(!(memberOf=CN=ExcludedFromLDAPSync,OU=Groups,DC=example,DC=edu))`.
 
 ### File locations (XDG)
 
@@ -135,36 +157,81 @@ Attribute values can be plain AD attribute names or Go templates for derived val
 | Binary | `~/.local/bin/dolly` |
 | Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`) |
 | Secrets and CA files | next to the config, mode `0600` |
-| State (high-water mark, owned entries and members) | `$XDG_STATE_HOME/dolly/state.json` (`~/.local/state/dolly/`) |
-| Lock file | `$XDG_RUNTIME_DIR/dolly.lock` (falls back to `/run/user/<uid>`, then `$XDG_STATE_HOME/dolly/`) |
 | systemd units | `$XDG_CONFIG_HOME/systemd/user/dolly.{service,timer}` |
 | Logs | journald (`journalctl --user -u dolly`) |
 
-Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dolly/dolly.yaml`.
+Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dolly/dolly.yaml`. Dolly keeps no local state. Ownership records and the run lock live in the target LDAP.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `dolly sync` | Incremental sync based on the last recorded `uSNChanged` |
-| `dolly sync --full` | Full reconcile of every in-scope entry |
+| `dolly sync` | Reads all in-scope users and groups from AD and applies the differences |
 | `dolly sync --users` | Syncs users only |
 | `dolly sync --groups` | Syncs groups only (the default without either flag is both) |
-| `dolly sync --dry-run` | Prints planned adds, modifies, and deletes without writing |
+| `dolly sync --dry-run` | Prints planned adds, modifies, renames, and removals without writing |
+| `dolly sync --force` | Applies the run even if it trips the mass-deletion guard |
+| `dolly adopt` | One-time takeover of an existing tree, such as one written by ad2openldap. See "Adopting an existing tree" |
+| `dolly unlock` | Shows the current run lock and removes it after asking for confirmation (`--yes` skips the prompt). Use it after a crash |
 | `dolly diff` | Compares source and target and reports differences |
-| `dolly check` | Tests connectivity, binds, and search scopes |
+| `dolly check` | Tests connectivity, binds, search scopes, and SMTP |
 | `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units |
-| `dolly uninstall` | Removes the units and binary, and keeps config and state |
+| `dolly uninstall` | Removes the units and binary, and keeps the config |
 | `dolly version` | Prints the version |
 
 ## How it works
 
-1. **Bleat.** Dolly binds to AD and runs paged searches for in-scope users and groups. In incremental mode it only asks for entries with `uSNChanged` greater than the last high-water mark.
-2. **Shear.** Each entry is mapped through the configured attribute rules. Group members are resolved and rewritten as target DNs or bare uids.
-3. **Clone.** Dolly compares mapped entries against the target and issues the minimal set of LDAP add, modify, and delete operations. For group membership it only adds or removes members it knows came from AD. Members added directly on the target are never touched.
-4. **Remember.** The new high-water mark and the set of AD-sourced entries and group members are saved, so the next run picks up where this one left off and knows exactly what it owns.
+1. **Lock.** Dolly takes the run lock in the target LDAP, or exits if another host holds it. See "Run lock".
+2. **Bleat.** Dolly binds to AD and runs paged searches for all in-scope users and groups. Large `member` attributes are fetched with ranged retrieval (`member;range=…`). Group members outside the configured search bases are followed and fetched by DN.
+3. **Shear.** Each entry is mapped through the configured attribute rules. Entries missing a `required` attribute are skipped with a warning. Nested groups are flattened. Members are resolved by DN to the user's `objectGUID` and then to the target DN and uid, never by CN, because CNs aren't unique and can contain escaped commas.
+4. **Compare.** Dolly reads the target entries and its ownership records under `state_base`, then plans adds, attribute modifies, renames (`modrdn`), and member additions and removals.
+5. **Guard.** If the plan removes more than `max_delete_percent` of Dolly-owned members or users, Dolly aborts, sends a notification, and changes nothing. `--force` overrides the guard.
+6. **Clone.** Dolly applies the plan, updates its ownership records in the same pass, and releases the lock.
 
-> **Note on `uSNChanged`:** USNs are local to each domain controller. Dolly tracks the DC's `invocationId`, and if it connects to a different DC it falls back to a full sync automatically.
+### Ownership records
+
+Dolly records what it manages in the target LDAP under `state_base`, using only the standard core schema, so no schema changes are needed:
+
+```text
+ou=dolly,dc=local
+├── ou=users
+│   └── cn=<objectGUID>   objectClass: organizationalRole
+│                         seeAlso: uid=jdoe,ou=people,dc=local
+└── ou=groups
+    └── cn=<objectGUID>   objectClass: organizationalRole
+                          seeAlso: cn=hpc-users,ou=group,dc=local
+                          roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added)
+```
+
+The rules:
+
+- A user in the AD group but not in the target group is added and recorded as Dolly-owned.
+- A Dolly-owned member who left the AD group, or was deleted from AD, is removed from the target group and from the record.
+- A member who is already in the target group without a record was added locally. Dolly never removes that member, even if the same user is also in the AD group.
+- A target user or group with the same `uid` or `cn` as an AD entry but no ownership record is a conflict. Dolly logs an error and skips it.
+- A user or group renamed in AD (same `objectGUID`) is renamed in place, and its `member` and `memberUid` values are updated in every group.
+- A user deleted from AD is removed from all groups. The user entry itself is deleted only when `prune_users` is on.
+- A group deleted from AD loses its Dolly-owned members and its ownership record. The group itself stays.
+- A new AD group with no resolvable members isn't created until it has one, because `groupOfNames` needs at least one `member`.
+- If removing Dolly-owned members would leave a group with no members at all, Dolly adds the `empty_group_member` placeholder instead of breaking the `groupOfNames` schema. It removes the placeholder once the group has a real member again.
+- A disabled AD account (`userAccountControl` bit `0x2`) keeps its user entry, but Dolly removes it from every group where it's Dolly-owned. Local memberships are untouched.
+- The AD primary group (`primaryGroupID`, usually Domain Users) is ignored, because AD doesn't list it in the group's `member` attribute.
+- A member outside the configured search bases is followed only if it has a `gidNumber`. Otherwise it's skipped with a warning. An out-of-scope user becomes a normal Dolly-managed user. An out-of-scope child group is only flattened into its parent and isn't created on the target.
+
+### Run lock
+
+Before writing anything, Dolly creates `cn=lock,<state_base>` with an LDAP add. The add is atomic, so only one host can hold the lock. The entry records the host, PID, and start time. Dolly deletes it when the run ends, even after an error.
+
+If a run crashes and leaves the lock behind:
+
+- A lock older than `lock_ttl` (by the server's `createTimestamp`) is treated as stale. The next run breaks it with a warning and sends a notification.
+- `dolly unlock` shows who holds the lock and since when, and removes it after confirmation.
+
+### Adopting an existing tree
+
+A tree written by ad2openldap has no ownership records. Run `dolly adopt` once before the first sync. For every AD user and group that matches a target entry by `uid` or `cn`, it creates an ownership record. In each group it marks the members who are also in the AD group as Dolly-owned, and treats every other member as local.
+
+One caveat: a user removed from an AD group shortly before the adoption looks local, so Dolly will never remove them. Check `dolly adopt --dry-run` for surprises.
 
 ## Running it on a schedule
 
@@ -198,15 +265,6 @@ loginctl enable-linger "$USER"   # keep the timer running while you're logged ou
 - **`~/.local/bin` is missing or not on `PATH`.** Dolly creates the directory and warns if it isn't on `PATH`. The timer doesn't care, because the unit uses the absolute path `%h/.local/bin/dolly`.
 - **Not Linux.** Without systemd (for example macOS), Dolly installs the binary and config, skips the units, and says so.
 
-**Container**
-
-```bash
-docker run --rm -v ~/.config/dolly:/config:ro -v dolly-state:/state -e XDG_STATE_HOME=/state \
-  ghcr.io/<your-org>/dolly sync --config /config/dolly.yaml
-```
-
-A nightly `dolly sync --full` alongside frequent incremental runs is a good default, because it catches deletions and anything the incremental pass missed.
-
 ## TLS certificates
 
 If the TLS handshake fails because the server's CA isn't trusted locally (common with an internal AD CA), pull the server's certificate chain and point `ca_file` at it:
@@ -223,7 +281,7 @@ Check the fingerprint against a trusted source before relying on it. Dolly never
 ## Permissions
 
 - **AD:** a regular read-only service account is enough. Dolly never writes to AD.
-- **Target LDAP:** the bind DN needs write access to the configured users and groups subtrees, and ideally nothing else.
+- **Target LDAP:** the bind DN needs write access to `users_base`, `groups_base`, and `state_base`, and ideally nothing else.
 
 ## Building from source
 
@@ -235,6 +293,19 @@ go test ./...
 ```
 
 Requires Go 1.22 or later. Built on [go-ldap/ldap](https://github.com/go-ldap/ldap).
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs `gofmt`, `go vet`, `go test -race`, and a GoReleaser config check on every push and pull request that touches Go code.
+
+To cut a release, push a semver tag:
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then runs the tests and [GoReleaser](https://goreleaser.com), which publishes static binaries for Linux and macOS (amd64 and arm64), `checksums.txt`, and a changelog to the GitHub release. Each archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`. `dolly version` prints the tag, commit, and build date.
 
 ## Contributing
 
