@@ -10,13 +10,30 @@ It is deliberately simple. Dolly is not a bidirectional sync engine, an identity
 
 ---
 
+## Background and design requirements
+
+Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/dirkpetersen/ad2openldap), a 15-year-old project that still runs reliably in production. A local checkout lives at `../ad2openldap`. Use `ad2openldap3` (`../ad2openldap/ad2openldap/ad2openldap3`) as the main reference.
+
+- **Learn from the old code's corner cases, not its issues.** ad2openldap has known problems, so don't copy its design wholesale. It does handle many real-world edge cases, though, and Dolly should handle them too.
+- **Reliable incremental replication.** Normal operation must never require wiping the target and rebuilding it from scratch.
+- **Only touch what Dolly manages.** Target groups may contain extra members that were added directly on the LDAP server and don't exist in AD. Dolly only changes the members it previously replicated from AD:
+  - A user added to the group in AD is added to the target group.
+  - A user removed from the group in AD, or deleted from AD, is removed from the target group.
+  - A member added directly on the LDAP server stays untouched.
+- **Users and groups are independent.** Dolly can sync users only, groups only, or both, and each can run on its own.
+- **Users and groups only.** No other object types are in scope.
+
+---
+
 ## Features
 
 - **One-way replication** of users and groups from AD to a target LDAP server
 - **Configurable attribute mapping**, e.g. `sAMAccountName` → `uid` and `user` → `inetOrgPerson` + `posixAccount`
 - **Group membership rewriting**, which translates AD member DNs into target DNs (`member`, `uniqueMember`, or `memberUid`)
+- **Non-destructive group membership**, where only members Dolly replicated from AD are added or removed, and members added directly on the LDAP server are left alone
+- **Users and groups sync separately**, so you can run users only, groups only, or both
 - **Incremental sync** using `uSNChanged`, so only changed entries are fetched after the first run
-- **Full reconcile mode** that detects and optionally prunes entries removed from AD
+- **Full reconcile mode** that detects entries removed from AD and can optionally prune them. It only ever deletes entries that Dolly itself created.
 - **Scoped sync** through search bases and LDAP filters, so you replicate only the OUs and groups you want
 - **Disabled-account handling**, which skips, flags, or locks accounts based on `userAccountControl`
 - **Dry-run mode** that shows exactly what would change before anything is touched
@@ -99,7 +116,8 @@ mapping:
 
 sync:
   disabled_accounts: skip           # skip | include | lock
-  prune: false                      # delete target entries missing from AD
+  prune: false                      # delete Dolly-managed target entries missing from AD
+                                    # (group members removed in AD are always removed)
   state_file: /var/lib/dolly/state.json
 ```
 
@@ -111,6 +129,8 @@ Attribute values can be plain AD attribute names or Go templates for derived val
 |---|---|
 | `dolly sync` | Incremental sync based on the last recorded `uSNChanged` |
 | `dolly sync --full` | Full reconcile of every in-scope entry |
+| `dolly sync --users` | Syncs users only |
+| `dolly sync --groups` | Syncs groups only (the default without either flag is both) |
 | `dolly sync --dry-run` | Prints planned adds, modifies, and deletes without writing |
 | `dolly diff` | Compares source and target and reports differences |
 | `dolly check` | Tests connectivity, binds, and search scopes |
@@ -120,8 +140,8 @@ Attribute values can be plain AD attribute names or Go templates for derived val
 
 1. **Bleat.** Dolly binds to AD and runs paged searches for in-scope users and groups. In incremental mode it only asks for entries with `uSNChanged` greater than the last high-water mark.
 2. **Shear.** Each entry is mapped through the configured attribute rules. Group members are resolved and rewritten as target DNs or bare uids.
-3. **Clone.** Dolly compares mapped entries against the target and issues the minimal set of LDAP add, modify, and delete operations.
-4. **Remember.** The new high-water mark is saved so the next run picks up where this one left off.
+3. **Clone.** Dolly compares mapped entries against the target and issues the minimal set of LDAP add, modify, and delete operations. For group membership it only adds or removes members it knows came from AD. Members added directly on the target are never touched.
+4. **Remember.** The new high-water mark and the set of AD-sourced entries and group members are saved, so the next run picks up where this one left off and knows exactly what it owns.
 
 > **Note on `uSNChanged`:** USNs are local to each domain controller. Dolly tracks the DC's `invocationId`, and if it connects to a different DC it falls back to a full sync automatically.
 
