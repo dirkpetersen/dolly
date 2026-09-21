@@ -93,6 +93,11 @@ func TestValidationErrors(t *testing.T) {
 		{"bad DN", []string{"users_base: ou=people,dc=local", "users_base: people"}, "target.users_base: invalid DN"},
 		{"bad url", []string{"url: ldap://ldap.example.edu:389", "url: http://ldap.example.edu"}, "scheme must be ldap:// or ldaps://"},
 		{"notify.on", []string{"on: failure ", "on: sometimes "}, "notify.on: must be failure, changes, or always"},
+		{"smtp username without password", []string{`username: ""                        # optional SMTP auth`, `username: dolly`}, "notify.password: set password or password_file when username is set"},
+		{"smtp password without username", []string{`password: ""                        # inline, or use password_file (set only one)`, `password: "x"`}, "notify.username: required when a password is set"},
+		{"smtps with start_tls", []string{"smtp_port: 25", "smtp_port: 465"}, "notify.start_tls: port 465 uses implicit TLS"},
+		{"bad from", []string{`from: "Dolly <dolly-noreply@example.edu>"`, `from: "not an address"`}, "notify.from:"},
+		{"bad to", []string{`to: [ldap-admins@example.edu]`, `to: [ldap-admins]`}, "notify.to[0]:"},
 		{"create_only unmapped", []string{"create_only: [loginShell, homeDirectory]", "create_only: [loginShell, mail]"}, `"mail" is not in mapping.users.attributes`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,5 +269,36 @@ func TestStateBaseInsideBaseIsValid(t *testing.T) {
 		if _, err := Parse(edit(t, "state_base: ou=dolly,dc=local", "state_base: "+sb), "/x/dolly.yaml"); err != nil {
 			t.Errorf("state_base %s: %v", sb, err)
 		}
+	}
+}
+
+// SMTP without authentication is plain relay and valid with or without
+// StartTLS; AUTH needs TLS (StartTLS or implicit TLS on port 465).
+func TestSMTPAuthRules(t *testing.T) {
+	const notifyAuth = "start_tls: true\n  username: \"\"                        # optional SMTP auth\n  password: \"\"                        # inline, or use password_file (set only one)\n  password_file: \"\""
+	for _, tc := range []struct {
+		name, repl, want string // want "" means valid
+	}{
+		{"no auth, StartTLS", "start_tls: true", ""},
+		{"no auth, plain relay", "start_tls: false", ""},
+		{"auth over StartTLS", "start_tls: true\n  username: dolly\n  password_file: smtp.secret", ""},
+		{"auth without TLS", "start_tls: false\n  username: dolly\n  password_file: smtp.secret", "notify.username: SMTP AUTH is only sent over TLS"},
+		{"username without password", "start_tls: true\n  username: dolly", "notify.password: set password or password_file when username is set"},
+		{"password without username", "start_tls: true\n  password_file: smtp.secret", "notify.username: required when a password is set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(edit(t, notifyAuth, tc.repl), "/x/dolly.yaml")
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("want valid, got %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Errorf("error = %v\nwant it to contain %q", err, tc.want)
+			}
+		})
+	}
+	// Implicit TLS on port 465 allows AUTH without start_tls.
+	_, err := Parse(edit(t, notifyAuth, "start_tls: false\n  username: dolly\n  password_file: smtp.secret", "smtp_port: 25", "smtp_port: 465"), "/x/dolly.yaml")
+	if err != nil {
+		t.Errorf("port 465 with AUTH: %v", err)
 	}
 }

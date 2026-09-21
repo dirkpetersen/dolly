@@ -24,7 +24,7 @@ You have two options:
 olcLimits: dn.exact="cn=dolly,dc=local" size=unlimited time=unlimited
 ```
 
-Adjust `dn.exact` to match the actual `target.bind_dn` in your config. `dolly check` tests for a truncated search using the configured bind DN, so run it after changing either the account or the limit — see [Commands](../commands.md#dolly-check).
+Adjust `dn.exact` to match the actual `target.bind_dn` in your config. `dolly check` tests for a truncated search using the configured bind DN, so run it after changing either the account or the limit — see [Commands](../commands.md#dolly-check). A truncated `groups_base`, or a truncated `users_base` without `--groups`, is reported as a failure; a truncated `users_base` with `dolly check --groups` is only a warning, since a groups-only run never reads `users_base` in full.
 
 !!! note
     A `size=unlimited` grant only expands what this one DN can retrieve in a search; it doesn't grant it write access anywhere. Access control (`olcAccess`) and size limits (`olcLimits`) are configured separately.

@@ -2,13 +2,53 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/dirkpetersen/dolly/internal/check"
+	"github.com/dirkpetersen/dolly/internal/install"
+	"github.com/dirkpetersen/dolly/internal/ldapconn"
 )
 
 const template = "../../dolly.yaml.template"
+
+// TestMain makes sure no test can touch the real environment: install and
+// uninstall get an environment that fails, and systemctl a runner that
+// fails, unless a test sets its own (temp HOME and XDG dirs, fake
+// systemctl). SMTP and LDAP are only ever faked per test.
+func TestMain(m *testing.M) {
+	installEnv = func() (install.Env, error) {
+		return install.Env{}, errors.New("test guard: set installEnv to a temp environment")
+	}
+	systemctl = refuseSystemctl{}
+	checkDial = func(context.Context, ldapconn.Options) (check.Conn, error) {
+		return nil, errors.New("test guard: set checkDial to a fake")
+	}
+	notifyOptions.Dial = localOnly
+	os.Exit(m.Run())
+}
+
+// localOnly lets notifications reach only a fake SMTP server on 127.0.0.1;
+// the template's mx.example.edu is never contacted.
+func localOnly(ctx context.Context, network, addr string) (net.Conn, error) {
+	if host, _, _ := net.SplitHostPort(addr); host != "127.0.0.1" {
+		return nil, fmt.Errorf("test guard: no SMTP connection to %s", addr)
+	}
+	return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+}
+
+type refuseSystemctl struct{}
+
+func (refuseSystemctl) Run([]string, ...string) (string, error) {
+	return "", errors.New("test guard: set systemctl to a fake")
+}
 
 func runCLI(args ...string) (int, string, string) {
 	var out, errb bytes.Buffer
@@ -148,9 +188,9 @@ func TestExitCodes(t *testing.T) {
 		{[]string{"sync", "--dry-run", "--config", template}, 1, "reading password file"}, // reads AD for real; the template names no existing secret
 		{[]string{"adopt", "--config", template}, 1, "reading password file"},
 		{[]string{"unlock", "--yes", "--config", template}, 1, "reading password file"},
-		{[]string{"check"}, 1, "not implemented yet"},
-		{[]string{"install"}, 1, "not implemented yet"},
-		{[]string{"uninstall"}, 1, "not implemented yet"},
+		{[]string{"check", "--config", "/nonexistent.yaml"}, 1, ""}, // the ✗ line goes to stdout
+		{[]string{"install", "--bogus"}, 1, "flag provided but not defined"},
+		{[]string{"uninstall", "extra"}, 1, "unexpected argument"},
 		{[]string{"sync", "--config", "/nonexistent.yaml"}, 1, "does not exist"},
 		{[]string{"diff"}, 1, "unknown command"},
 		{[]string{"sync", "--bogus"}, 1, "flag provided but not defined"},

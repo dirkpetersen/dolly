@@ -29,7 +29,7 @@ A stale lock is broken like this:
 
 1. The stale lock is renamed (`modrdn`) to `cn=lock-stale-<short host>-<unix time>-<pid>` first. Because `modrdn` is also atomic, only one competing host can win this rename; a host that loses it (the lock is gone, or the stale name already exists) treats the lock as still held.
 2. The winner then deletes the renamed entry and takes a fresh lock (one retry). If the entry it renamed turns out to have been fresh after all — another host broke the same stale lock and took a new one in between — the winner renames it back instead of deleting it.
-3. Breaking a lock logs a warning and sends a notification.
+3. Breaking a lock logs a warning and sends a notification — even if the run that broke it then goes on to succeed. See [Notifications](../operations/notifications.md#when-mail-is-sent).
 
 ## `dolly unlock`
 

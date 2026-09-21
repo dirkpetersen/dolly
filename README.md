@@ -1,6 +1,15 @@
 # 🐑 Dolly
 
+[![CI](https://github.com/dirkpetersen/dolly/actions/workflows/ci.yml/badge.svg)](https://github.com/dirkpetersen/dolly/actions/workflows/ci.yml)
+[![Docs](https://github.com/dirkpetersen/dolly/actions/workflows/docs.yml/badge.svg)](https://dirkpetersen.github.io/dolly/)
+[![Release](https://img.shields.io/github/v/release/dirkpetersen/dolly?sort=semver)](https://github.com/dirkpetersen/dolly/releases/latest)
+[![Go version](https://img.shields.io/github/go-mod/go-version/dirkpetersen/dolly)](go.mod)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey)](https://github.com/dirkpetersen/dolly/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > Hello, Dolly. Clones your Active Directory users and groups into OpenLDAP (or any LDAP server), one sheep at a time.
+
+**📖 Documentation: [dirkpetersen.github.io/dolly](https://dirkpetersen.github.io/dolly/)** · [Getting started](https://dirkpetersen.github.io/dolly/getting-started/) · [Configuration](https://dirkpetersen.github.io/dolly/configuration/) · [Releases](https://github.com/dirkpetersen/dolly/releases) · [Contributing](CONTRIBUTING.md)
 
 Dolly is a small, single-binary tool written in Go that replicates users and groups **one way** from Microsoft Active Directory to OpenLDAP or another standards-compliant LDAP directory. It exists for the common case where AD is the source of truth, but your Linux systems, HPC clusters, or legacy applications want a plain POSIX-friendly LDAP tree they can query without learning Microsoft's dialect.
 
@@ -63,9 +72,9 @@ Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/
 go install github.com/dirkpetersen/dolly/cmd/dolly@latest
 
 # Self-install for the current (unprivileged) user: binary, config, systemd --user units
-dolly install
+dolly install            # groups-only deployment: dolly install --groups
 $EDITOR ~/.config/dolly/dolly.yaml
-dolly check
+dolly check              # groups-only: dolly check --groups
 
 # Taking over a tree written by ad2openldap? Adopt it once first:
 dolly adopt --dry-run
@@ -191,6 +200,7 @@ Attribute values are plain AD attribute names or Go templates. Dolly only writes
 - `mapping.users.rdn` must map to the same value as `uid`.
 - Every `create_only` entry must also be a mapped attribute.
 - An empty `notify.smtp_host` disables notifications.
+- SMTP without authentication is allowed: with `notify.username`, `password`, and `password_file` all empty, Dolly never sends `AUTH` (plain relay, with or without `start_tls`). A username without a password, or a password without a username, is a config error. A username also requires TLS, since `AUTH` is never sent over an unencrypted connection: `start_tls: true`, or `smtp_port: 465` (implicit TLS, where `start_tls` must be `false`). `notify.from` and each `notify.to` entry must be valid mail addresses.
 - `page_size` defaults to `500` if omitted.
 - Listing `member` in `mapping.groups.membership` requires `empty_group_member` to be set.
 - `users_base` and `groups_base` must differ, since Dolly tells users from groups by their container.
@@ -220,10 +230,49 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `--debug` | Accepted by every command that plans (`sync`, `adopt`). Prints debug details to stderr, one line per group member skipped because it has no entry on the target: `debug: skip <uid> in <group DN>: no entry on the target under <users_base>` (with `member` in the membership list: `no entry on the target at <member DN>`). Without it, the summary shows only the count |
 | `dolly adopt` | One-time takeover of an existing tree, such as one written by ad2openldap. See "Adopting an existing tree" |
 | `dolly unlock` | Shows the current run lock (holder, and age by the server's `createTimestamp`) and removes it after asking for confirmation. Without `--yes`, stdin must be a terminal: Dolly refuses (exit `1`) rather than guess when it isn't, for example under cron. `--yes` skips the prompt. Use it after a crash, when no run is active |
-| `dolly check` | Tests connectivity, binds, search scopes, the target's containers and size limit, and SMTP |
-| `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units |
-| `dolly uninstall` | Removes the units and binary, and keeps the config |
+| `dolly check` | Tests the config, every domain controller, the target's containers and size limit, and SMTP, one `✓`/`✗`/`!` line each; exits `1` if any check fails. Writes nothing. `--groups` for a groups-only deployment; `--send-test-mail` also sends one test message to `notify.to`. See "Checking a config" |
+| `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units. `--users` or `--groups` and `--config FILE` are baked into the unit's `ExecStart`. See "Running it on a schedule" |
+| `dolly uninstall` | Stops and disables the timer, removes the units and the binary, and keeps the config |
 | `dolly version` | Prints the version |
+
+### Checking a config
+
+`dolly check` runs every check it can, even after one fails, and never writes to AD or the target:
+
+- **Config:** loads and validates it (including the password rules), and reads every password file: it must exist and not be empty, and a file readable by group or others is a warning.
+- **AD:** connects to *each* DC in `source.urls` (LDAPS, or StartTLS for `ldap://`) and binds. A DC that fails while another answers is a warning, since runs fail over; none answering is a failure. After an invalid-credentials error the remaining DCs aren't tried, because every attempt counts toward the account's lockout. On the first DC that answered, it runs a paged search (page size 1, first page only) of the users base and the groups base with their filters, and names that DC. A base with no matching entry is a failure (the guard stops every sync when AD returns no users or no groups), except the users base with `--groups`, which groups-only runs never search.
+- **Target:** TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it (DNs only, no client size limit) must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full read tests its size limit. A truncated `users_base` read is a failure, or with `--groups` a warning, because groups-only runs never read `users_base` in full. Both print the `olcLimits` fix (see "Permissions"). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent for the first real run to create it under (write access there isn't tested, since `check` never writes).
+- **SMTP** (if `notify.smtp_host` is set): connects, says `EHLO`, does StartTLS if configured, and authenticates with `AUTH PLAIN` if a username is set, or reports `SMTP: no authentication (username empty)`. No mail is sent unless `--send-test-mail` is given. Connects and operations are bounded by `network_timeout`, the whole check by `run_timeout`.
+
+```text
+Config /home/svc-dolly/.config/dolly/dolly.yaml
+  ✓ loaded and valid
+  ✓ source.bind_password_file /home/svc-dolly/.config/dolly/ad.secret: readable
+  ✓ target.bind_password_file /home/svc-dolly/.config/dolly/ldap.secret: readable
+
+AD (source.urls, tried in order)
+  ! ldaps://dc01.example.edu:636: dial tcp: connection refused (runs fail over to ldaps://dc02.example.edu:636)
+  ✓ ldaps://dc02.example.edu:636: LDAPS and bind as CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu (41ms)
+  ✓ users base OU=People,DC=example,DC=edu: paged search with (&(objectClass=user)(objectCategory=person)) returns entries (answered by ldaps://dc02.example.edu:636)
+  ✓ groups base OU=Groups,DC=example,DC=edu: paged search with (objectClass=group) returns entries (answered by ldaps://dc02.example.edu:636)
+
+Target ldap://ldap.example.edu:389
+  ✓ StartTLS and bind as cn=admin,dc=local (12ms)
+  ✓ groups_base ou=group,dc=local exists; all 9412 entries readable in one search
+  ✓ users_base ou=people,dc=local: readable (uid lookup found uid=jdoe,ou=people,dc=local)
+  ✗ users_base ou=people,dc=local: the server truncated a full read after 10000 entries (sizeLimitExceeded); runs that sync users read it in full and would abort (for a groups-only deployment, run dolly check --groups)
+      bind as the rootdn, or raise the limit for Dolly's DN on the database entry: olcLimits: dn.exact="cn=admin,dc=local" size=unlimited time=unlimited (README "Permissions")
+  ✓ state_base ou=dolly,dc=local exists
+
+SMTP mx.example.edu:25
+  ✓ connected to mx.example.edu:25
+  ✓ EHLO ldap-sync01
+  ✓ STARTTLS (certificate verified for mx.example.edu)
+  ✓ SMTP: no authentication (username empty)
+  - no mail sent (use --send-test-mail to send one to ldap-admins@example.edu)
+
+1 check failed, 14 passed, 1 warning.
+```
 
 Exit codes: `0` for success, or when another host holds the lock. `1` for an error, including a single rejected operation (see "Applying the plan") and a run stopped by a signal or `run_timeout`. `2` when the mass-deletion guard stopped (or, for `--dry-run`, would have stopped) the run — `--force` makes that case exit `0` instead. The "AD returned zero users or zero groups" guard applies to every `dolly sync`, dry-run or not, but not to `dolly adopt`.
 
@@ -342,7 +391,7 @@ A second, intended difference from ad2openldap: users without a `gidNumber` (the
 
 **systemd user timer (default)**
 
-`dolly install` writes these units, so you normally don't create them by hand:
+`dolly install` writes these units, so you normally don't create them by hand. This is the default, a full sync of users and groups:
 
 ```ini
 # ~/.config/systemd/user/dolly.service
@@ -367,22 +416,46 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+`dolly install --groups` (or `--users`) bakes the flag into the service, for example for a groups-only deployment, and `--config FILE` adds the config's absolute path (a relative path is made absolute), which also becomes the file `dolly install` creates from the template if it's missing. Without `--config` the service relies on the default lookup (`$XDG_CONFIG_HOME/dolly/dolly.yaml`), because its working directory isn't where you ran `dolly install`:
+
+```bash
+dolly install --groups
+# dolly.service then has:
+# ExecStart=%h/.local/bin/dolly sync --groups
+dolly install --groups --config ~/targets/ldap-a.yaml
+# ExecStart=%h/.local/bin/dolly sync --groups --config /home/svc-dolly/targets/ldap-a.yaml
+```
+
+`dolly install` prints the resulting `ExecStart=` line. Re-running it with different flags rewrites the service. It doesn't enable the timer; it ends with the next steps (edit the config, `dolly check`, `dolly sync --dry-run`, then):
+
 ```bash
 systemctl --user enable --now dolly.timer
 loginctl enable-linger "$USER"   # keep the timer running while you're logged out (may need an admin)
 ```
 
-`dolly install` is safe to re-run. It never overwrites an existing config and only rewrites the units when they changed. It also handles a few common gaps in a service account's environment:
+`dolly install` is safe to re-run. It never overwrites an existing config (it creates it with mode `0600`, in a `0700` directory), replaces the binary atomically (mode `0755`) only when it differs, and only rewrites the units when their content changed. It runs `systemctl --user daemon-reload` on every install, so a re-run after a failed reload fixes it. `dolly uninstall` stops and disables the timer (a timer that isn't loaded is fine), removes both units and reloads, removes `~/.local/bin/dolly`, and keeps the config and any secrets next to it. It also handles a few common gaps in a service account's environment:
 
-- **`XDG_RUNTIME_DIR` is unset** (typical after `su -` or `sudo -iu`, where `systemctl --user` fails with "Failed to connect to bus"). If `/run/user/<uid>` exists, Dolly points `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` at it for its own `systemctl --user` calls. If it doesn't exist, the user has no session and no linger, and Dolly stops and tells you to run `loginctl enable-linger <user>`. Dolly never edits your shell startup files.
+- **`XDG_RUNTIME_DIR` is unset** (typical after `su -` or `sudo -iu`, where `systemctl --user` fails with "Failed to connect to bus"). If `/run/user/<uid>` exists, Dolly points `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` at it for its own `systemctl --user` calls. If it doesn't exist, the user has no session and no linger: Dolly still installs the binary, config, and units, then stops with exit `1` and tells you to run `loginctl enable-linger <user>` and `dolly install` again. Dolly never edits your shell startup files.
 - **`~/.local/bin` is missing or not on `PATH`.** Dolly creates the directory and warns if it isn't on `PATH`. The timer doesn't care, because the unit uses the absolute path `%h/.local/bin/dolly`.
 - **Not Linux.** Without systemd (for example macOS), Dolly installs the binary and config, skips the units, and says so.
 
 ## Notifications
 
-With `on: changes`, Dolly mails when a run made changes. Failures are always reported, whichever setting you choose. Dolly sends at most **one email per run**. It's a summary of everything that happened: counts, then the adds, removals, renames, changed ID numbers, warnings, and errors. A hundred changed users is still one mail.
+With `on: changes`, Dolly mails when a run made changes. Failures are always reported, whichever setting you choose. Dolly sends at most **one email per run**, in plain text. It's a summary of everything that happened: a short header (host, command, start and end time, outcome, and why this mail was sent), the failure if any, then the run's output exactly as the journal has it: the plan with its counts, adds, removals, renames, changed ID numbers, and warnings, the result with the created and changed groups and their members, and the errors. A hundred changed users is still one mail. A body longer than 2,000 lines is cut, with a note pointing at `journalctl --user -u dolly`.
 
-Dolly keeps a `cn=status` entry (an `organizationalRole`) under `state_base` with the last successful run, the current failure, and when it last sent mail, as `description` key=value notes: `last-run`, `last-success`, `last-result` (a one-line count summary), `failure-since` and `failure` (only while a failure persists), and `last-notified`. Every real run that got the lock writes it, whether it succeeded, failed to read, tripped the guard, had per-entry errors, or was stopped. With `on: failure` it sends one mail when a failure first appears, a reminder at most every `remind_every` while it persists, and one mail when the run succeeds again. So an AD outage overnight is two or three mails, not 96. Ignored entries and conflicts are listed in the run summary and mailed only when the list changes.
+Dolly keeps a `cn=status` entry (an `organizationalRole`) under `state_base` with the last successful run, the current failure, and when it last sent mail, as `description` key=value notes: `last-run`, `last-success`, `last-result` (a one-line count summary), `failure-since` and `failure` (only while a failure persists), `last-notified` (the last successful send), `notify-error` (the last failed send, cleared by a successful one), and `warnings-hash` (see below). Every real run that got the lock writes it, whether it succeeded, failed to read, tripped the guard, had per-entry errors, or was stopped.
+
+Each run that got the lock decides from those notes, before writing them, whether to mail:
+
+- **Failures, whatever `on` says.** A read error, a tripped guard, a rejected operation, and a stop by signal or `run_timeout` are failures. Dolly mails when a failure first appears (or when it was never mailed, for example because the send failed), then a reminder at most every `remind_every` (by `last-notified`) while it persists, and one "recovered" mail when a run succeeds again. So an AD outage overnight is two or three mails, not 96.
+- **A broken stale lock** (see "Run lock") is mailed, even if the run then succeeds.
+- **`on: changes`** also mails when the run applied at least one operation; **`on: always`** mails every run.
+- **Warnings** (ignored entries, conflicts, duplicates, groups waiting for members; not changed ID numbers, which are changes) are mailed only when the list changes, whatever `on` says. Dolly stores a short hash of the list in `warnings-hash`, one note per run scope (`warnings-hash`, `warnings-hash-users`, `warnings-hash-groups`, `warnings-hash-adopt`), so alternating `--users` and `--groups` runs don't flip it. A run that failed before planning leaves the hash alone.
+- A run that finds the lock held never mails, and neither does `--dry-run`. A run that can't reach the target at all can't read or write `cn=status`, so it isn't mailed either; it logs the error and exits `1` (watch the unit's result in systemd).
+
+`last-notified` and `warnings-hash` are updated only after a successful send, so a failed send is retried by the next run. A mail failure never changes the run's exit code or stops the run: Dolly logs it to stderr and records `notify-error`. Each SMTP step is bounded by `network_timeout`.
+
+SMTP without authentication (plain relay, the usual campus relay on port 25) needs only `smtp_host`, `smtp_port`, `from`, and `to`: with no username Dolly never sends `AUTH`, with or without StartTLS. With a username it authenticates with `AUTH PLAIN`, only over TLS (StartTLS, or implicit TLS on port 465). StartTLS and implicit TLS verify the server's certificate against the system trust store; there is no way to skip verification. An empty `smtp_host` disables notifications.
 
 ## TLS certificates
 
@@ -400,7 +473,7 @@ Check the fingerprint against a trusted source before relying on it. Dolly never
 ## Permissions
 
 - **AD:** a regular read-only service account is enough. Dolly never writes to AD.
-- **Target LDAP:** the bind DN needs write access to `users_base`, `groups_base`, and `state_base`, and ideally nothing else (a groups-only deployment needs only read access to `users_base`). It must also be able to read *every* entry under `groups_base` and `state_base`, and under `users_base` in runs that sync users. OpenLDAP's default `olcSizeLimit` (500, or 10000 in the ad2openldap config) truncates searches for any DN except the rootdn, so either bind as the rootdn or raise the limit for Dolly's DN with `olcLimits`. Dolly aborts on a truncated read, and `dolly check` tests for it. A `--groups` run never reads all of `users_base`, so a large `users_base` behind a hard limit is fine there.
+- **Target LDAP:** the bind DN needs write access to `users_base`, `groups_base`, and `state_base`, and ideally nothing else (a groups-only deployment needs only read access to `users_base`). It must also be able to read *every* entry under `groups_base` and `state_base`, and under `users_base` in runs that sync users. OpenLDAP's default `olcSizeLimit` (500, or 10000 in the ad2openldap config) truncates searches for any DN except the rootdn, so either bind as the rootdn or raise the limit for Dolly's DN with `olcLimits` on the database entry, for example `olcLimits: dn.exact="cn=dolly,dc=local" size=unlimited time=unlimited`. Dolly aborts on a truncated read, and `dolly check` tests for it. A `--groups` run never reads all of `users_base`, so a large `users_base` behind a hard limit is fine there.
 
 ## Building from source
 
@@ -428,7 +501,7 @@ git push origin v0.1.0
 
 ## Contributing
 
-Issues and pull requests are welcome. Please include a dry-run output or a minimal LDIF example when reporting mapping bugs, with anything sensitive redacted.
+Issues and pull requests are welcome. Please include a dry-run output or a minimal LDIF example when reporting mapping bugs, with anything sensitive redacted. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up a fork and how this project is developed with Claude Code.
 
 ## License
 

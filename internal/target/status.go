@@ -19,7 +19,13 @@ const (
 	StatusFailureSince = "failure-since" // when the current failure first appeared; absent while healthy
 	StatusFailure      = "failure"       // the current failure, one line; absent while healthy
 	StatusLastResult   = "last-result"   // one-line summary of the last run
-	StatusLastNotified = "last-notified" // when mail was last sent; written by notifications (not yet), kept as is
+	StatusLastNotified = "last-notified" // when mail was last sent successfully; set by the Notes hook
+	StatusNotifyError  = "notify-error"  // the last mail failure (time and error); cleared by a successful send
+	// StatusWarningsHash is the prefix of the notes that hold a short hash
+	// of the last mailed warnings list (ignored entries, conflicts, ...),
+	// one note per run scope: warnings-hash (users and groups),
+	// warnings-hash-users, warnings-hash-groups, warnings-hash-adopt.
+	StatusWarningsHash = "warnings-hash"
 )
 
 // maxFailureLen caps the failure note, so a huge error can't bloat the entry.
@@ -30,6 +36,12 @@ type RunStatus struct {
 	End     time.Time
 	Failure string // "" for a successful run
 	Result  string // one-line summary
+	// Notes, if set, is called with the notes before the run, after the
+	// new notes are computed and before they are written. It returns
+	// notes to set; an empty value deletes the note. Notifications use it
+	// to decide on and send the run's single mail, and to record
+	// last-notified, notify-error, and the warnings hash.
+	Notes func(before []string) map[string]string
 }
 
 // StatusDN returns cn=status under stateBase.
@@ -52,13 +64,9 @@ func WriteStatus(ctx context.Context, c Conn, stateBase string, st RunStatus) (b
 		before = e.GetEqualFoldAttributeValues("description")
 	}
 	after = nextStatus(before, st)
-
-	// TODO(notify): decide here whether to send the run's single email,
-	// comparing before and after: with on: failure, mail when failure-since
-	// first appears, remind at most every remind_every (last-notified), and
-	// mail once on recovery (failure-since disappears). After sending, set
-	// last-notified in after before writing it. A broken stale lock and a
-	// tripped guard are failures too.
+	if st.Notes != nil {
+		after = setNotes(after, st.Notes(before))
+	}
 
 	if e == nil {
 		req := ldap.NewAddRequest(dn, nil)
@@ -121,6 +129,47 @@ func nextStatus(before []string, st RunStatus) []string {
 		}
 	}
 	return append(out, plain...)
+}
+
+// setNotes sets key=value notes in notes, in place where a key exists and
+// appended otherwise; an empty value removes the key.
+func setNotes(notes []string, set map[string]string) []string {
+	if len(set) == 0 {
+		return notes
+	}
+	done := map[string]bool{}
+	var out []string
+	for _, n := range notes {
+		k, _, ok := strings.Cut(n, "=")
+		v, change := set[k]
+		switch {
+		case !ok || !change:
+			out = append(out, n)
+		case done[k] || v == "":
+			// removed, or a duplicate of a key already set
+		default:
+			out = append(out, k+"="+oneLine(v))
+		}
+		if ok && change {
+			done[k] = true
+		}
+	}
+	for _, k := range model.SortedKeys(set) {
+		if v := set[k]; !done[k] && v != "" {
+			out = append(out, k+"="+oneLine(v))
+		}
+	}
+	return out
+}
+
+// StatusNote returns the value of key in status notes, or "".
+func StatusNote(notes []string, key string) string {
+	for _, n := range notes {
+		if k, v, ok := strings.Cut(n, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
 }
 
 func oneLine(s string) string {

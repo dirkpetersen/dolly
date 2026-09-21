@@ -4,7 +4,7 @@ Dolly is designed to run unprivileged, under `systemd --user`, with all paths fo
 
 ## systemd user timer (default)
 
-`dolly install` writes these units, so you normally don't create them by hand:
+`dolly install` writes these units, so you normally don't create them by hand. This is the default, a full sync of users and groups:
 
 ```ini
 # ~/.config/systemd/user/dolly.service
@@ -29,6 +29,19 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+`dolly install --groups` (or `--users`) bakes the flag into the service's `ExecStart`, for example for a groups-only deployment, and `--config FILE` adds the config's absolute path (a relative path is made absolute), which is also the path `dolly install` creates from the template if it's missing. Without `--config`, the service relies on the default [config lookup order](../configuration.md#config-lookup-order), since its working directory isn't where you ran `dolly install`:
+
+```bash
+dolly install --groups
+# dolly.service then has:
+# ExecStart=%h/.local/bin/dolly sync --groups
+
+dolly install --groups --config ~/targets/ldap-a.yaml
+# ExecStart=%h/.local/bin/dolly sync --groups --config /home/svc-dolly/targets/ldap-a.yaml
+```
+
+`dolly install` prints the resulting `ExecStart=` line, and re-running it with different flags rewrites the service. It doesn't enable the timer itself — it ends by printing the next steps (edit the config, `dolly check`, `dolly sync --dry-run`, then):
+
 ```bash
 systemctl --user enable --now dolly.timer
 loginctl enable-linger "$USER"   # keep the timer running while you're logged out (may need an admin)
@@ -40,16 +53,18 @@ loginctl enable-linger "$USER"   # keep the timer running while you're logged ou
 
 `dolly install` is safe to re-run:
 
-- it never overwrites an existing `dolly.yaml`,
-- it only rewrites the systemd units when their content has actually changed.
+- it never overwrites an existing `dolly.yaml` (created with mode `0600`, in a `0700` directory),
+- it replaces the binary only when it differs from what's already installed (written to a temp file and renamed into place, mode `0755`),
+- it only rewrites the systemd units when their content has actually changed,
+- it runs `systemctl --user daemon-reload` on every install, so a re-run after a failed reload fixes it.
 
-`dolly uninstall` removes the units and the binary, and leaves the config in place.
+`dolly uninstall` is the undo: it stops and disables `dolly.timer` (fine if it isn't loaded), removes both units, reloads systemd, and removes `~/.local/bin/dolly` — the config and any secrets next to it are kept.
 
 ## Environment gaps in service-account setups
 
 Service accounts reached via `su -` or `sudo -iu` often lack a full session environment. `dolly install` handles the common gaps:
 
-- **`XDG_RUNTIME_DIR` unset.** This is typical after `su -` or `sudo -iu`, and normally makes `systemctl --user` fail with "Failed to connect to bus." If `/run/user/<uid>` exists, Dolly sets `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` for its own `systemctl --user` calls. If `/run/user/<uid>` doesn't exist, the account has no active session and no linger enabled — Dolly fails clearly and tells you to run `loginctl enable-linger <user>` (may need an admin to run it for the service account).
+- **`XDG_RUNTIME_DIR` unset.** This is typical after `su -` or `sudo -iu`, and normally makes `systemctl --user` fail with "Failed to connect to bus." If `/run/user/<uid>` exists, Dolly sets `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` for its own `systemctl --user` calls. If `/run/user/<uid>` doesn't exist, the account has no active session and no linger enabled: Dolly still installs the binary, config, and units, then exits `1` and tells you to run `loginctl enable-linger <user>` (may need an admin to run it for the service account) and re-run `dolly install`.
 - **`~/.local/bin` missing or not on `PATH`.** Dolly creates the directory if needed, and warns (without failing) if it isn't on `PATH`. This doesn't matter for the timer itself, since the unit references the absolute path `%h/.local/bin/dolly` and never depends on `PATH`.
 - **Non-Linux hosts.** Without systemd, `dolly install` installs the binary and config, skips writing any units, and says so.
 
@@ -57,4 +72,4 @@ Dolly never edits shell startup files (`.bashrc`, `.profile`, and so on) to fix 
 
 ## Several targets from one host
 
-There is no multi-target mode — each target LDAP server needs its own config file, state base, and run lock. To sync more than one target from a single host, keep one `dolly.yaml` per target and pass `--config` explicitly for each, either as separate `dolly.service` units (one per target) or by wrapping calls to `dolly sync --config /path/to/target-a.yaml` and `--config /path/to/target-b.yaml` in your own scheduling. See [Configuration](../configuration.md#config-lookup-order).
+There is no multi-target mode — each target LDAP server needs its own config file, state base, and run lock. To sync more than one target from a single host, keep one `dolly.yaml` per target and pass `--config` explicitly for each, either as separate `dolly.service` units (one per target, each with its own `--config` baked in by `dolly install --config`) or by wrapping calls to `dolly sync --config /path/to/target-a.yaml` and `--config /path/to/target-b.yaml` in your own scheduling. See [Configuration](../configuration.md#config-lookup-order).

@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -13,12 +14,14 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/dirkpetersen/dolly/internal/config"
 	"github.com/dirkpetersen/dolly/internal/fixture"
 	"github.com/dirkpetersen/dolly/internal/model"
+	"github.com/dirkpetersen/dolly/internal/notify"
 	"github.com/dirkpetersen/dolly/internal/planner"
 	"github.com/dirkpetersen/dolly/internal/source"
 	"github.com/dirkpetersen/dolly/internal/target"
@@ -49,7 +52,9 @@ Commands:
   adopt      One-time takeover of an existing tree [--dry-run] [--debug]
   unlock     Show and remove the run lock after a crash [--yes]
   check      Test connectivity, binds, search scopes, size limits, and SMTP
+             [--groups] [--send-test-mail]
   install    Install the binary, config, and systemd --user units
+             [--users|--groups] [--config FILE]
   uninstall  Remove the units and binary, keep the config
   version    Print the version
 
@@ -74,9 +79,9 @@ func commands() []command {
 		{"sync", "Read all in-scope AD users and groups and apply the differences to the target.", runSync},
 		{"adopt", "Create ownership records for an existing tree, such as one written by ad2openldap. Run once before the first sync.", runAdopt},
 		{"unlock", "Show the run lock and remove it after confirmation.", runUnlock},
-		{"check", "Test connectivity, binds, search scopes, the target's containers and size limit, and SMTP.", notImplemented("check")},
-		{"install", "Install the binary to ~/.local/bin, create the config from the template if missing, and write the systemd --user units.", notImplemented("install")},
-		{"uninstall", "Remove the systemd --user units and the binary. The config is kept.", notImplemented("uninstall")},
+		{"check", "Test connectivity, binds, search scopes, the target's containers and size limit, and SMTP.", runCheck},
+		{"install", "Install the binary to ~/.local/bin, create the config from the template if missing, and write the systemd --user units.", runInstall},
+		{"uninstall", "Remove the systemd --user units and the binary. The config is kept.", runUninstall},
 		{"version", "Print the version.", runVersion},
 	}
 }
@@ -254,6 +259,11 @@ func runContext(cfg *config.Config) (context.Context, func()) {
 func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
 	ctx, cleanup := runContext(cfg)
 	defer cleanup()
+	start := time.Now()
+	// The run's output (stdout and stderr, as written) becomes the body of
+	// the run's single notification.
+	capture := &lockedBuffer{}
+	stdout, stderr = io.MultiWriter(stdout, capture), io.MultiWriter(stderr, capture)
 	sb := cfg.Target.StateBase
 	conn, err := dialWriter(cfg)
 	if err != nil {
@@ -291,12 +301,30 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 			fmt.Fprintf(stderr, "dolly %s: warning: %v\n", cmd, err)
 		}
 	}()
-	// TODO(notify): a broken stale lock (lock.Broke) sends a notification.
 
+	// status records the outcome in cn=status and, through the Notes hook,
+	// sends the run's single notification (decided from the notes before
+	// this run). A broken stale lock and a tripped guard are mailed as
+	// failures are. A mail failure is logged and recorded as notify-error;
+	// it never changes the exit code.
+	var p *planner.Plan
+	var res *target.Result
 	status := func(failure, result string) {
 		sctx, cancel := fresh()
 		defer cancel()
-		if _, _, err := target.WriteStatus(sctx, conn, sb, target.RunStatus{End: time.Now(), Failure: failure, Result: result}); err != nil {
+		end := time.Now()
+		notes := func(before []string) map[string]string {
+			r := notify.Report{
+				Command: cmd, ConfigPath: cfg.Path, Start: start, End: end, Failure: failure,
+				Changed: res != nil && res.Applied > 0, BrokeLock: lock.Broke, Plan: p, Output: capture.String(),
+			}
+			mctx, mcancel := context.WithTimeout(context.Background(), 2*cfg.Sync.NetworkTimeout.Duration)
+			defer mcancel()
+			o := notifyOptions
+			o.Timeout = cfg.Sync.NetworkTimeout.Duration
+			return notify.Notes(mctx, cfg.Notify, o, before, r, stderr)
+		}
+		if _, _, err := target.WriteStatus(sctx, conn, sb, target.RunStatus{End: end, Failure: failure, Result: result, Notes: notes}); err != nil {
 			fmt.Fprintf(stderr, "dolly %s: warning: %v\n", cmd, err)
 		}
 	}
@@ -311,8 +339,9 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 	if err != nil {
 		return fail(err)
 	}
-	p, err := planner.Build(snaps.AD, snaps.Target, snaps.Records, cfg, opt)
+	p, err = planner.Build(snaps.AD, snaps.Target, snaps.Records, cfg, opt)
 	if err != nil {
+		p = nil
 		return fail(err)
 	}
 	if showDebug {
@@ -329,7 +358,7 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		}
 		fmt.Fprintf(stdout, "\n--force: applying the plan despite the guard.\n")
 	}
-	res := target.Apply(ctx, conn, p, stderr, showDebug)
+	res = target.Apply(ctx, conn, p, stderr, showDebug)
 	res.Print(stdout)
 	summary := fmt.Sprintf("%d operations: %d applied, %d already in place, %d skipped, %d failed, %d not run",
 		len(p.Ops), res.Applied, res.AlreadyDone, res.Skipped, res.Failed, res.NotRun)
@@ -339,6 +368,28 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 	}
 	status("", summary)
 	return exitOK
+}
+
+// notifyOptions are the notification options other than the config
+// (Timeout is set from network_timeout); tests set RootCAs.
+var notifyOptions notify.Options
+
+// lockedBuffer is a bytes.Buffer safe for concurrent writes.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // writerConn is the target connection of a real run.
@@ -434,31 +485,6 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 	}
 	fmt.Fprintf(stderr, "dolly: read complete in %s\n", time.Since(start).Round(time.Millisecond))
 	return &fixture.Snapshots{AD: snap, Target: tgt, Records: recs}, nil
-}
-
-// notImplemented returns a command that accepts its documented flags and
-// reports that it isn't available yet.
-func notImplemented(name string, boolFlags ...string) func([]string, io.Writer, io.Writer) int {
-	return func(args []string, stdout, stderr io.Writer) int {
-		var help string
-		for _, c := range commands() {
-			if c.name == name {
-				help = c.help
-			}
-		}
-		fs := newFlags(name, help, stderr, "")
-		if name == "check" {
-			fs.String("config", "", "config file")
-		}
-		for _, b := range boolFlags {
-			fs.Bool(b, false, "skip the confirmation prompt")
-		}
-		if code, ok := parse(fs, args); !ok {
-			return code
-		}
-		fmt.Fprintf(stderr, "dolly %s: not implemented yet\n", name)
-		return exitError
-	}
 }
 
 // stdin and stdinIsTTY are the confirmation input of dolly unlock; tests

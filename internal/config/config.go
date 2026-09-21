@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -139,6 +140,9 @@ type Notify struct {
 	On            string   `yaml:"on"`
 	RemindEvery   Duration `yaml:"remind_every"`
 }
+
+// smtpsPort is the SMTP port with implicit TLS (notify.ImplicitTLSPort).
+const smtpsPort = 465
 
 // Duration is a time.Duration written as a Go duration string ("45m").
 type Duration struct{ time.Duration }
@@ -471,9 +475,16 @@ func (c *Config) Validate() error {
 		}
 		if n.From == "" {
 			add("notify.from: required when notify.smtp_host is set")
+		} else if _, err := mail.ParseAddress(n.From); err != nil {
+			add("notify.from: %q is not a mail address: %v", n.From, err)
 		}
 		if len(n.To) == 0 {
 			add("notify.to: at least one recipient is required when notify.smtp_host is set")
+		}
+		for i, r := range n.To {
+			if _, err := mail.ParseAddress(r); err != nil {
+				add("notify.to[%d]: %q is not a mail address: %v", i, r, err)
+			}
 		}
 		switch n.On {
 		case "failure", "changes", "always":
@@ -488,6 +499,14 @@ func (c *Config) Validate() error {
 		}
 		if n.Username != "" && n.Password == "" && n.PasswordFile == "" {
 			add("notify.password: set password or password_file when username is set")
+		}
+		// spec: without a username Dolly never sends AUTH (plain relay, with
+		// or without StartTLS). With one, AUTH is sent only over TLS.
+		if n.SMTPPort == smtpsPort && n.StartTLS {
+			add("notify.start_tls: port %d uses implicit TLS; set start_tls: false", smtpsPort)
+		}
+		if n.Username != "" && !n.StartTLS && n.SMTPPort != smtpsPort {
+			add("notify.username: SMTP AUTH is only sent over TLS; set notify.start_tls: true (or use port %d, implicit TLS), or leave username empty for unauthenticated relay", smtpsPort)
 		}
 	}
 	return errors.Join(errs...)

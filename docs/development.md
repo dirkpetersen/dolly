@@ -77,7 +77,7 @@ Docs publish automatically to [https://dirkpetersen.github.io/dolly/](https://di
 
 ## Contributing
 
-Issues and pull requests are welcome. Please include a dry-run output or a minimal LDIF example when reporting mapping bugs, with anything sensitive redacted.
+Issues and pull requests are welcome. Please include a dry-run output or a minimal LDIF example when reporting mapping bugs, with anything sensitive redacted. See [CONTRIBUTING.md](https://github.com/dirkpetersen/dolly/blob/main/CONTRIBUTING.md) for how to set up a fork and how this project is developed with Claude Code.
 
 ## License
 

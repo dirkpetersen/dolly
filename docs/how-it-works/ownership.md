@@ -12,8 +12,10 @@ ou=dolly,dc=local
 │                         seeAlso: cn=hpc-users,ou=group,dc=local
 │                         roleOccupant: uid=jdoe,ou=people,dc=local   (one per member Dolly added, always a DN)
 ├── cn=lock                                                              (only while a run is active)
-└── cn=status             last successful run, current failure, last notification
+└── cn=status             last successful run, current failure, notification state
 ```
+
+See [Notifications](../operations/notifications.md) for every note `cn=status` carries and when Dolly mails from it.
 
 Each record's RDN is `cn=<objectGUID>` — the AD object's `objectGUID`, formatted as a canonical hyphenated string (AD returns it as 16 mixed-endian bytes, so Dolly normalizes it once to a single consistent format). `seeAlso` points at the managed target entry. On group records, `roleOccupant` lists the members Dolly itself added to that group, always as a DN built as `<rdn>=<uid>,<users_base>` (for example `uid=jdoe,ou=people,dc=local`), even when the group's schema uses `memberUid` only; `memberUid` ownership is derived from those DNs rather than tracked separately. With `memberUid` only, that DN is just an identifier: the user entry must exist somewhere under `users_base` with that uid (see [Required attributes](#required-attributes) below), but not necessarily at that DN. User records also carry small `description` values in `key=value` form:
 

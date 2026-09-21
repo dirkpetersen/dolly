@@ -1,5 +1,6 @@
 // Package ldapfake is an in-memory LDAP directory for tests of the target
-// writer: Add, Modify, ModifyDN, Del, and base-scope Search, with the
+// writer: Add, Modify, ModifyDN, Del, and Search (base scope, and one-level
+// and subtree with simple filters and a size limit), with the
 // result codes a real server returns (entryAlreadyExists, noSuchObject,
 // attributeOrValueExists, noSuchAttribute, notAllowedOnNonLeaf) and a
 // createTimestamp on every entry. Hooks inject failures and races.
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	ber "github.com/go-asn1-ber/asn1-ber"
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/dirkpetersen/dolly/internal/model"
@@ -37,6 +39,10 @@ type Dir struct {
 	// after a ModifyDN, every value of them equal to the old DN, in every
 	// entry, is rewritten to the new DN.
 	Refint []string
+	// SizeLimit, if positive, is the server's size limit for one-level
+	// and subtree searches (olcSizeLimit): more matching entries fail
+	// with sizeLimitExceeded.
+	SizeLimit int
 	// Calls records "<op> <dn>" for every call, in order.
 	Calls []string
 }
@@ -290,30 +296,77 @@ func (d *Dir) Del(req *ldap.DelRequest) error {
 	return nil
 }
 
-// Search implements target.Conn for base-scope searches. It returns the
-// requested attributes ("*" or none: all user attributes; "1.1": none) and
-// createTimestamp when requested by name.
+// Search implements target.Conn. Base-scope searches ignore the filter
+// (every caller asks for (objectClass=*)). One-level and subtree searches
+// evaluate it: presence, equality (case-insensitive), and, or, and not;
+// any other filter is unwillingToPerform. (objectClass=*) matches every
+// entry, as on a real server. It returns the requested attributes ("*" or
+// none: all user attributes; "1.1": none) and createTimestamp when
+// requested by name.
+//
+// SizeLimit (the server's) and the request's size limit truncate non-base
+// results the way a server does: the entries up to the limit and
+// sizeLimitExceeded, like go-ldap's Search, which returns both.
 func (d *Dir) Search(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	if err := d.begin("search", req.BaseDN, req); err != nil {
 		return nil, err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if req.Scope != ldap.ScopeBaseObject {
-		return nil, Error(ldap.LDAPResultUnwillingToPerform, "the fake supports base-scope searches only")
-	}
-	e := d.entries[model.MustDNKey(req.BaseDN)]
-	if e == nil {
+	base := d.entries[model.MustDNKey(req.BaseDN)]
+	if base == nil {
 		return nil, Error(ldap.LDAPResultNoSuchObject, "No such object")
 	}
+	if req.Scope == ldap.ScopeBaseObject {
+		return &ldap.SearchResult{Entries: []*ldap.Entry{project(base, req.Attributes)}}, nil
+	}
+	filter, err := ldap.CompileFilter(req.Filter)
+	if err != nil {
+		return nil, Error(ldap.LDAPResultFilterError, err.Error())
+	}
+	var keys []string
+	for k := range d.entries {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	res := &ldap.SearchResult{}
+	limit := d.SizeLimit
+	if req.SizeLimit > 0 && (limit == 0 || req.SizeLimit < limit) {
+		limit = req.SizeLimit
+	}
+	for _, k := range keys {
+		e := d.entries[k]
+		if !model.IsUnder(e.dn, base.dn) {
+			continue
+		}
+		if req.Scope == ldap.ScopeSingleLevel && !isChild(e.dn, base.dn) {
+			continue
+		}
+		ok, err := match(filter, e.attrs)
+		if err != nil {
+			return nil, Error(ldap.LDAPResultUnwillingToPerform, err.Error())
+		}
+		if !ok {
+			continue
+		}
+		if limit > 0 && len(res.Entries) == limit {
+			return res, Error(ldap.LDAPResultSizeLimitExceeded, "Size Limit Exceeded")
+		}
+		res.Entries = append(res.Entries, project(e, req.Attributes))
+	}
+	return res, nil
+}
+
+// project returns e with the requested attributes.
+func project(e *entry, attrs []string) *ldap.Entry {
 	out := map[string][]string{}
-	all := len(req.Attributes) == 0
-	for _, a := range req.Attributes {
+	all := len(attrs) == 0
+	for _, a := range attrs {
 		if a == "*" {
 			all = true
 		}
 	}
-	for _, a := range req.Attributes {
+	for _, a := range attrs {
 		switch {
 		case a == "1.1" || a == "*":
 		case strings.EqualFold(a, "createTimestamp"):
@@ -329,7 +382,45 @@ func (d *Dir) Search(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
 			out[k] = append([]string(nil), v...)
 		}
 	}
-	return &ldap.SearchResult{Entries: []*ldap.Entry{ldap.NewEntry(e.dn, out)}}, nil
+	return ldap.NewEntry(e.dn, out)
+}
+
+// isChild reports whether dn is directly below parent.
+func isChild(dn, parent string) bool {
+	p, err := ldap.ParseDN(dn)
+	if err != nil || len(p.RDNs) == 0 {
+		return false
+	}
+	return model.DNEqual((&ldap.DN{RDNs: p.RDNs[1:]}).String(), parent)
+}
+
+// match evaluates a compiled filter against attrs.
+func match(f *ber.Packet, attrs map[string][]string) (bool, error) {
+	switch f.Tag {
+	case ldap.FilterAnd, ldap.FilterOr:
+		and := f.Tag == ldap.FilterAnd
+		for _, c := range f.Children {
+			ok, err := match(c, attrs)
+			if err != nil {
+				return false, err
+			}
+			if ok != and {
+				return ok, nil
+			}
+		}
+		return and, nil
+	case ldap.FilterNot:
+		ok, err := match(f.Children[0], attrs)
+		return !ok, err
+	case ldap.FilterPresent:
+		name := ber.DecodeString(f.Data.Bytes())
+		return strings.EqualFold(name, "objectClass") || attrKey(attrs, name) != "", nil
+	case ldap.FilterEqualityMatch:
+		name := ber.DecodeString(f.Children[0].Data.Bytes())
+		value := ber.DecodeString(f.Children[1].Data.Bytes())
+		return contains(name, attrs[attrKey(attrs, name)], value), nil
+	}
+	return false, fmt.Errorf("the fake doesn't support filter %s", ldap.FilterMap[uint64(f.Tag)])
 }
 
 // Close is a no-op.

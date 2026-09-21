@@ -20,7 +20,7 @@ Dolly runs as a regular user by default and needs no root.
 dolly install
 ```
 
-This copies the binary to `~/.local/bin`, creates `$XDG_CONFIG_HOME/dolly/dolly.yaml` from the built-in template if one doesn't already exist, and writes the `systemd --user` units. Re-running `dolly install` is always safe: it never overwrites an existing config, and it only rewrites the systemd units when their content has changed. See [Scheduling](operations/scheduling.md) for what the units look like and how to handle service-account environments.
+This copies the binary to `~/.local/bin`, creates `$XDG_CONFIG_HOME/dolly/dolly.yaml` from the built-in template if one doesn't already exist, and writes the `systemd --user` units. For a groups-only deployment, use `dolly install --groups` instead, which bakes `--groups` into the unit's `ExecStart` (see [Groups-only deployments](configuration.md#groups-only-deployments)). Re-running `dolly install` is always safe: it never overwrites an existing config, replaces the binary only when it differs, and only rewrites the systemd units when their content has changed. It prints the next steps and doesn't enable the timer itself. See [Scheduling](operations/scheduling.md) for what the units look like and how to handle service-account environments.
 
 ## Edit the configuration
 
@@ -34,9 +34,10 @@ At minimum, fill in your AD source (URLs, bind DN, bind password, user and group
 
 ```bash
 dolly check
+dolly check --groups   # for a groups-only deployment: a truncated users_base is a warning, not a failure
 ```
 
-`dolly check` tests connectivity and binds to both AD and the target, verifies the target's containers exist, checks for a truncated search (a sign that `olcSizeLimit` is too low for Dolly's bind DN), and tests SMTP if notifications are configured. Fix anything it reports before syncing.
+`dolly check` runs every check it can, even after one fails, and never writes to AD or the target. It prints a `✓`/`✗`/`!` line per check: the config (including password files), each AD domain controller and its search bases, the target's TLS/bind and containers (with a size-limit check for a truncated read — a sign that `olcSizeLimit` is too low for Dolly's bind DN), and SMTP if `notify` is configured (add `--send-test-mail` to actually send a test message). Fix anything it reports before syncing; see [Commands](commands.md#dolly-check).
 
 ## Adopt an existing tree
 

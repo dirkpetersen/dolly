@@ -355,3 +355,33 @@ func TestStatusKeepsPlainNotes(t *testing.T) {
 		t.Errorf("plain note lost: %v", got)
 	}
 }
+
+// The Notes hook sees the notes before the run and sets or deletes notes
+// in the written entry.
+func TestStatusNotesHook(t *testing.T) {
+	dir := ldapfake.New()
+	sb := "ou=dolly,dc=local"
+	dn := StatusDN(sb)
+	dir.Put(dn, map[string][]string{"objectClass": {"organizationalRole"}, "cn": {"status"},
+		"description": {"last-run=x", "notify-error=old", "warnings-hash=aaa", "plain note"}}, time.Now())
+	var seen []string
+	_, after, err := WriteStatus(context.Background(), dir, sb, RunStatus{End: time.Now(), Result: "ok",
+		Notes: func(before []string) map[string]string {
+			seen = before
+			return map[string]string{StatusNotifyError: "", StatusLastNotified: "2026-09-21T00:00:00Z", "warnings-hash": "bbb"}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(seen, "|") != "last-run=x|notify-error=old|warnings-hash=aaa|plain note" {
+		t.Errorf("before %v", seen)
+	}
+	got := strings.Join(dir.Values(dn, "description"), "|")
+	if got != strings.Join(after, "|") || strings.Contains(got, "notify-error") || !strings.Contains(got, "warnings-hash=bbb") ||
+		!strings.Contains(got, "last-notified=2026-09-21T00:00:00Z") || !strings.Contains(got, "plain note") || strings.Count(got, "warnings-hash") != 1 {
+		t.Errorf("after %s", got)
+	}
+	if StatusNote(after, "warnings-hash") != "bbb" || StatusNote(after, "missing") != "" {
+		t.Error("StatusNote")
+	}
+}

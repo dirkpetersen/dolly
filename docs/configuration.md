@@ -142,6 +142,7 @@ Dolly validates `dolly.yaml` before connecting to anything:
 - `mapping.users.rdn` must map to the same value as `uid`.
 - Every `create_only` entry must also be a mapped attribute.
 - An empty `notify.smtp_host` disables notifications.
+- SMTP without authentication is allowed: with `notify.username`, `notify.password`, and `notify.password_file` all empty, Dolly never sends `AUTH` (plain relay, with or without `notify.start_tls`). A username without a password, or a password without a username, is a config error. A username also requires TLS, since `AUTH` is never sent over an unencrypted connection: `notify.start_tls: true`, or `notify.smtp_port: 465` (implicit TLS, where `notify.start_tls` must be `false`). `notify.from` and each `notify.to` entry must be valid mail addresses.
 - `source.page_size` defaults to `500` if omitted.
 - Listing `member` in `mapping.groups.membership` requires `target.empty_group_member` to be set.
 - `target.users_base` and `target.groups_base` must differ, since Dolly tells users from groups by their container.
@@ -232,7 +233,7 @@ See [How it works](how-it-works/index.md#guard) for the mass-deletion guard in d
 
 ## `notify`
 
-SMTP settings and when to send mail. See [Notifications](operations/notifications.md) for the flood-control behavior.
+SMTP settings and when to send mail. See [Notifications](operations/notifications.md) for the flood-control behavior, and [Authentication](operations/notifications.md#authentication) for the `username`/`password`/TLS rules.
 
 | Key | Default / example | Meaning |
 |---|---|---|

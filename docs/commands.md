@@ -74,11 +74,20 @@ Use this after a crash that left the lock behind, when no run is active, instead
 
 ## `dolly check`
 
-Tests connectivity, binds, search scopes, the target's containers and size limit, and SMTP.
+Runs every check it can, even after one has failed, and never writes to AD or the target — safe to run at any time.
 
 ```bash
-dolly check
+dolly check                    # full deployment (users and groups)
+dolly check --groups           # groups-only deployment
+dolly check --send-test-mail   # also sends one test message to notify.to
 ```
+
+Each check prints one `✓` / `✗` / `!` line, and `dolly check` exits `1` if any check failed:
+
+- **Config** — loads and validates `dolly.yaml` (including the SMTP validation rules; see [Configuration](configuration.md#config-validation)), and reads every password file: it must exist and be non-empty, and one readable by group or others is a warning.
+- **AD** — connects to each entry in `source.urls`, in order (LDAPS, or StartTLS for `ldap://`), and binds. A DC that fails while another answers is a warning, since real runs fail over the same way; none answering is a failure. After an invalid-credentials error the remaining DCs aren't tried, since every attempt counts toward the account's lockout. On the first DC that answered, it runs a one-page search of the users base and the groups base with their filters. A base with no matching entries is a failure (the guard stops every sync when AD returns zero users or zero groups) — except the users base with `--groups`, which a groups-only run never searches.
+- **Target** — TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full-read size-limit test applies, but a truncated `users_base` is a failure only without `--groups` — with it, it's a warning, since groups-only runs never read `users_base` in full. Both truncation checks print the `olcLimits` fix; see [Permissions](operations/permissions.md). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent so the first real run can create it (write access there isn't tested, since `check` never writes).
+- **SMTP** (if `notify.smtp_host` is set) — connects, sends `EHLO`, does StartTLS if configured, and authenticates with `AUTH PLAIN` if a username is set, otherwise reports that no authentication will be used. No mail is sent unless `--send-test-mail` is given. See [Notifications](operations/notifications.md#authentication).
 
 Run this after editing the config, and whenever `dolly sync` reports connection or truncation errors.
 
@@ -88,13 +97,17 @@ Copies the binary to `~/.local/bin`, creates the config from the built-in templa
 
 ```bash
 dolly install
+dolly install --groups                            # bake sync --groups into the unit
+dolly install --users --config ~/targets/a.yaml    # bake sync --users --config <absolute path>
 ```
 
-Safe to re-run: it never overwrites an existing config, and it only rewrites the systemd units when their content changed. See [Scheduling](operations/scheduling.md) for the units it writes and how it handles service-account environments.
+`--users` or `--groups` and `--config FILE` are baked into the unit's `ExecStart` (a relative `--config` path is made absolute; that same path is what `dolly install` creates from the template if it's missing). Without `--config`, the unit relies on the default [config lookup order](configuration.md#config-lookup-order). `dolly install` prints the resulting `ExecStart=` line and ends with the next steps (edit the config, `dolly check`, `dolly sync --dry-run`, then enable the timer) — it never enables the timer itself.
+
+Safe to re-run: it never overwrites an existing config, replaces the binary only when it differs, and only rewrites the systemd units when their content changed (it runs `systemctl --user daemon-reload` every time). See [Scheduling](operations/scheduling.md) for the units it writes and how it handles service-account environments.
 
 ## `dolly uninstall`
 
-Removes the systemd units and the binary. The config is kept.
+Stops and disables the timer, removes the systemd units and the binary, and reloads systemd. The config is kept.
 
 ```bash
 dolly uninstall
