@@ -28,7 +28,7 @@ This is `dolly.yaml.template`, copied verbatim. `dolly install` writes this file
 # Defaults match the tree produced by ad2openldap.
 
 source:
-  urls:                               # tried in order
+  urls:                               # tried in random order each run
     - ldaps://dc01.example.edu:636
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
@@ -154,7 +154,7 @@ Connection and search settings for Active Directory. Dolly only ever reads from 
 
 | Key | Default / example | Meaning |
 |---|---|---|
-| `urls` | `[ldaps://dc01.example.edu:636, ldaps://dc02.example.edu:636]` | Domain controllers, tried in order: a connect or bind failure moves on to the next one (invalid credentials don't, to spare the account's lockout counter). An `ldap://` URL is always upgraded with StartTLS. |
+| `urls` | `[ldaps://dc01.example.edu:636, ldaps://dc02.example.edu:636]` | Domain controllers, tried in random order each run to spread the load: a connect or bind failure moves on to the next one (invalid credentials don't, to spare the account's lockout counter). An `ldap://` URL is always upgraded with StartTLS. |
 | `ca_file` | `ad-ca.pem` (optional) | CA certificate to trust for AD's TLS chain. See [TLS certificates](operations/tls.md). |
 | `bind_dn` | `CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu` | The AD service account to bind as. A UPN such as `svc-dolly@example.edu` also works. |
 | `bind_password` | `""` | Inline bind password. Set only one of `bind_password` / `bind_password_file`. See [Passwords](#passwords). |

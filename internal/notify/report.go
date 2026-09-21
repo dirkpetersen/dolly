@@ -46,8 +46,9 @@ func (r Report) scopeKey() string {
 
 // Notes decides whether the run sends its single mail and sends it. It
 // returns the cn=status notes to set (see target.RunStatus.Notes): after a
-// successful send last-notified, the warnings hash, and an empty
-// notify-error (deleted); after a failed send only notify-error. A mail
+// successful send last-notified, the warnings hash, an empty notify-error
+// (deleted), and for a failure mail failure-notified; after a failed send
+// only notify-error. A mail
 // failure is logged to log and never returned: it must not change the
 // run's exit code. An empty smtp_host disables notifications entirely.
 func Notes(ctx context.Context, n config.Notify, o Options, before []string, r Report, log io.Writer) map[string]string {
@@ -76,6 +77,9 @@ func Notes(ctx context.Context, n config.Notify, o Options, before []string, r R
 		target.StatusLastNotified: o.Now().UTC().Format(time.RFC3339),
 		target.StatusNotifyError:  "",
 	}
+	if d.FailureMail() {
+		notes[target.StatusFailureNotified] = FailureNotifiedNote(o.Now(), r.Failure)
+	}
 	if out.WarningsKnown {
 		notes[out.WarningsKey] = out.WarningsHash
 	}
@@ -92,6 +96,8 @@ func Compose(d Decision, before []string, r Report) Message {
 	switch {
 	case d.Has(ReasonFailure):
 		subject = fmt.Sprintf("%s FAILED: %s", who, short(r.Failure, 100))
+	case d.Has(ReasonFailureChanged):
+		subject = fmt.Sprintf("%s FAILED (failure changed): %s", who, short(r.Failure, 80))
 	case d.Has(ReasonReminder):
 		subject = fmt.Sprintf("%s still failing since %s: %s", who, target.StatusNote(before, target.StatusFailureSince), short(r.Failure, 80))
 	case d.Has(ReasonStaleLock):
@@ -105,7 +111,7 @@ func Compose(d Decision, before []string, r Report) Message {
 	default:
 		subject = fmt.Sprintf("%s ok", who)
 	}
-	if r.Plan != nil && !d.Has(ReasonFailure) && !d.Has(ReasonReminder) {
+	if r.Plan != nil && !d.FailureMail() {
 		if c := planCounts(r.Plan); c != "" {
 			subject += " (" + c + ")"
 		}
@@ -136,6 +142,9 @@ func Compose(d Decision, before []string, r Report) Message {
 		if since := target.StatusNote(before, target.StatusFailureSince); since != "" {
 			fmt.Fprintf(&b, "Failing since: %s\n", since)
 		}
+		if d.Has(ReasonFailureChanged) {
+			fmt.Fprintf(&b, "Previous failure: %s\n", target.StatusNote(before, target.StatusFailure))
+		}
 	}
 	if d.Has(ReasonRecovered) {
 		fmt.Fprintf(&b, "\nRecovered. The failure since %s was: %s\n",
@@ -157,6 +166,8 @@ func reasonText(r Reason, before []string) string {
 	switch r {
 	case ReasonFailure:
 		return "a failure appeared (failures are always reported)"
+	case ReasonFailureChanged:
+		return "failure changed: the run still fails, but differently from the failure last mailed"
 	case ReasonReminder:
 		return "reminder: the failure persists (reminders at most every notify.remind_every)"
 	case ReasonStaleLock:

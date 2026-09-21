@@ -21,6 +21,12 @@ const (
 	StatusLastResult   = "last-result"   // one-line summary of the last run
 	StatusLastNotified = "last-notified" // when mail was last sent successfully; set by the Notes hook
 	StatusNotifyError  = "notify-error"  // the last mail failure (time and error); cleared by a successful send
+	// StatusFailureNotified is when the last failure mail (failure,
+	// failure changed, reminder) was sent, and a short hash of the failure
+	// it reported: "<RFC 3339> <hash>". Set by the Notes hook; removed on
+	// success. Other mails sent during a failure don't touch it, so they
+	// don't reset the reminder clock.
+	StatusFailureNotified = "failure-notified"
 	// StatusWarningsHash is the prefix of the notes that hold a short hash
 	// of the last mailed warnings list (ignored entries, conflicts, ...),
 	// one note per run scope: warnings-hash (users and groups),
@@ -116,6 +122,7 @@ func nextStatus(before []string, st RunStatus) []string {
 		set(StatusLastSuccess, end)
 		delete(notes, StatusFailure)
 		delete(notes, StatusFailureSince)
+		delete(notes, StatusFailureNotified)
 	} else {
 		if _, ok := notes[StatusFailureSince]; !ok {
 			set(StatusFailureSince, end)
@@ -171,6 +178,10 @@ func StatusNote(notes []string, key string) string {
 	}
 	return ""
 }
+
+// OneLine returns s as the failure note stores it: whitespace collapsed to
+// single spaces, capped in length.
+func OneLine(s string) string { return oneLine(s) }
 
 func oneLine(s string) string {
 	s = strings.Join(strings.Fields(s), " ")

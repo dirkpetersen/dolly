@@ -46,7 +46,8 @@ The `on` setting controls the trigger for non-failure mail:
 Failures are mailed whatever `on` says. Dolly avoids flooding your inbox during an extended outage by tracking state in `cn=status`:
 
 - one mail when a failure **first appears** (or was never successfully mailed — for example because an earlier send attempt failed),
-- at most one reminder per `remind_every` while it **persists**,
+- one mail right away when the failure **changes** while it persists — a different error, not the same one with different counts, timestamps, or durations (Dolly compares the text with those normalized away against the failure it last mailed); at most once an hour, or once per `remind_every` if that is shorter, so a failure flapping between two texts can't mail every run,
+- at most one reminder per `remind_every` while it **persists**, counted from the last failure mail — a changes or warnings mail sent during the failure doesn't postpone the reminder,
 - one mail on **recovery**, when the run next succeeds.
 
 So an AD outage that lasts overnight produces two or three mails total, not one for every 15-minute run. A read error, a tripped [mass-deletion guard](../how-it-works/index.md#guard), a rejected operation, and a run stopped by a signal or `run_timeout` all count as failures.
@@ -71,11 +72,12 @@ Dolly keeps a `cn=status` entry (an `organizationalRole`) under `state_base` (al
 - `last-result` — a one-line count summary of that run,
 - `failure-since` and `failure` — present only while a failure persists,
 - `last-notified` — when a notification mail was last **successfully sent**,
+- `failure-notified` — when the last failure mail (first failure, failure changed, or reminder) was sent, with a short hash of the failure it reported; present only while a failure persists, and the clock for reminders,
 - `notify-error` — the last failed send attempt, cleared by the next successful send,
 - `warnings-hash`, `warnings-hash-users`, `warnings-hash-groups`, `warnings-hash-adopt` — a short hash of the current warnings list, one note per run scope, so alternating `--users` and `--groups` runs don't keep re-triggering a warnings mail off each other's hash.
 
 Every real run that acquires the lock writes this entry, whether it succeeded, failed to read AD or the target, tripped the mass-deletion guard, had per-entry errors while applying the plan, or was stopped by a signal or `run_timeout`. `--dry-run` never writes it, since it never takes the lock.
 
-`last-notified` and the warnings hashes are updated only *after* a successful send, so a failed send is retried by the next run instead of being silently treated as delivered. A mail failure never changes the run's own exit code — it's only logged (to stderr) and recorded in `notify-error`.
+`last-notified`, `failure-notified`, and the warnings hashes are updated only *after* a successful send, so a failed send is retried by the next run instead of being silently treated as delivered. A mail failure never changes the run's own exit code — it's only logged (to stderr) and recorded in `notify-error`.
 
 This is what makes the flood-control behavior possible without any local state — a fresh host or a rebuilt Dolly instance picks up exactly where the last one left off, because the status lives in the target LDAP too. See [Ownership](../how-it-works/ownership.md) for the rest of what lives under `state_base`.

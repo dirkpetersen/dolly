@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -54,7 +55,7 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{home: home, sc: &fakeSystemctl{}}
 	f.env = Env{
 		GOOS: "linux", Home: home, Path: "/usr/bin:" + filepath.Join(home, ".local", "bin"),
-		RuntimeDir: "/run/user/1234", Environ: []string{"HOME=" + home, "PATH=/usr/bin"},
+		RuntimeDir: filepath.Join(runUser, "1234"), Environ: []string{"HOME=" + home, "PATH=/usr/bin"},
 		UID: 1234, User: "svc-dolly", RunUser: runUser, Systemd: func() bool { return true }, Executable: exe,
 	}
 	return f
@@ -141,8 +142,12 @@ func TestInstallFreshAndIdempotent(t *testing.T) {
 	if err := Install(f.env, f.opts()); err != nil {
 		t.Fatalf("%v\n%s", err, f.out.String())
 	}
-	if read(t, p.Binary) != "binary v1" || mode(t, p.Binary) != 0o755 || mode(t, p.BinDir) != 0o700 {
-		t.Errorf("binary: mode %v, dir %v", mode(t, p.Binary), mode(t, p.BinDir))
+	// MkdirAll honors the umask, so only require that the owner has full
+	// access and the dirs are not the config's 0700-only mode under umask 022.
+	um := currentUmask()
+	if read(t, p.Binary) != "binary v1" || mode(t, p.Binary) != 0o755 || mode(t, p.BinDir) != 0o755&^um ||
+		mode(t, filepath.Dir(p.BinDir)) != 0o755&^um {
+		t.Errorf("binary: mode %v, dir %v, ~/.local %v", mode(t, p.Binary), mode(t, p.BinDir), mode(t, filepath.Dir(p.BinDir)))
 	}
 	if read(t, p.Config) != "template: yes\n" || mode(t, p.Config) != 0o600 || mode(t, filepath.Dir(p.Config)) != 0o700 {
 		t.Errorf("config: mode %v", mode(t, p.Config))
@@ -272,6 +277,72 @@ func TestInstallRuntimeDirFallback(t *testing.T) {
 	}
 }
 
+// An XDG_RUNTIME_DIR that isn't this user's (inherited after sudo -u svc)
+// counts as unset: systemctl gets /run/user/<own uid>, or the linger hint.
+func TestInstallForeignRuntimeDir(t *testing.T) {
+	f := newFixture(t)
+	f.env.RuntimeDir = filepath.Join(f.env.RunUser, "1000") // the admin's
+	f.env.Environ = append(f.env.Environ, "XDG_RUNTIME_DIR="+f.env.RuntimeDir, "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus")
+	if err := Install(f.env, f.opts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	dir := filepath.Join(f.env.RunUser, "1234")
+	env := strings.Join(f.sc.envs[0], "\n")
+	if !strings.Contains(env, "XDG_RUNTIME_DIR="+dir+"\n") || !strings.Contains(env, "DBUS_SESSION_BUS_ADDRESS=unix:path="+dir+"/bus") ||
+		strings.Contains(env, "1000") {
+		t.Errorf("systemctl env:\n%s", env)
+	}
+
+	// Own runtime dir, spelled with a trailing slash: inherited as is.
+	if senv, err := SystemctlEnv(Env{RuntimeDir: dir + "/", RunUser: f.env.RunUser, UID: 1234}); err != nil || senv != nil {
+		t.Errorf("own XDG_RUNTIME_DIR: env %v, err %v", senv, err)
+	}
+
+	// Foreign and no /run/user/<uid>: the linger hint, naming the foreign dir.
+	f2 := newFixture(t)
+	f2.env.RuntimeDir = "/run/user/1000"
+	f2.env.UID = 999
+	err := Install(f2.env, f2.opts())
+	var nm *NoManagerError
+	if !errors.As(err, &nm) || !strings.Contains(err.Error(), "loginctl enable-linger svc-dolly") || !strings.Contains(err.Error(), "XDG_RUNTIME_DIR=/run/user/1000 is not this user's") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f2.sc.calls) != 0 {
+		t.Errorf("systemctl was called: %v", f2.sc.calls)
+	}
+}
+
+// Paths with spaces or shell metacharacters are quoted in the next steps.
+func TestNextStepsQuoting(t *testing.T) {
+	f := newFixture(t)
+	f.env.Path = "/usr/bin"
+	f.env.Home = filepath.Join(f.home, "my home")
+	o := f.opts()
+	o.ConfigPath = filepath.Join(f.env.Home, "it's $x.yaml")
+	if err := Install(f.env, o); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	bin := "'" + filepath.Join(f.env.Home, ".local", "bin", "dolly") + "'"
+	cfg := `'` + filepath.Join(f.env.Home, "it") + `'\''s $x.yaml'`
+	out := f.out.String()
+	for _, want := range []string{"$EDITOR " + cfg + "\n", bin + " check --config " + cfg + "\n", bin + " sync --dry-run --config " + cfg + "\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for in, want := range map[string]string{
+		"/home/svc/.config/dolly/a.yaml": "/home/svc/.config/dolly/a.yaml",
+		"/tmp/a b":                       "'/tmp/a b'",
+		"/tmp/a;rm":                      "'/tmp/a;rm'",
+		"/tmp/$(x)":                      "'/tmp/$(x)'",
+		"":                               "''",
+	} {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestInstallNoUserManager(t *testing.T) {
 	f := newFixture(t)
 	f.env.RuntimeDir = ""
@@ -377,4 +448,11 @@ func TestUninstall(t *testing.T) {
 	if _, err := os.Stat(g.paths().Service); err == nil {
 		t.Error("service not removed")
 	}
+}
+
+// currentUmask returns the process umask (read by setting and restoring it).
+func currentUmask() os.FileMode {
+	m := syscall.Umask(0)
+	syscall.Umask(m)
+	return os.FileMode(m)
 }

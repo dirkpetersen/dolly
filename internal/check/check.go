@@ -173,7 +173,7 @@ func tlsMode(url string, startTLS bool) string {
 // checkAD tests each DC's TLS and bind, then a size-1 paged search of the
 // users and groups bases on the first DC that answered.
 func checkAD(ctx context.Context, p *printer, cfg *config.Config, o Options) {
-	p.section("AD (source.urls, tried in order)")
+	p.section("AD (source.urls; sync tries them in random order)")
 	pw, err := cfg.Source.Password()
 	if err != nil || pw == "" {
 		p.fail("skipped: no AD bind password")

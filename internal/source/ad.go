@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +44,9 @@ func DialAD(ctx context.Context, cfg *config.Config) (*AD, error) {
 		return nil, fmt.Errorf("source: %w", err)
 	}
 	var fails []string
-	for _, u := range cfg.Source.URLs {
+	// spec: DCs are tried in random order each run, which spreads the load;
+	// a connect or bind failure falls over to the next one.
+	for _, u := range shuffleURLs(cfg.Source.URLs) {
 		conn, err := ldapconn.Dial(ctx, ldapconn.Options{
 			URL: u, StartTLS: ldapconn.Scheme(u) == "ldap", CAFile: cfg.Source.CAFile,
 			Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: cfg.Source.BindDN, Password: pw,
@@ -373,4 +376,12 @@ func kindOf(classes []string) model.Kind {
 		return model.KindUser
 	}
 	return model.KindOther
+}
+
+// shuffleURLs returns a randomly ordered copy of urls. Tests replace it to
+// get a fixed order.
+var shuffleURLs = func(urls []string) []string {
+	out := append([]string(nil), urls...)
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
 }

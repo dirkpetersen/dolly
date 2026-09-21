@@ -55,6 +55,32 @@ func TestDecide(t *testing.T) {
 		{"warnings cleared", "failure", []string{"warnings-hash=abc"}, Outcome{WarningsKnown: true, WarningsKey: "warnings-hash"}, []Reason{ReasonWarnings}},
 		{"warnings unknown (read failed)", "failure", append([]string{"warnings-hash=abc"}, failing...), Outcome{Failure: "AD down", WarningsKey: "warnings-hash"}, nil},
 		{"other scope's hash ignored", "failure", []string{"warnings-hash-groups=abc"}, Outcome{WarningsKnown: true, WarningsHash: "abc", WarningsKey: "warnings-hash-groups"}, nil},
+		{"failure changed", "failure", failing, Outcome{Failure: "LDAP down"}, []Reason{ReasonFailureChanged}},
+		{"failure changed, on changes with changes", "changes", failing, Outcome{Failure: "LDAP down", Changed: true}, []Reason{ReasonFailureChanged, ReasonChanges}},
+		{"only counts differ: same failure", "failure", []string{"failure-since=" + ts(-2*time.Hour), "failure=run incomplete: 10 operations: 3 applied, 1 failed",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-2*time.Hour), "run incomplete: 12 operations: 5 applied, 2 failed")},
+			Outcome{Failure: "run incomplete: 9 operations: 0 applied, 4 failed"}, nil},
+		{"guard counts differ: same failure", "failure", []string{"failure-since=" + ts(-2*time.Hour), "failure=x",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-2*time.Hour), "mass-deletion guard tripped: 40 user removals exceed max_delete_min (10) and 5% of 300 owned")},
+			Outcome{Failure: "mass-deletion guard tripped: 41 user removals exceed max_delete_min (10) and 5% of 290 owned"}, nil},
+		{"flapping failure: changed text within the minimum gap is not mailed", "failure", []string{"failure-since=" + ts(-3*time.Hour), "failure=AD down",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-15*time.Minute), "AD down")},
+			Outcome{Failure: "LDAP down"}, nil},
+		{"flapping failure: changed text after the minimum gap is mailed", "failure", []string{"failure-since=" + ts(-3*time.Hour), "failure=AD down",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-61*time.Minute), "AD down")},
+			Outcome{Failure: "LDAP down"}, []Reason{ReasonFailureChanged}},
+		{"compared with the failure last mailed, not the last run's", "failure", []string{"failure-since=" + ts(-2*time.Hour), "failure=LDAP down",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-2*time.Hour), "AD down")},
+			Outcome{Failure: "LDAP down"}, []Reason{ReasonFailureChanged}},
+		{"a changes mail during a failure doesn't reset the reminder", "changes", []string{"failure-since=" + ts(-30*time.Hour), "failure=AD down",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-24*time.Hour), "AD down"), "last-notified=" + ts(-time.Hour)},
+			Outcome{Failure: "AD down", Changed: true}, []Reason{ReasonReminder, ReasonChanges}},
+		{"failure mailed recently, no reminder", "failure", []string{"failure-since=" + ts(-30*time.Hour), "failure=AD down",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-time.Hour), "AD down"), "last-notified=" + ts(-48*time.Hour)},
+			Outcome{Failure: "AD down"}, nil},
+		{"failure mail predates this failure", "failure", []string{"failure-since=" + ts(-time.Hour), "failure=AD down",
+			"failure-notified=" + FailureNotifiedNote(t0.Add(-48*time.Hour), "AD down"), "last-notified=" + ts(-time.Minute)},
+			Outcome{Failure: "AD down"}, []Reason{ReasonFailure}},
 		{"guard trip is a failure", "failure", nil, Outcome{Failure: "mass-deletion guard tripped"}, []Reason{ReasonFailure}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -64,6 +90,29 @@ func TestDecide(t *testing.T) {
 				t.Errorf("got send=%v %v, want %v", d.Send, d.Reasons, tc.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeFailure(t *testing.T) {
+	for _, tc := range []struct{ a, b string }{
+		{"run incomplete: 10 operations: 3 applied, 1 failed", "run incomplete:  12 operations: 5 applied, 0 failed"},
+		{"stopped by run_timeout after 25m0s", "stopped by run_timeout after 24m59.5s"},
+		{"lock taken at 2026-09-21T12:00:00Z (3 runs)", "lock taken at 2026-09-22T01:02:03Z (14 runs)"},
+		{"guard: 40 removals exceed 5% of 300", "guard: 41 removals exceed 7% of 290"},
+	} {
+		if NormalizeFailure(tc.a) != NormalizeFailure(tc.b) || FailureHash(tc.a) != FailureHash(tc.b) {
+			t.Errorf("%q and %q should normalize alike: %q vs %q", tc.a, tc.b, NormalizeFailure(tc.a), NormalizeFailure(tc.b))
+		}
+	}
+	for _, tc := range []struct{ a, b string }{
+		{"AD down", "LDAP down"},
+		{"connecting to dc01.example.edu:636: refused", "connecting to dc02.example.edu:636: refused"},
+		{"dial ldap://10.0.0.1:389 failed", "dial ldap://10.0.0.2:389 failed"},
+		{"reading AD: sizeLimitExceeded", "reading target: sizeLimitExceeded"},
+	} {
+		if FailureHash(tc.a) == FailureHash(tc.b) {
+			t.Errorf("%q and %q must differ, both normalize to %q", tc.a, tc.b, NormalizeFailure(tc.a))
+		}
 	}
 }
 
@@ -281,11 +330,47 @@ func TestNotes(t *testing.T) {
 	if _, ok := notes[target.StatusNotifyError]; !ok {
 		t.Error("a successful send must clear notify-error")
 	}
+	if notes[target.StatusFailureNotified] != FailureNotifiedNote(t0, r.Failure) {
+		t.Errorf("a failure mail must set failure-notified: %v", notes)
+	}
+
+	// A persisting failure that changed is mailed at once and restarts
+	// the failure clock.
+	before := []string{"failure-since=" + ts(-time.Hour), "failure=AD down", "failure-notified=" + FailureNotifiedNote(t0.Add(-time.Hour), "AD down")}
+	notes = Notes(context.Background(), n, opts(s), before, r, &log)
+	msgs = s.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("%d messages, log %q", len(msgs), log.String())
+	}
+	m, _ = mail.ReadMessage(strings.NewReader(msgs[1].Data))
+	body, _ = io.ReadAll(quotedprintable.NewReader(m.Body))
+	if subj := m.Header.Get("Subject"); subj != "[dolly] dollyhost dolly sync FAILED (failure changed): run incomplete: 1 failed" {
+		t.Errorf("subject %q", subj)
+	}
+	if !strings.Contains(string(body), "failure changed") || !strings.Contains(string(body), "Previous failure: AD down") {
+		t.Errorf("body:\n%s", body)
+	}
+	if notes[target.StatusFailureNotified] != FailureNotifiedNote(t0, r.Failure) {
+		t.Errorf("a failure-changed mail must set failure-notified: %v", notes)
+	}
+
+	// A changes mail during the same failure leaves failure-notified alone.
+	nc := n
+	nc.On = "changes"
+	before = []string{"failure-since=" + ts(-time.Hour), "failure=" + r.Failure, "failure-notified=" + FailureNotifiedNote(t0.Add(-time.Hour), r.Failure),
+		"warnings-hash=" + WarningsHash(p.Warnings)}
+	notes = Notes(context.Background(), nc, opts(s), before, r, &log)
+	if len(s.Messages()) != 3 {
+		t.Fatalf("%d messages, log %q", len(s.Messages()), log.String())
+	}
+	if _, ok := notes[target.StatusFailureNotified]; ok || notes[target.StatusLastNotified] != ts(0) {
+		t.Errorf("a changes-only mail must set last-notified but not failure-notified: %v", notes)
+	}
 
 	// Disabled: nothing at all.
 	n2 := n
 	n2.SMTPHost = ""
-	if Notes(context.Background(), n2, opts(s), nil, r, &log) != nil || len(s.Messages()) != 1 {
+	if Notes(context.Background(), n2, opts(s), nil, r, &log) != nil || len(s.Messages()) != 3 {
 		t.Error("an empty smtp_host must disable notifications")
 	}
 

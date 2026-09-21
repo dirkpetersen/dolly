@@ -3,6 +3,7 @@ package notify
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -17,13 +18,14 @@ type Reason string
 
 // Reasons, in subject precedence.
 const (
-	ReasonFailure   Reason = "failure"    // a failure appeared (or was never mailed)
-	ReasonReminder  Reason = "reminder"   // the failure persists and remind_every has passed
-	ReasonStaleLock Reason = "stale-lock" // this run broke a stale run lock
-	ReasonRecovered Reason = "recovered"  // a run succeeded after a failure
-	ReasonChanges   Reason = "changes"    // on: changes or always, and the run applied changes
-	ReasonWarnings  Reason = "warnings"   // the warnings list (ignored entries, conflicts, ...) changed
-	ReasonAlways    Reason = "always"     // on: always
+	ReasonFailure        Reason = "failure"         // a failure appeared (or was never mailed)
+	ReasonFailureChanged Reason = "failure-changed" // the failure persists but differs from the one last mailed
+	ReasonReminder       Reason = "reminder"        // the failure persists and remind_every has passed
+	ReasonStaleLock      Reason = "stale-lock"      // this run broke a stale run lock
+	ReasonRecovered      Reason = "recovered"       // a run succeeded after a failure
+	ReasonChanges        Reason = "changes"         // on: changes or always, and the run applied changes
+	ReasonWarnings       Reason = "warnings"        // the warnings list (ignored entries, conflicts, ...) changed
+	ReasonAlways         Reason = "always"          // on: always
 )
 
 // Outcome is what the decision needs to know about a run.
@@ -53,6 +55,13 @@ type Decision struct {
 	Reasons []Reason
 }
 
+// FailureMail reports whether the decision reports the failure itself
+// (failure, failure changed, reminder). Only such a mail sets
+// failure-notified and so restarts the reminder clock.
+func (d Decision) FailureMail() bool {
+	return d.Has(ReasonFailure) || d.Has(ReasonFailureChanged) || d.Has(ReasonReminder)
+}
+
 // Has reports whether r is among the reasons.
 func (d Decision) Has(r Reason) bool {
 	for _, x := range d.Reasons {
@@ -68,11 +77,15 @@ func (d Decision) Has(r Reason) bool {
 // run's outcome:
 //
 //   - Failures are always reported, whatever on says: a mail when a failure
-//     first appears (failure-since absent before the run, or last-notified
-//     older than failure-since, so a failure whose mail failed is retried),
-//     then a reminder at most every remind_every (by last-notified) while
-//     it persists, and one "recovered" mail when a run succeeds after a
-//     failure. Breaking a stale lock is always mailed too.
+//     first appears (failure-since absent before the run, or no failure
+//     mail sent since failure-since, so a failure whose mail failed is
+//     retried), a mail right away when the failure changes (its normalized
+//     text differs from the failure last mailed), then a reminder at most
+//     every remind_every while it persists, and one "recovered" mail when a
+//     run succeeds after a failure. The failure clock is failure-notified,
+//     which only failure mails set: a changes or warnings mail sent during
+//     a failure doesn't postpone the reminder. Breaking a stale lock is
+//     always mailed too.
 //   - on: changes also mails when the run applied changes; on: always mails
 //     every run.
 //   - A changed warnings list (hash differs from the stored note) is
@@ -88,13 +101,25 @@ func Decide(on string, remindEvery time.Duration, before []string, o Outcome) De
 	if !prevFailing && target.StatusNote(before, target.StatusFailureSince) != "" {
 		prevFailing = true // present but unparsable: still a failure in progress
 	}
-	lastNotified, notified := parseTime(target.StatusNote(before, target.StatusLastNotified))
+	failNotified, mailedHash, notified := parseFailureNotified(target.StatusNote(before, target.StatusFailureNotified))
+	if !notified {
+		// Written by an older Dolly without failure-notified: last-notified
+		// is the best guess at the last failure mail.
+		failNotified, notified = parseTime(target.StatusNote(before, target.StatusLastNotified))
+	}
+	if prev := target.StatusNote(before, target.StatusFailure); mailedHash == "" && prev != "" {
+		mailedHash = FailureHash(prev) // older notes: compare with the last run's failure
+	}
 	switch {
 	case o.Failure != "":
 		switch {
-		case !prevFailing, !notified, lastNotified.Before(failSince):
+		case !prevFailing, !notified, failNotified.Before(failSince):
 			add(ReasonFailure)
-		case remindEvery > 0 && o.Now.Sub(lastNotified) >= remindEvery:
+		case mailedHash != "" && FailureHash(o.Failure) != mailedHash && o.Now.Sub(failNotified) >= changedMinGap(remindEvery):
+			// A flapping failure (two texts alternating) is mailed at most
+			// once per changedMinGap; the reminder carries the current text.
+			add(ReasonFailureChanged)
+		case remindEvery > 0 && o.Now.Sub(failNotified) >= remindEvery:
 			add(ReasonReminder)
 		}
 	case prevFailing:
@@ -114,6 +139,61 @@ func Decide(on string, remindEvery time.Duration, before []string, o Outcome) De
 	}
 	d.Send = len(d.Reasons) > 0
 	return d
+}
+
+// FailureNotifiedNote returns the failure-notified note for a failure
+// mail sent at t that reported failure.
+func FailureNotifiedNote(t time.Time, failure string) string {
+	return t.UTC().Format(time.RFC3339) + " " + FailureHash(failure)
+}
+
+// parseFailureNotified splits a failure-notified note into its time and
+// failure hash (either may be missing).
+func parseFailureNotified(s string) (time.Time, string, bool) {
+	ts, hash, _ := strings.Cut(strings.TrimSpace(s), " ")
+	t, ok := parseTime(ts)
+	return t, strings.TrimSpace(hash), ok
+}
+
+// FailureHash returns a short hash of a failure after NormalizeFailure, so
+// two runs failing the same way with different counts or times hash alike.
+func FailureHash(failure string) string {
+	sum := sha256.Sum256([]byte(NormalizeFailure(failure)))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// NormalizeFailure returns a failure text with its volatile parts
+// replaced, for deciding whether a persisting failure changed: whitespace
+// is collapsed and the text capped as the failure note stores it, then
+// every word that is only a number (a count such as "3 failed" or
+// "12 applied", a percentage), a timestamp, or a duration becomes "#".
+// Numbers inside a word (dc01, 10.0.0.1:636, ldap://host:389) are kept, so
+// a different server or port is a different failure.
+func NormalizeFailure(failure string) string {
+	words := strings.Fields(target.OneLine(failure))
+	for i, w := range words {
+		core := strings.TrimLeft(w, "([{\"'")
+		core = strings.TrimRight(core, ")]},;:.!?\"'")
+		if core != "" && volatileWord(core) {
+			words[i] = strings.Replace(w, core, "#", 1)
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+var numberRE = regexp.MustCompile(`^[+-]?[0-9]+(\.[0-9]+)?%?$`)
+
+func volatileWord(w string) bool {
+	if numberRE.MatchString(w) {
+		return true
+	}
+	if _, err := time.Parse(time.RFC3339, w); err == nil {
+		return true
+	}
+	if d, err := time.ParseDuration(w); err == nil && d != 0 {
+		return true
+	}
+	return false
 }
 
 func parseTime(s string) (time.Time, bool) {
@@ -168,4 +248,14 @@ func WarningsHash(ws []planner.Warning) string {
 	sort.Strings(lines)
 	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// changedMinGap is the minimum time between "failure changed" mails, so a
+// failure that alternates between two texts can't mail every run: one hour,
+// or remind_every if that is shorter.
+func changedMinGap(remindEvery time.Duration) time.Duration {
+	if remindEvery > 0 && remindEvery < time.Hour {
+		return remindEvery
+	}
+	return time.Hour
 }

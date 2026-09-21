@@ -133,6 +133,19 @@ func unitQuote(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
+// shellQuote quotes s for a POSIX shell command line the user copies from
+// the "Next steps": unchanged if it holds only safe characters, otherwise
+// single-quoted, each embedded single quote closed, escaped, and reopened.
+func shellQuote(s string) string {
+	safe := func(r rune) bool {
+		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("/._-+=:,@%", r)
+	}
+	if s != "" && !strings.ContainsFunc(s, func(r rune) bool { return !safe(r) }) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // Units returns the content of dolly.service and dolly.timer, exactly as
 // README "Running it on a schedule" shows them (with execStart after
 // ExecStart=).
@@ -170,27 +183,39 @@ func hasSystemd(env Env) bool {
 }
 
 // NoManagerError is returned when systemctl --user can't reach a user
-// manager: XDG_RUNTIME_DIR is unset and /run/user/<uid> doesn't exist.
-type NoManagerError struct{ Dir, User string }
+// manager: XDG_RUNTIME_DIR is unset (or belongs to another user) and
+// /run/user/<uid> doesn't exist.
+type NoManagerError struct {
+	Dir, User string
+	// Foreign is an XDG_RUNTIME_DIR that was set but isn't this user's
+	// (inherited after sudo -u), or "".
+	Foreign string
+}
 
 func (e *NoManagerError) Error() string {
-	return fmt.Sprintf("XDG_RUNTIME_DIR is not set and %s does not exist: %s has no login session and no linger, so systemctl --user has no user manager to talk to. Run `loginctl enable-linger %s` (an admin may have to: sudo loginctl enable-linger %s), then run dolly install again",
-		e.Dir, e.User, e.User, e.User)
+	why := "XDG_RUNTIME_DIR is not set"
+	if e.Foreign != "" {
+		why = fmt.Sprintf("XDG_RUNTIME_DIR=%s is not this user's runtime directory (inherited from another user, e.g. after sudo -u)", e.Foreign)
+	}
+	return fmt.Sprintf("%s and %s does not exist: %s has no login session and no linger, so systemctl --user has no user manager to talk to. Run `loginctl enable-linger %s` (an admin may have to: sudo loginctl enable-linger %s), then run dolly install again",
+		why, e.Dir, e.User, e.User, e.User)
 }
 
 // SystemctlEnv returns the environment for Dolly's own systemctl --user
-// calls. With XDG_RUNTIME_DIR set it is nil (inherit). Without it (typical
-// after su - or sudo -iu), if /run/user/<uid> exists, XDG_RUNTIME_DIR and
+// calls. With XDG_RUNTIME_DIR set to this user's /run/user/<uid> it is nil
+// (inherit). Without it (typical after su - or sudo -iu), or with another
+// user's XDG_RUNTIME_DIR (inherited after sudo -u, which would reach the
+// wrong manager or none), if /run/user/<uid> exists, XDG_RUNTIME_DIR and
 // DBUS_SESSION_BUS_ADDRESS point there; otherwise the user has no session
 // and no linger, which is a NoManagerError. Only systemctl's environment
 // changes: Dolly never edits shell startup files.
 func SystemctlEnv(env Env) ([]string, error) {
-	if env.RuntimeDir != "" {
+	dir := filepath.Join(env.RunUser, strconv.Itoa(env.UID))
+	if env.RuntimeDir != "" && filepath.Clean(env.RuntimeDir) == dir {
 		return nil, nil
 	}
-	dir := filepath.Join(env.RunUser, strconv.Itoa(env.UID))
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		return nil, &NoManagerError{Dir: dir, User: env.User}
+		return nil, &NoManagerError{Dir: dir, User: env.User, Foreign: env.RuntimeDir}
 	}
 	var out []string
 	for _, kv := range env.Environ {
@@ -282,11 +307,11 @@ func Install(env Env, o Options) error {
 	// Next steps. The timer is never enabled automatically.
 	dolly := "dolly"
 	if !onPath(env.Path, p.BinDir) {
-		dolly = p.Binary
+		dolly = shellQuote(p.Binary)
 	}
 	cfgFlag := ""
 	if o.ConfigPath != "" {
-		cfgFlag = " --config " + o.ConfigPath
+		cfgFlag = " --config " + shellQuote(o.ConfigPath)
 	}
 	scope := ""
 	switch {
@@ -296,7 +321,7 @@ func Install(env Env, o Options) error {
 		scope = " --groups"
 	}
 	fmt.Fprintf(w, "\nNext steps:\n")
-	fmt.Fprintf(w, "  1. Edit the config:     $EDITOR %s\n", p.Config)
+	fmt.Fprintf(w, "  1. Edit the config:     $EDITOR %s\n", shellQuote(p.Config))
 	fmt.Fprintf(w, "  2. Test it:             %s check%s%s\n", dolly, scope, cfgFlag)
 	fmt.Fprintf(w, "  3. Preview a run:       %s sync%s --dry-run%s\n", dolly, scope, cfgFlag)
 	if systemd {
@@ -320,7 +345,7 @@ func Uninstall(env Env, o Options) error {
 		senv, envErr := SystemctlEnv(env)
 		if envErr != nil {
 			// No user manager is running, so nothing is loaded to stop.
-			fmt.Fprintf(w, "- systemctl --user: skipped, no user manager is running (XDG_RUNTIME_DIR unset, no %s/%d), so no timer is active\n", env.RunUser, env.UID)
+			fmt.Fprintf(w, "- systemctl --user: skipped, no user manager is running (no XDG_RUNTIME_DIR of this user's, no %s/%d), so no timer is active\n", env.RunUser, env.UID)
 		} else {
 			switch out, err := o.Systemctl.Run(senv, "disable", "--now", "dolly.timer"); {
 			case err == nil:
@@ -401,7 +426,7 @@ func onPath(pathEnv, dir string) bool {
 }
 
 // installBinary copies src to p.Binary atomically (temp file and rename),
-// mode 0755, creating ~/.local/bin (0700) if missing.
+// mode 0755, creating ~/.local and ~/.local/bin (0755) if missing.
 func installBinary(src string, p Paths) (string, error) {
 	if src == "" {
 		return "", errors.New("can't find the running binary")
@@ -409,7 +434,7 @@ func installBinary(src string, p Paths) (string, error) {
 	if r, err := filepath.EvalSymlinks(src); err == nil {
 		src = r
 	}
-	if err := os.MkdirAll(p.BinDir, 0o700); err != nil {
+	if err := os.MkdirAll(p.BinDir, 0o755); err != nil {
 		return "", err
 	}
 	if a, err := os.Stat(src); err == nil {

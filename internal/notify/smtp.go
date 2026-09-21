@@ -74,6 +74,12 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// dialGuard, if set, vets every SMTP connection before it is dialed,
+// whatever Options.Dial is. It is nil in production; the package's tests
+// set it to refuse anything but a loopback address, so no test can reach a
+// real mail server.
+var dialGuard func(network, addr string) error
+
 // Message is one mail.
 type Message struct {
 	Subject string
@@ -150,6 +156,11 @@ func session(ctx context.Context, n config.Notify, o Options, fn func(c *smtp.Cl
 	}
 	tlsCfg := &tls.Config{ServerName: host, RootCAs: o.RootCAs, MinVersion: tls.VersionTLS12}
 
+	if dialGuard != nil {
+		if err := dialGuard("tcp", addr); err != nil {
+			return steps, err
+		}
+	}
 	conn, err := o.Dial(ctx, "tcp", addr)
 	if err != nil {
 		return steps, fmt.Errorf("connecting to %s: %w", addr, err)

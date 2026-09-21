@@ -52,3 +52,30 @@ func TestKindOf(t *testing.T) {
 		t.Error("contacts and foreign security principals are other")
 	}
 }
+
+// Each run tries the DCs in random order: over many shuffles every URL comes
+// first at least once, and every shuffle keeps all URLs exactly once.
+func TestShuffleURLs(t *testing.T) {
+	urls := []string{"ldaps://a:636", "ldaps://b:636", "ldaps://c:636"}
+	first := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		got := shuffleURLs(urls)
+		if len(got) != len(urls) {
+			t.Fatalf("shuffle changed the length: %v", got)
+		}
+		seen := map[string]bool{}
+		for _, u := range got {
+			seen[u] = true
+		}
+		if len(seen) != len(urls) {
+			t.Fatalf("shuffle lost or duplicated a URL: %v", got)
+		}
+		first[got[0]] = true
+	}
+	if len(first) != len(urls) {
+		t.Errorf("not every DC was tried first in 200 runs: %v", first)
+	}
+	if urls[0] != "ldaps://a:636" || urls[2] != "ldaps://c:636" {
+		t.Errorf("shuffle modified the config slice: %v", urls)
+	}
+}

@@ -17,7 +17,25 @@ import (
 	"github.com/dirkpetersen/dolly/internal/ldapconn"
 )
 
-const template = "../../dolly.yaml.template"
+// templateSrc is the checked-in config template.
+const templateSrc = "../../dolly.yaml.template"
+
+// templateCopy copies the template into a temp dir and returns its path.
+// Its relative paths (password_file: ad.secret, ...) then resolve against
+// that empty dir, never against the repo root, where a git-ignored secret
+// may or may not exist.
+func templateCopy(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(templateSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "dolly.yaml")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 // TestMain makes sure no test can touch the real environment: install and
 // uninstall get an environment that fails, and systemctl a runner that
@@ -66,6 +84,7 @@ func TestVersion(t *testing.T) {
 }
 
 func TestDryRunWithFixture(t *testing.T) {
+	template := templateCopy(t)
 	code, out, errs := runCLI("sync", "--dry-run", "--config", template, "--fixture", "testdata/fixture.yaml")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errs)
@@ -102,6 +121,7 @@ func TestDryRunWithFixture(t *testing.T) {
 
 // --users and --groups together mean both, the same as neither.
 func TestUsersAndGroupsFlagsTogether(t *testing.T) {
+	template := templateCopy(t)
 	code, out, errs := runCLI("sync", "--dry-run", "--users", "--groups", "--config", template, "--fixture", "testdata/fixture.yaml")
 	if code != 0 || !strings.Contains(out, "Plan: dolly sync (users and groups)") {
 		t.Errorf("--users --groups: exit %d, stderr %q\n%s", code, errs, out)
@@ -115,6 +135,7 @@ func TestUsersAndGroupsFlagsTogether(t *testing.T) {
 // --debug lists each member skipped for having no entry on the target on
 // stderr; without it, the plan shows only the count, and never a warning.
 func TestDebugListsMissingMembers(t *testing.T) {
+	template := templateCopy(t)
 	fix := filepath.Join(t.TempDir(), "missing.yaml")
 	data := `now: 2024-06-01T00:00:00Z
 ad:
@@ -163,6 +184,7 @@ target:
 }
 
 func TestGuardExitCode(t *testing.T) {
+	template := templateCopy(t)
 	dir := t.TempDir()
 	fix := filepath.Join(dir, "empty.yaml")
 	if err := os.WriteFile(fix, []byte("ad: {}\ntarget: {}\n"), 0o644); err != nil {
@@ -178,6 +200,7 @@ func TestGuardExitCode(t *testing.T) {
 }
 
 func TestExitCodes(t *testing.T) {
+	template := templateCopy(t)
 	for _, tc := range []struct {
 		args []string
 		code int

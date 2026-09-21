@@ -40,6 +40,7 @@ func fakeWithLock(age time.Duration) *ldapfake.Dir {
 }
 
 func TestUnlock(t *testing.T) {
+	template := templateCopy(t)
 	t.Run("no lock", func(t *testing.T) {
 		dir := ldapfake.New()
 		withFake(t, dir, "", false)
@@ -85,6 +86,7 @@ func TestUnlock(t *testing.T) {
 // A real run that finds the lock held by another run exits 0 quietly: one
 // line on stderr, nothing on stdout, no reads, no writes.
 func TestRealRunLockHeld(t *testing.T) {
+	template := templateCopy(t)
 	for _, cmd := range []string{"sync", "adopt"} {
 		dir := fakeWithLock(time.Minute)
 		withFake(t, dir, "", false)
@@ -122,6 +124,7 @@ func statusNotes(dir *ldapfake.Dir) string {
 // status, unlock; per-entry errors exit 1; the guard exits 2 and writes
 // nothing but the lock and cn=status.
 func TestRealRun(t *testing.T) {
+	template := templateCopy(t)
 	t.Run("success", func(t *testing.T) {
 		dir := ldapfake.New()
 		withFake(t, dir, "", false)

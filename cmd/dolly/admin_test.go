@@ -38,8 +38,11 @@ func withInstallEnv(t *testing.T) (install.Env, *fakeSystemctl, string) {
 	if err := os.WriteFile(exe, []byte("binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(root, "run", "1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	env := install.Env{
-		GOOS: "linux", Home: filepath.Join(root, "home"), Path: "/usr/bin", RuntimeDir: "/run/user/1",
+		GOOS: "linux", Home: filepath.Join(root, "home"), Path: "/usr/bin", RuntimeDir: filepath.Join(root, "run", "1"),
 		UID: 1, User: "svc", RunUser: filepath.Join(root, "run"), Systemd: func() bool { return true }, Executable: exe,
 	}
 	sc := &fakeSystemctl{}
@@ -100,7 +103,7 @@ func TestInstallCLI(t *testing.T) {
 // names, and with the SMTP settings pointed at s (nil: notifications off).
 func testConfig(t *testing.T, s *smtpfake.Server, edits ...string) string {
 	t.Helper()
-	data, err := os.ReadFile(template)
+	data, err := os.ReadFile(templateSrc)
 	if err != nil {
 		t.Fatal(err)
 	}
