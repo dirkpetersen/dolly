@@ -136,7 +136,7 @@ Attribute values can be plain AD attribute names or Go templates for derived val
 | Config | `$XDG_CONFIG_HOME/dolly/dolly.yaml` (`~/.config/dolly/`) |
 | Secrets and CA files | next to the config, mode `0600` |
 | State (high-water mark, owned entries and members) | `$XDG_STATE_HOME/dolly/state.json` (`~/.local/state/dolly/`) |
-| Lock file | `$XDG_RUNTIME_DIR/dolly.lock` |
+| Lock file | `$XDG_RUNTIME_DIR/dolly.lock` (falls back to `/run/user/<uid>`, then `$XDG_STATE_HOME/dolly/`) |
 | systemd units | `$XDG_CONFIG_HOME/systemd/user/dolly.{service,timer}` |
 | Logs | journald (`journalctl --user -u dolly`) |
 
@@ -191,6 +191,12 @@ WantedBy=timers.target
 systemctl --user enable --now dolly.timer
 loginctl enable-linger "$USER"   # keep the timer running while you're logged out (may need an admin)
 ```
+
+`dolly install` is safe to re-run. It never overwrites an existing config and only rewrites the units when they changed. It also handles a few common gaps in a service account's environment:
+
+- **`XDG_RUNTIME_DIR` is unset** (typical after `su -` or `sudo -iu`, where `systemctl --user` fails with "Failed to connect to bus"). If `/run/user/<uid>` exists, Dolly points `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` at it for its own `systemctl --user` calls. If it doesn't exist, the user has no session and no linger, and Dolly stops and tells you to run `loginctl enable-linger <user>`. Dolly never edits your shell startup files.
+- **`~/.local/bin` is missing or not on `PATH`.** Dolly creates the directory and warns if it isn't on `PATH`. The timer doesn't care, because the unit uses the absolute path `%h/.local/bin/dolly`.
+- **Not Linux.** Without systemd (for example macOS), Dolly installs the binary and config, skips the units, and says so.
 
 **Container**
 
