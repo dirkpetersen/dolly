@@ -61,31 +61,101 @@ func (r *Reader) Close() error { return r.conn.Close() }
 // error (Dolly never creates them); a missing state_base means no records
 // yet (a real run creates it).
 func (r *Reader) Read(ctx context.Context, readUsers bool) (*model.TargetSnapshot, *model.Records, error) {
-	t := r.cfg.Target
-	groupAttrs := append([]string{"objectClass", "cn", config.AttrMember, config.AttrMemberUID}, model.SortedKeys(r.cfg.Mapping.Groups.Attributes)...)
-	entries, err := r.subtree(ctx, t.GroupsBase, "groups_base", groupAttrs, false)
+	return readSnapshot(r.cfg, r.URL, readUsers, func(base, name string, attrs []string, optional bool) ([]*model.Entry, error) {
+		return r.subtree(ctx, base, name, attrs, optional)
+	})
+}
+
+// subtreeFunc reads every entry under base with the given attributes. A
+// missing base is an error unless optional is set.
+type subtreeFunc func(base, name string, attrs []string, optional bool) ([]*model.Entry, error)
+
+// readSnapshot does Read's three subtree reads through read, then combines
+// and classifies them. Errors from read are returned as they are; url names
+// the server in classification errors.
+func readSnapshot(cfg *config.Config, url string, readUsers bool, read subtreeFunc) (*model.TargetSnapshot, *model.Records, error) {
+	t := cfg.Target
+	groupAttrs := append([]string{"objectClass", "cn", config.AttrMember, config.AttrMemberUID}, model.SortedKeys(cfg.Mapping.Groups.Attributes)...)
+	groups, err := read(t.GroupsBase, "groups_base", groupAttrs, false)
 	if err != nil {
 		return nil, nil, err
 	}
+	var users []*model.Entry
 	if readUsers {
-		userAttrs := append([]string{"objectClass", "uid"}, model.SortedKeys(r.cfg.Mapping.Users.Attributes)...)
-		users, err := r.subtree(ctx, t.UsersBase, "users_base", userAttrs, false)
+		userAttrs := append([]string{"objectClass", "uid"}, model.SortedKeys(cfg.Mapping.Users.Attributes)...)
+		users, err = read(t.UsersBase, "users_base", userAttrs, false)
 		if err != nil {
 			return nil, nil, err
 		}
-		entries = append(entries, users...)
 	}
-	state, err := r.subtree(ctx, t.StateBase, "state_base", []string{"objectClass", "cn", "ou", "seeAlso", "roleOccupant", "description"}, true)
+	state, err := read(t.StateBase, "state_base", []string{"objectClass", "cn", "ou", "seeAlso", "roleOccupant", "description"}, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	entries = append(entries, state...)
-	snap, recs, err := model.Classify(entries, model.Bases{Users: t.UsersBase, Groups: t.GroupsBase, State: t.StateBase})
+	snap, recs, err := model.Classify(combine(t.StateBase, groups, users, state), model.Bases{Users: t.UsersBase, Groups: t.GroupsBase, State: t.StateBase})
 	if err != nil {
-		return nil, nil, fmt.Errorf("target %s: %w", r.URL, err)
+		return nil, nil, fmt.Errorf("target %s: %w", url, err)
 	}
 	snap.UsersRead = readUsers
 	return snap, recs, nil
+}
+
+// combine merges the three subtree reads into one list with each DN once.
+//
+// state_base may live inside groups_base or users_base (config validation
+// allows that, but not the reverse). The groups_base and users_base reads
+// then also return Dolly's containers and records, with the wrong attribute
+// list (no seeAlso or roleOccupant), so every entry at or under state_base
+// is dropped from them and comes only from the state_base read.
+//
+// users_base and groups_base may be nested in each other, so an entry can
+// come back from both reads, each time with a different attribute list.
+// Those copies are merged (union of attributes) into one entry.
+func combine(stateBase string, groups, users, state []*model.Entry) []*model.Entry {
+	var out []*model.Entry
+	seen := map[string]*model.Entry{}
+	for _, list := range [][]*model.Entry{groups, users} {
+		for _, e := range list {
+			if model.IsUnder(e.DN, stateBase) {
+				continue
+			}
+			k := model.MustDNKey(e.DN)
+			if prev, ok := seen[k]; ok {
+				mergeAttrs(prev, e)
+				continue
+			}
+			seen[k] = e
+			out = append(out, e)
+		}
+	}
+	for _, e := range state {
+		k := model.MustDNKey(e.DN)
+		if _, ok := seen[k]; ok {
+			// Only possible if a base is inside state_base, which config
+			// validation rejects; let Classify report the duplicate.
+			out = append(out, e)
+			continue
+		}
+		seen[k] = e
+		out = append(out, e)
+	}
+	return out
+}
+
+// mergeAttrs adds src's attribute values that dst lacks (attribute names
+// compared case-insensitively). Both are the same server entry read with
+// different attribute lists, so values of an attribute present in both are
+// identical and dst's are kept.
+func mergeAttrs(dst, src *model.Entry) {
+	have := map[string]bool{}
+	for a := range dst.Attrs {
+		have[strings.ToLower(a)] = true
+	}
+	for a, v := range src.Attrs {
+		if !have[strings.ToLower(a)] {
+			dst.Attrs[a] = append([]string(nil), v...)
+		}
+	}
 }
 
 // subtree reads every entry under base (paged). A missing base is an error

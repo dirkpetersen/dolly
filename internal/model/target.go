@@ -71,17 +71,29 @@ type Bases struct {
 // records. The containers themselves are not returned as entries. Entries
 // outside all bases, cn=lock, and cn=status are ignored. A malformed
 // ownership record is an error: Dolly never plans from data it can't read.
+// So is a DN that appears twice: the caller must merge its reads first
+// (picking one copy could pick one read with the wrong attribute list).
 func Classify(entries []*Entry, b Bases) (*TargetSnapshot, *Records, error) {
 	t := &TargetSnapshot{}
 	r := &Records{}
 	usersKey, groupsKey, stateKey := MustDNKey(b.Users), MustDNKey(b.Groups), MustDNKey(b.State)
 	userRecs := MustDNKey(RecordsBase(b.State, UserRecord))
 	groupRecs := MustDNKey(RecordsBase(b.State, GroupRecord))
+	// Check for duplicates first, so a stripped copy is reported as a
+	// duplicate rather than as a malformed record.
+	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		k, err := DNKey(e.DN)
 		if err != nil {
 			return nil, nil, fmt.Errorf("target entry: %w", err)
 		}
+		if seen[k] {
+			return nil, nil, fmt.Errorf("target entry %s appears twice in the read (internal error)", e.DN)
+		}
+		seen[k] = true
+	}
+	for _, e := range entries {
+		k := MustDNKey(e.DN)
 		switch k {
 		case stateKey:
 			t.HasStateBase = true

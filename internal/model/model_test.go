@@ -149,6 +149,10 @@ func TestClassify(t *testing.T) {
 	if !tgt.HasStateBase || !tgt.HasUserRecords || tgt.HasGroupRecords {
 		t.Errorf("containers: %+v", tgt)
 	}
+	stripped := &Entry{DN: "CN=" + strings.ToUpper(RDNValue(rec.DN)) + ",ou=Users,ou=dolly,dc=local"}
+	if _, _, err := Classify(append([]*Entry{stripped}, entries...), b); err == nil || !strings.Contains(err.Error(), "appears twice") {
+		t.Errorf("duplicate DN: %v", err)
+	}
 	bad := &Entry{DN: "cn=not-a-guid,ou=users,ou=dolly,dc=local", Attrs: map[string][]string{"seeAlso": {"uid=a,dc=x"}}}
 	if _, _, err := Classify([]*Entry{bad}, b); err == nil || !strings.Contains(err.Error(), "invalid GUID") {
 		t.Errorf("malformed record: %v", err)

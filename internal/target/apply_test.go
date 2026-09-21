@@ -83,7 +83,14 @@ target:
 // entries.
 func load(t *testing.T) (*planner.Plan, *ldapfake.Dir) {
 	t.Helper()
-	cfg := templateConfig(t)
+	p, dir, _ := loadCfg(t, templateConfig(t))
+	return p, dir
+}
+
+// loadCfg is load with a given configuration; it also returns the
+// snapshots, for re-planning against the fake directory.
+func loadCfg(t *testing.T, cfg *config.Config) (*planner.Plan, *ldapfake.Dir, *fixture.Snapshots) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "scenario.yaml")
 	if err := os.WriteFile(path, []byte(scenario), 0o600); err != nil {
 		t.Fatal(err)
@@ -110,7 +117,107 @@ func load(t *testing.T) (*planner.Plan, *ldapfake.Dir) {
 	for _, e := range entries {
 		dir.Put(e.DN, e.Attrs, time.Now())
 	}
-	return p, dir
+	return p, dir, snaps
+}
+
+// replan reads the fake directory back and plans again against the same AD
+// snapshot.
+func replan(t *testing.T, cfg *config.Config, dir *ldapfake.Dir, snaps *fixture.Snapshots) *planner.Plan {
+	t.Helper()
+	var entries []*model.Entry
+	for _, dn := range dir.DNs() {
+		entries = append(entries, &model.Entry{DN: dn, Attrs: dir.Get(dn)})
+	}
+	tgt, recs, err := model.Classify(entries, model.Bases{Users: people, Groups: groups, State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt.UsersRead = true
+	p, err := planner.Build(snaps.AD, tgt, recs, cfg, planner.Options{Users: true, Groups: true, Now: snaps.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// With OpenLDAP's refint overlay, the modrdn of carol -> carol2 already
+// rewrites member and roleOccupant values everywhere, so the planned
+// fix-ups find the old value gone and the new one present: already done,
+// not a failure (and nothing after them is skipped).
+func TestApplyRefint(t *testing.T) {
+	for _, mode := range []string{"member", "memberUid"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := templateConfig(t)
+			if mode == "memberUid" {
+				cfg.Mapping.Groups.ObjectClasses = []string{"posixGroup"}
+				cfg.Mapping.Groups.Membership = []config.Membership{{Attribute: config.AttrMemberUID}}
+				if err := cfg.Validate(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p, dir, snaps := loadCfg(t, cfg)
+			dir.Refint = []string{"member", "roleOccupant", "seeAlso"}
+			var log bytes.Buffer
+			res := Apply(context.Background(), dir, p, &log, true)
+			if res.Failed != 0 || res.Skipped != 0 || !res.OK() {
+				var out bytes.Buffer
+				res.Print(&out)
+				t.Fatalf("refint apply:\n%s\n%s", out.String(), log.String())
+			}
+			if res.AlreadyDone == 0 || !strings.Contains(log.String(), "already renamed by the server (refint?)") {
+				t.Errorf("no fix-up was recognized as done by the server:\n%s", log.String())
+			}
+			if occ := dir.Values(grec("a2"), "roleOccupant"); has(occ, udn("carol")) || !has(occ, udn("carol2")) {
+				t.Errorf("staff record occupants %v", occ)
+			}
+			if m := dir.Values(gdn("staff"), "memberUid"); has(m, "carol") || !has(m, "carol2") {
+				t.Errorf("staff memberUid %v", m)
+			}
+			if q := replan(t, cfg, dir, snaps); !q.Empty() {
+				var out bytes.Buffer
+				q.Print(&out)
+				t.Errorf("not converged:\n%s", out.String())
+			}
+		})
+	}
+}
+
+// The fallbacks after a failed value rename: the old value already gone and
+// the new one missing is left alone (it may have been a local member that was
+// removed concurrently; an owned one is re-added by the next run); both
+// present deletes the old one.
+func TestApplyRenameValueFallbacks(t *testing.T) {
+	dir := ldapfake.New()
+	dir.Put(gdn("g"), map[string][]string{"objectClass": {"groupOfNames", "posixGroup"}, "cn": {"g"}, "gidNumber": {"5000"},
+		"member": {udn("b"), udn("c")}, "memberUid": {"b", "c"}}, time.Now())
+	dir.Put(grec("a1"), map[string][]string{"objectClass": {"organizationalRole"}, "cn": {"x"}, "roleOccupant": {udn("c")}}, time.Now())
+	ren := func(dn, attr, old, value string) planner.Op {
+		return planner.Op{Kind: planner.RenameMember, DN: dn, Attr: attr, Old: old, Value: value}
+	}
+	ops := []planner.Op{
+		ren(gdn("g"), "member", udn("a"), udn("a2")), // both gone: nothing to rename
+		ren(gdn("g"), "member", udn("b"), udn("c")),  // both present: delete old
+		ren(gdn("g"), "memberUid", "b", "c"),         // both present: delete old
+		ren(gdn("g"), "memberUid", "zz", "c"),        // old gone, new present: done
+		{Kind: planner.UpdateRecord, DN: grec("a1"), Changes: []planner.Change{ // old gone, new present: done
+			{Type: planner.Delete, Attr: "roleOccupant", Values: []string{udn("a")}},
+			{Type: planner.Add, Attr: "roleOccupant", Values: []string{udn("c")}}}},
+		ren(gdn("g"), "member", udn("q"), udn("Q")), // case-only, old gone: can't tell, fails
+	}
+	res := Apply(context.Background(), dir, &planner.Plan{Ops: ops}, &bytes.Buffer{}, false)
+	want := []Outcome{AlreadyDone, Applied, Applied, AlreadyDone, AlreadyDone, Failed}
+	for i, r := range res.Ops {
+		if r.Outcome != want[i] {
+			t.Errorf("op %d %s: %s (%v), want %s", i+1, r.Op, r.Outcome, r.Err, want[i])
+		}
+	}
+	m := dir.Values(gdn("g"), "member")
+	if len(m) != 1 || has(m, udn("a2")) || !has(m, udn("c")) {
+		t.Errorf("member %v", m)
+	}
+	if u := dir.Values(gdn("g"), "memberUid"); len(u) != 1 || u[0] != "c" {
+		t.Errorf("memberUid %v", u)
+	}
 }
 
 func has(vals []string, v string) bool {
@@ -356,12 +463,12 @@ func TestApplyIdempotent(t *testing.T) {
 		{Kind: planner.UpdateRecord, DN: urec("1"), Changes: []planner.Change{{Type: planner.Add, Attr: "roleOccupant", Values: []string{udn("q")}}}},                                      // exists now
 		{Kind: planner.AddRecord, DN: urec("1"), Attrs: []planner.Attribute{{Name: "objectClass", Values: []string{"OrganizationalRole"}}, {Name: "seeAlso", Values: []string{udn("a")}}}}, // same content
 		{Kind: planner.AddRecord, DN: urec("1"), Attrs: []planner.Attribute{{Name: "seeAlso", Values: []string{udn("b")}}}},                                                                // different content
-		{Kind: planner.RenameMember, DN: gdn("g"), Attr: "memberUid", Old: "missing", Value: "new"},                                                                                        // not idempotent
+		{Kind: planner.RenameMember, DN: gdn("g"), Attr: "memberUid", Old: "missing", Value: "a"},                                                                                          // old gone, new present: done
 		{Kind: planner.ModifyEntry, DN: gdn("g"), Changes: []planner.Change{{Type: planner.Replace, Attr: "memberUid", Values: []string{"x"}}}},                                            // refused
 		{Kind: planner.DeleteEntry, DN: udn("nobody")},                                                                                                                                     // noSuchObject is an error
 	}
 	res := Apply(context.Background(), dir, &planner.Plan{Ops: ops}, &bytes.Buffer{}, false)
-	want := []Outcome{AlreadyDone, AlreadyDone, AlreadyDone, Applied, AlreadyDone, AlreadyDone, Failed, Failed, Failed, Failed}
+	want := []Outcome{AlreadyDone, AlreadyDone, AlreadyDone, Applied, AlreadyDone, AlreadyDone, Failed, AlreadyDone, Failed, Failed}
 	for i, r := range res.Ops {
 		if r.Outcome != want[i] {
 			t.Errorf("op %d %s: %s (%v), want %s", i+1, r.Op, r.Outcome, r.Err, want[i])

@@ -86,6 +86,10 @@ func TestValidationErrors(t *testing.T) {
 		{"unknown key", []string{"page_size: 500", "page_size: 500\n  pagesize: 1"}, "field pagesize not found"},
 		{"bad filter", []string{"filter: (objectClass=group)", "filter: (objectClass=group"}, "source.groups.filter"},
 		{"same bases", []string{"groups_base: ou=group,dc=local", "groups_base: OU=People,dc=local"}, "target.users_base and target.groups_base must differ"},
+		{"state_base is groups_base", []string{"state_base: ou=dolly,dc=local", "state_base: OU=Group,dc=local"}, "target.state_base and target.groups_base must differ"},
+		{"state_base is users_base", []string{"state_base: ou=dolly,dc=local", "state_base: ou=people,DC=local"}, "target.state_base and target.users_base must differ"},
+		{"groups_base inside state_base", []string{"groups_base: ou=group,dc=local", "groups_base: ou=group,ou=dolly,dc=local"}, "target.groups_base must not be inside target.state_base"},
+		{"users_base inside state_base", []string{"users_base: ou=people,dc=local", "users_base: ou=people,ou=Dolly,dc=local"}, "target.users_base must not be inside target.state_base"},
 		{"bad DN", []string{"users_base: ou=people,dc=local", "users_base: people"}, "target.users_base: invalid DN"},
 		{"bad url", []string{"url: ldap://ldap.example.edu:389", "url: http://ldap.example.edu"}, "scheme must be ldap:// or ldaps://"},
 		{"notify.on", []string{"on: failure ", "on: sometimes "}, "notify.on: must be failure, changes, or always"},
@@ -251,6 +255,14 @@ func TestValueSources(t *testing.T) {
 		}
 		if got := strings.Join(v.Sources(), ","); got != want {
 			t.Errorf("%s: sources = %q, want %q", src, got, want)
+		}
+	}
+}
+
+func TestStateBaseInsideBaseIsValid(t *testing.T) {
+	for _, sb := range []string{"ou=dolly,ou=group,dc=local", "ou=dolly,ou=people,dc=local"} {
+		if _, err := Parse(edit(t, "state_base: ou=dolly,dc=local", "state_base: "+sb), "/x/dolly.yaml"); err != nil {
+			t.Errorf("state_base %s: %v", sb, err)
 		}
 	}
 }

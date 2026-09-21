@@ -194,6 +194,7 @@ Attribute values are plain AD attribute names or Go templates. Dolly only writes
 - `page_size` defaults to `500` if omitted.
 - Listing `member` in `mapping.groups.membership` requires `empty_group_member` to be set.
 - `users_base` and `groups_base` must differ, since Dolly tells users from groups by their container.
+- `state_base` may live inside `groups_base` or `users_base` (for example `ou=dolly,ou=group,dc=local`), and Dolly ignores that subtree when it reads users and groups. It must not equal either base, and neither base may live inside `state_base`.
 
 ### File locations (XDG)
 
@@ -244,7 +245,7 @@ A rejected operation doesn't stop the run. Dolly logs it to stderr with its step
 - Each membership is its own sequence: a failed `roleOccupant` add skips the member values; a failed member value delete skips the `roleOccupant` delete, so the member stays Dolly-owned and is removed on the next run instead of turning into a local member. A group gone from AD keeps its record until all its owned members are removed; a pruned user keeps its entry and record until every membership is removed.
 - If the `empty_group_member` placeholder can't be added, the member deletes on that group are skipped; if a member add fails, the placeholder stays.
 
-Skipped operations are listed with the step that caused them, and are retried by the next run. On a re-run after a crash, an add whose entry already exists with the planned content, a value add that finds the value present, and a value delete that finds it gone count as "already in place". Any other server error is a failure. Each operation is bounded by `network_timeout`. On `SIGTERM`, `SIGINT`, or `run_timeout`, Dolly stops before the next operation, reports the rest as not run, and still writes `cn=status` and releases the lock.
+Skipped operations are listed with the step that caused them, and are retried by the next run. On a re-run after a crash, an add whose entry already exists with the planned content, a value add that finds the value present, and a value delete that finds it gone count as "already in place". So does a rename fix-up (a `member`, `memberUid`, or `roleOccupant` value changed from the old user DN or uid to the new one) that the server already carried out itself, as OpenLDAP's `refint` overlay does for DN values right after a `modrdn`: when such a fix-up is rejected, Dolly re-reads the attribute and counts it as done if the old value is gone and the new one present, deletes only the old value if both are present, and leaves the value alone if both are gone (it may have been a local member removed in the meantime; an owned one is re-added by the next run). Any other server error is a failure. Each operation is bounded by `network_timeout`. On `SIGTERM`, `SIGINT`, or `run_timeout`, Dolly stops before the next operation, reports the rest as not run, and still writes `cn=status` and releases the lock.
 
 A real run prints the plan (as `--dry-run` does) and then the result:
 

@@ -434,6 +434,7 @@ func (c *Config) Validate() error {
 			add("target.users_base and target.groups_base must differ; Dolly tells users from groups by their container")
 		}
 	}
+	c.checkStateBase(add)
 	checkDN("target.empty_group_member", c.Target.EmptyGroupMember, false, add)
 
 	c.validateMapping(add)
@@ -621,6 +622,36 @@ func checkURL(s string) error {
 		return fmt.Errorf("%q: host is missing", s)
 	}
 	return nil
+}
+
+// checkStateBase checks where state_base sits relative to the two bases.
+// state_base may live inside users_base or groups_base (Dolly ignores that
+// subtree when reading users and groups), but it must not equal either base,
+// and neither base may live inside state_base.
+func (c *Config) checkStateBase(add func(string, ...any)) {
+	t := c.Target
+	if t.StateBase == "" {
+		return
+	}
+	sb, err := ldap.ParseDN(t.StateBase)
+	if err != nil {
+		return // checkDN reported it
+	}
+	for _, b := range []struct{ name, dn string }{{"users_base", t.UsersBase}, {"groups_base", t.GroupsBase}} {
+		if b.dn == "" {
+			continue
+		}
+		d, err := ldap.ParseDN(b.dn)
+		if err != nil {
+			continue
+		}
+		switch {
+		case d.EqualFold(sb):
+			add("target.state_base and target.%s must differ; state_base may live inside %s, but not be it", b.name, b.name)
+		case sb.AncestorOfFold(d):
+			add("target.%s must not be inside target.state_base (state_base may be inside %s, not the other way round)", b.name, b.name)
+		}
+	}
 }
 
 func checkDN(name, dn string, required bool, add func(string, ...any)) {

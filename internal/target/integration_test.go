@@ -15,7 +15,10 @@ package target
 // schemas. By default groups are groupOfNames + posixGroup, which needs
 // rfc2307bis; set DOLLY_IT_SCHEMA=rfc2307 for memberUid-only groups on a
 // server with nis.schema. With DOLLY_IT_REQUIRED set (CI), missing
-// variables fail the tests instead of skipping them. Every test works in its own ou=dolly-it-<n>
+// variables fail the tests instead of skipping them. The carol -> carol2
+// rename in TestIntegrationApply must also pass on servers with the refint
+// overlay (the CI image enables it), which rewrites member and roleOccupant
+// values itself after the modrdn. Every test works in its own ou=dolly-it-<n>
 // subtree under DOLLY_IT_BASE and deletes it afterwards.
 
 import (

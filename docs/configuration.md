@@ -145,6 +145,7 @@ Dolly validates `dolly.yaml` before connecting to anything:
 - `source.page_size` defaults to `500` if omitted.
 - Listing `member` in `mapping.groups.membership` requires `target.empty_group_member` to be set.
 - `target.users_base` and `target.groups_base` must differ, since Dolly tells users from groups by their container.
+- `state_base` may live inside `groups_base` or `users_base` (for example `ou=dolly,ou=group,dc=local`), and Dolly ignores that subtree when it reads users and groups. It must not equal either base, and neither base may live inside `state_base`.
 
 ## `source`
 

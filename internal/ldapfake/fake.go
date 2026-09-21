@@ -32,6 +32,11 @@ type Dir struct {
 	// Before, if set, is called before every operation (after Fail), with
 	// the lock released, so a test can change the directory in between.
 	Before func(op, dn string)
+	// Refint, if non-empty, emulates OpenLDAP's refint overlay configured
+	// for these attributes (for example member, roleOccupant, seeAlso):
+	// after a ModifyDN, every value of them equal to the old DN, in every
+	// entry, is rewritten to the new DN.
+	Refint []string
 	// Calls records "<op> <dn>" for every call, in order.
 	Calls []string
 }
@@ -241,9 +246,28 @@ func (d *Dir) ModifyDN(req *ldap.ModifyDNRequest) error {
 		e.attrs[k] = append(e.attrs[k], newVal)
 	}
 	delete(d.entries, oldKey)
+	oldDN := e.dn
 	e.dn = newDN
 	d.entries[newKey] = e
+	d.refint(oldDN, newDN)
 	return nil
+}
+
+// refint rewrites every Refint attribute value equal to oldDN to newDN.
+func (d *Dir) refint(oldDN, newDN string) {
+	for _, e := range d.entries {
+		for _, name := range d.Refint {
+			k := attrKey(e.attrs, name)
+			if k == "" {
+				continue
+			}
+			for i, v := range e.attrs[k] {
+				if model.DNEqual(v, oldDN) {
+					e.attrs[k][i] = newDN
+				}
+			}
+		}
+	}
 }
 
 // Del implements target.Conn.

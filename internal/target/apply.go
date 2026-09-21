@@ -65,7 +65,10 @@ func (r *Result) OK() bool {
 //
 // On a re-run after a crash, entryAlreadyExists on an add whose planned
 // content is present, attributeOrValueExists on a single-value add, and
-// noSuchAttribute on a single-value delete count as already done.
+// noSuchAttribute on a single-value delete count as already done. A value
+// rename (delete old, add new) that the server has already carried out
+// itself, as the refint overlay does for DN values after a modrdn, counts as
+// already done too; see renameValue.
 //
 // log receives one line per failure and skip; with debug, one per applied
 // operation too.
@@ -86,7 +89,10 @@ func Apply(ctx context.Context, c Conn, plan *planner.Plan, log io.Writer, debug
 			breakKeys(op.Provides, blocker, broken)
 			fmt.Fprintf(log, "dolly: step %d skipped (step %d failed): %s\n", r.Step, blocker, op)
 		default:
-			done, err := applyOp(c, op)
+			done, note, err := applyOp(c, op)
+			if note != "" {
+				note = " (" + note + ")"
+			}
 			switch {
 			case err != nil:
 				r.Outcome, r.Err = Failed, err
@@ -95,12 +101,14 @@ func Apply(ctx context.Context, c Conn, plan *planner.Plan, log io.Writer, debug
 			case done:
 				r.Outcome = AlreadyDone
 				if debug {
-					fmt.Fprintf(log, "debug: step %d already in place: %s\n", r.Step, op)
+					fmt.Fprintf(log, "debug: step %d already in place%s: %s\n", r.Step, note, op)
 				}
 			default:
 				r.Outcome = Applied
 				if debug {
-					fmt.Fprintf(log, "debug: step %d applied: %s\n", r.Step, op)
+					fmt.Fprintf(log, "debug: step %d applied%s: %s\n", r.Step, note, op)
+				} else if note != "" {
+					fmt.Fprintf(log, "dolly: step %d applied%s: %s\n", r.Step, note, op)
 				}
 			}
 		}
@@ -143,8 +151,99 @@ func breakKeys(keys []string, step int, broken map[string]int) {
 }
 
 // applyOp performs one operation. done reports that the server said it was
-// already in place.
-func applyOp(c Conn, op planner.Op) (done bool, err error) {
+// already in place; note, if set, says how the operation was carried out.
+func applyOp(c Conn, op planner.Op) (done bool, note string, err error) {
+	switch op.Kind {
+	case planner.RenameMember:
+		return renameValue(c, op.DN, op.Attr, op.Old, op.Value)
+	case planner.ModifyEntry, planner.UpdateRecord:
+		if attr, old, value, ok := valueRename(op.Changes); ok {
+			return renameValue(c, op.DN, attr, old, value)
+		}
+	}
+	done, err = applySimple(c, op)
+	return done, "", err
+}
+
+// valueRename reports whether changes are exactly one value rename: a
+// single-value delete followed by a single-value add of the same attribute
+// (roleOccupant fix-ups after a user rename).
+func valueRename(changes []planner.Change) (attr, old, value string, ok bool) {
+	if len(changes) != 2 {
+		return "", "", "", false
+	}
+	d, a := changes[0], changes[1]
+	if d.Type != planner.Delete || a.Type != planner.Add || !strings.EqualFold(d.Attr, a.Attr) ||
+		len(d.Values) != 1 || len(a.Values) != 1 {
+		return "", "", "", false
+	}
+	return d.Attr, d.Values[0], a.Values[0], true
+}
+
+// renameValue replaces one value of attr with another in a single modify,
+// so the value is never missing in between. If the server answers
+// noSuchAttribute or attributeOrValueExists, it re-reads the attribute:
+// the server may have done the rename itself (the refint overlay rewrites
+// member, roleOccupant, and seeAlso values after a modrdn), or half of it.
+//
+//   - old gone, new present: already done;
+//   - old gone, new gone: the owned value was lost; add the new value;
+//   - old present, new present: delete the old value;
+//   - otherwise the original error stands.
+func renameValue(c Conn, dn, attr, old, value string) (done bool, note string, err error) {
+	req := ldap.NewModifyRequest(dn, nil)
+	req.Delete(attr, []string{old})
+	req.Add(attr, []string{value})
+	err = c.Modify(req)
+	if err == nil || !(ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchAttribute) ||
+		ldap.IsErrorWithCode(err, ldap.LDAPResultAttributeOrValueExists)) {
+		return false, "", err
+	}
+	if sameValue(attr, old, value) {
+		// A case-only rename can't be told apart by re-reading.
+		return false, "", err
+	}
+	e, rerr := readEntry(c, dn, attr)
+	switch {
+	case rerr != nil:
+		return false, "", fmt.Errorf("%w (re-reading %s: %v)", err, attr, rerr)
+	case e == nil:
+		return false, "", err
+	}
+	have := e.GetEqualFoldAttributeValues(attr)
+	hasOld, hasNew := containsValue(attr, have, old), containsValue(attr, have, value)
+	var fix *ldap.ModifyRequest
+	switch {
+	case !hasOld && hasNew:
+		return true, "already renamed by the server (refint?)", nil
+	case !hasOld && !hasNew:
+		// The value was removed concurrently. Don't recreate it: it may be a
+		// local member, and an owned one is re-added by the next run anyway.
+		return true, "the old value was already gone; nothing to rename", nil
+	case hasOld && hasNew:
+		fix = ldap.NewModifyRequest(dn, nil)
+		fix.Delete(attr, []string{old})
+		note = "the new value was already present; deleted the old value"
+	default:
+		return false, "", err
+	}
+	if ferr := c.Modify(fix); ferr != nil {
+		return false, "", fmt.Errorf("%w (then: %v)", err, ferr)
+	}
+	return false, note, nil
+}
+
+// sameValue reports whether a and b match under attr's equality rule as
+// containsValue applies it.
+func sameValue(attr, a, b string) bool {
+	if dnAttrs[strings.ToLower(attr)] {
+		return model.DNEqual(a, b)
+	}
+	return a == b
+}
+
+// applySimple performs every operation other than a value rename.
+func applySimple(c Conn, op planner.Op) (done bool, err error) {
 	switch op.Kind {
 	case planner.CreateContainer, planner.AddEntry, planner.AddRecord:
 		req := ldap.NewAddRequest(op.DN, nil)
@@ -205,13 +304,6 @@ func applyOp(c Conn, op planner.Op) (done bool, err error) {
 		req := ldap.NewModifyRequest(op.DN, nil)
 		req.Delete(op.Attr, []string{op.Value})
 		return idempotent(c.Modify(req), planner.Delete)
-
-	case planner.RenameMember:
-		// One modify, so the value is never missing in between.
-		req := ldap.NewModifyRequest(op.DN, nil)
-		req.Delete(op.Attr, []string{op.Old})
-		req.Add(op.Attr, []string{op.Value})
-		return false, c.Modify(req)
 	}
 	return false, fmt.Errorf("unknown operation %q", op.Kind)
 }
