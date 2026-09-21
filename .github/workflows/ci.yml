@@ -21,8 +21,49 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
+      - run: go vet -tags integration ./...
       - run: go test -race ./...
       - run: go build ./cmd/dolly
+
+  # The target writer (apply, run lock, cn=status) against a real OpenLDAP.
+  # osixia/openldap sets up the base DN and admin from the environment and
+  # loads core, cosine, inetorgperson, and rfc2307bis (posixGroup auxiliary,
+  # so groups can be groupOfNames + posixGroup like the default mapping).
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      openldap:
+        image: osixia/openldap:1.5.0
+        env:
+          LDAP_ORGANISATION: Dolly CI
+          LDAP_DOMAIN: example.org
+          LDAP_ADMIN_PASSWORD: admin
+          LDAP_RFC2307BIS_SCHEMA: "true"
+          LDAP_TLS: "false"
+        ports:
+          - 389:389
+        options: >-
+          --health-cmd "ldapsearch -x -H ldap://localhost:389 -b dc=example,dc=org -s base -D cn=admin,dc=example,dc=org -w admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DOLLY_IT_URL: ldap://localhost:389
+      DOLLY_IT_BIND_DN: cn=admin,dc=example,dc=org
+      DOLLY_IT_PASSWORD: admin
+      DOLLY_IT_BASE: dc=example,dc=org
+      DOLLY_IT_REQUIRED: "1"              # fail instead of skipping if the variables above are missing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Show the server's posixGroup schema
+        run: >-
+          docker exec ${{ job.services.openldap.id }}
+          ldapsearch -x -LLL -o ldif-wrap=no -H ldap://localhost:389 -D cn=admin,dc=example,dc=org -w admin -b cn=Subschema -s base objectClasses
+          | grep -i "NAME 'posixGroup'"
+      - run: go test -race -count=1 -tags integration ./...
 
   goreleaser-check:
     runs-on: ubuntu-latest

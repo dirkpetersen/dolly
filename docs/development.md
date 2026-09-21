@@ -22,10 +22,29 @@ go test ./path/to/pkg -run TestName
 `.github/workflows/ci.yml` runs on every push and pull request that touches Go code, `go.mod`/`go.sum`, or `.goreleaser.yaml`:
 
 - `gofmt -l` (fails if any file isn't formatted)
-- `go vet ./...`
+- `go vet ./...` and `go vet -tags integration ./...`
 - `go test -race ./...`
 - `go build ./cmd/dolly`
 - a GoReleaser config check (`goreleaser check`)
+- an `integration` job (see below)
+
+## Integration tests
+
+The target writer — apply, the run lock, and `cn=status` — is also tested end to end against a real OpenLDAP server, behind the `integration` build tag (`internal/target/integration_test.go`). These tests don't run with a plain `go test ./...`.
+
+To run them locally, point a scratch OpenLDAP server's connection details at these environment variables and pass `-tags integration`:
+
+```bash
+export DOLLY_IT_URL=ldap://localhost:389
+export DOLLY_IT_BIND_DN=cn=admin,dc=example,dc=org
+export DOLLY_IT_PASSWORD=admin
+export DOLLY_IT_BASE=dc=example,dc=org
+go test -tags integration ./...
+```
+
+The server needs the core, cosine, and either `nis` (RFC 2307) or `rfc2307bis` schema. By default groups are tested as `groupOfNames` + `posixGroup`, which needs `rfc2307bis`; set `DOLLY_IT_SCHEMA=rfc2307` to test `memberUid`-only groups instead, against a server with `nis.schema`. Each test works in its own `ou=dolly-it-<n>` subtree under `DOLLY_IT_BASE` and deletes it afterwards, so a shared scratch server is safe to reuse. If the four required variables above aren't set, the tests skip themselves quietly; setting `DOLLY_IT_REQUIRED` (as CI does) turns that into a failure instead, so a misconfigured CI job can't pass by silently skipping.
+
+In CI, the `integration` job in `ci.yml` starts an `osixia/openldap` service container configured with the `rfc2307bis` schema and runs `go test -race -count=1 -tags integration ./...` against it.
 
 ## Releasing
 

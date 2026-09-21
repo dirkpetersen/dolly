@@ -77,6 +77,11 @@ func (p *Plan) Print(w io.Writer) {
 	switch {
 	case p.Mode == "adopt":
 		fmt.Fprintf(w, "not applied (adopt removes nothing)\n")
+	case g.Tripped && p.Real:
+		fmt.Fprintf(w, "TRIPPED (without --force this run stops without writing)\n")
+		for _, r := range g.Reasons {
+			fmt.Fprintf(w, "  %s\n", r)
+		}
 	case g.Tripped:
 		fmt.Fprintf(w, "TRIPPED, a real run would abort without writing (use --force to override)\n")
 		for _, r := range g.Reasons {

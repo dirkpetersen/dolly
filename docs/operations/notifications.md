@@ -1,5 +1,8 @@
 # Notifications
 
+!!! note "Not implemented yet"
+    Sending mail isn't wired up yet — `internal/target/status.go` and `cmd/dolly/main.go` mark the decision points with `TODO(notify)`. The `cn=status` entry described below is already written by every real run, which is what the eventual notification logic will read. This page describes the design from the spec.
+
 Dolly sends at most **one email per run**. There's no per-entry mail — a run that changes a hundred users still produces exactly one message.
 
 ## Configuring SMTP
@@ -47,10 +50,14 @@ So an AD outage that lasts overnight produces two or three mails total, not one 
 
 ## `cn=status`
 
-Dolly keeps a `cn=status` entry under `state_base` (alongside the ownership records and run lock) recording:
+Dolly keeps a `cn=status` entry (an `organizationalRole`) under `state_base` (alongside the ownership records and run lock), recording, as `description` key=value notes:
 
-- the last successful run,
-- the current failure, if any,
-- when a notification was last sent.
+- `last-run` — when the last real run happened,
+- `last-success` — when a run last completed without aborting,
+- `last-result` — a one-line count summary of that run,
+- `failure-since` and `failure` — present only while a failure persists,
+- `last-notified` — when a notification was last sent.
 
-This is what makes the flood-control behavior possible without any local state — a fresh host or a rebuilt Dolly instance picks up exactly where the last one left off, because the status lives in the target LDAP too. See [Ownership](../how-it-works/ownership.md) for the rest of what lives under `state_base`.
+Every real run that acquires the lock writes this entry, whether it succeeded, failed to read AD or the target, tripped the mass-deletion guard, had per-entry errors while applying the plan, or was stopped by a signal or `run_timeout`. `--dry-run` never writes it, since it never takes the lock.
+
+This is what will make the flood-control behavior possible without any local state — a fresh host or a rebuilt Dolly instance picks up exactly where the last one left off, because the status lives in the target LDAP too. See [Ownership](../how-it-works/ownership.md) for the rest of what lives under `state_base`.

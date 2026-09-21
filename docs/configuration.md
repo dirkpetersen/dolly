@@ -223,7 +223,7 @@ Run behavior: pruning, the mass-deletion guard, and timeouts.
 | `disabled_shell` | `/sbin/nologin` | `loginShell` set on disabled AD accounts (`userAccountControl` bit `0x2`). Empty string leaves the shell alone. |
 | `max_delete_percent` | `10` | Part of the mass-deletion guard: abort if a run would remove more than this percentage of what Dolly owns. `--force` overrides. |
 | `max_delete_min` | `25` | The guard never trips for this many removals or fewer, regardless of percentage. |
-| `lock_ttl` | `60m` | A run lock older than this (by the server's `createTimestamp`) is treated as stale and broken. |
+| `lock_ttl` | `60m` | A run lock whose `createTimestamp` and holder `started=` time are both older than this is treated as stale and broken. See [Run lock](how-it-works/run-lock.md). |
 | `run_timeout` | `45m` | A run aborts itself after this long. Must be shorter than `lock_ttl` so a live run's lock is never mistaken for stale. |
 | `network_timeout` | `30s` | Connect and per-operation timeout against both AD and the target. |
 

@@ -4,7 +4,7 @@ Every `dolly sync` run follows the same six steps, in order. There's no incremen
 
 ## 1. Lock
 
-Dolly takes the run lock in the target LDAP, at `cn=lock,<state_base>`. If another host already holds it, Dolly exits quietly with code `0` — no error, no mail. `--dry-run` takes no lock at all. See [Run lock](run-lock.md) for how the lock works and how stale locks are broken.
+Dolly creates `state_base` first if it's missing, then takes the run lock in the target LDAP, at `cn=lock,<state_base>`. If another host already holds it, Dolly exits quietly with code `0` — no error, no mail. `--dry-run` takes no lock at all. See [Run lock](run-lock.md) for how the lock works and how stale locks are broken.
 
 ## 2. Bleat
 
@@ -53,9 +53,43 @@ Writes happen in a crash-safe order:
 
 This order matters because a crash partway through must never leave a Dolly-added member looking like a local one (which would make it un-removable later), and must never remove an ownership record while the thing it owns still exists (which would leak an entry Dolly can no longer track).
 
-Per-entry errors — a rejected modify, an unreachable entry — don't abort the run. Dolly logs them, continues with the rest, reports them in the summary, and exits with code `1`. Aborts are reserved for incomplete reads (step 2), the mass-deletion guard (step 5), and lock failures.
+The operations run in exactly plan order — the step numbers `--dry-run` prints — and Dolly never reorders them. See [Applying the plan](#applying-the-plan) for what happens when one of them fails.
 
 Finally, Dolly updates the `cn=status` entry under `state_base` and releases the lock.
+
+## Applying the plan {: #applying-the-plan }
+
+A rejected operation doesn't stop the run. Dolly logs it to stderr with its step number and DN, carries on, lists it in the result, and exits `1`. What it skips are the *later* operations that depend on the failed one, because running them anyway would break the crash-safe order from step 6:
+
+- A failed ownership record skips the entry add it protects, and a user whose creation failed (or was skipped) this run isn't added to any group. A new group whose initial members include such a user waits for the next run.
+- Each user's and each group's record update, entry add, rename (`modrdn`), reference fix-ups, and final "rename complete" note form one sequence. The first failure skips the rest of that sequence, exactly as if the run had crashed there: after a failed `modrdn` the `renaming-from` note stays, so the next run finishes the rename. A failed attribute change or a rejected member doesn't stop the group's other members.
+- Each membership is its own sequence: a failed `roleOccupant` add skips the member value adds; a failed member value delete skips the `roleOccupant` delete, so the member stays Dolly-owned and is removed on the next run instead of turning into a local member. A group gone from AD keeps its record until all its owned members are removed; a pruned user keeps its entry and record until every membership is removed.
+- If the `empty_group_member` placeholder can't be added, the member deletes on that group are skipped; if a member add fails, the placeholder stays.
+
+Skipped operations are listed with the step that caused them, and are retried by the next run. On a re-run after a crash, an add whose entry already exists with the planned content, a value add that finds the value already present, and a value delete that finds it already gone all count as "already in place," not as errors. Any other server error is a failure. Each operation is bounded by `network_timeout`. On `SIGTERM`, `SIGINT`, or `run_timeout`, Dolly stops before starting the next operation, reports the rest as not run, and still writes `cn=status` and releases the lock.
+
+A real run prints the plan (as `--dry-run` does) and then the result:
+
+```text
+Result: 41 applied, 2 already in place, 3 skipped because an earlier step failed, 1 failed
+
+Failed (1)
+  step 12 cn=hpc-users,ou=group,dc=local: add member uid=jdoe,ou=people,dc=local
+    LDAP Result Code 65 "Object Class Violation": ...
+
+Skipped (3)
+  step 13 cn=hpc-users,ou=group,dc=local: add memberUid jdoe
+    needs step 12, which failed (pair:...)
+
+Created groups (1)
+  lab (3 members)
+
+Changed groups (2)
+  hpc-users +2 -1: +asmith +bwong -cdavis
+  staff +0 -0 (1 renamed)
+```
+
+`--debug` also prints one line per applied operation to stderr (`debug: step 7 applied: ...`).
 
 ## Next
 

@@ -21,7 +21,7 @@ Each record's RDN is `cn=<objectGUID>` — the AD object's `objectGUID`, formatt
 - `saved-shell` — the shell to restore after a disabled account is re-enabled.
 - `renaming-from=<old DN>` — present only while a rename is in progress; see [Renames](#renames).
 
-Dolly creates `state_base` and its children if they're missing. It never creates `users_base` or `groups_base` — if those don't exist, it stops with a clear error.
+Dolly creates `state_base` and its children if they're missing (`state_base` itself needs an `ou=` or `cn=` RDN for Dolly to create it that way; otherwise create it by hand first). It never creates `users_base` or `groups_base` — if those don't exist, it stops with a clear error.
 
 ## Group membership
 
@@ -37,6 +37,8 @@ Dolly creates `state_base` and its children if they're missing. It never creates
 ## Local wins
 
 A member already present in a target group without an ownership record was added locally, on the LDAP server directly. Dolly never removes that member — even if the same user also happens to be in the AD group. Local additions are permanent until removed by hand, with one exception: [pruning](#deleted-and-pruned-users) a user removes their local memberships too, to avoid a dangling reference to a deleted entry.
+
+One race: a member that a local admin adds between Dolly's read and its write can end up Dolly-owned, because Dolly writes the ownership record before the member value. The window is one run.
 
 ## Conflicts
 
@@ -122,4 +124,4 @@ Attributes with IA5String syntax — `gecos`, `homeDirectory`, and `loginShell` 
 
 ## Per-entry errors
 
-A rejected change on one entry doesn't abort the run. Dolly logs it, continues with everything else, reports it in the run summary, and exits with code `1`. This mirrors the predecessor's use of `ldapmodify -c` (continue on error), without shelling out to `ldapmodify` itself. Aborts are reserved for incomplete reads, the mass-deletion guard, and lock failures — see [How it works](index.md).
+A rejected change on one entry doesn't abort the run. Dolly logs it, continues with everything else not depending on it, reports it in the run summary, and exits with code `1`. This mirrors the predecessor's use of `ldapmodify -c` (continue on error), without shelling out to `ldapmodify` itself. Aborts are reserved for incomplete reads, the mass-deletion guard, and lock failures — see [How it works](index.md) and [Applying the plan](index.md#applying-the-plan) for exactly which later operations a failure skips.

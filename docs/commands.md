@@ -61,14 +61,16 @@ See [Adopting an existing tree](operations/adopting.md) for what it does and its
 
 ## `dolly unlock`
 
-Shows the current run lock — who holds it, and since when — and removes it after confirmation.
+Shows the current run lock — who holds it, and its age by the server's `createTimestamp` — and removes it after confirmation.
 
 ```bash
 dolly unlock          # prompts for confirmation
 dolly unlock --yes    # skips the prompt
 ```
 
-Use this after a crash that left the lock behind, instead of waiting for `lock_ttl` to expire it. See [Run lock](how-it-works/run-lock.md).
+Without `--yes`, Dolly requires stdin to be a terminal: if it isn't (for example under cron), Dolly refuses and exits `1` rather than guess. `--yes` skips the prompt and works non-interactively.
+
+Use this after a crash that left the lock behind, when no run is active, instead of waiting for `lock_ttl` to expire it. See [Run lock](how-it-works/run-lock.md).
 
 ## `dolly check`
 
@@ -111,7 +113,7 @@ dolly version
 | Code | Meaning |
 |---|---|
 | `0` | Success, or another host already holds the run lock (a quiet, expected outcome). |
-| `1` | An error occurred. |
+| `1` | An error occurred, including a single rejected operation while applying the plan (see [Applying the plan](how-it-works/index.md#applying-the-plan)) or a run stopped by a signal or `run_timeout`. |
 | `2` | The [mass-deletion guard](how-it-works/index.md#guard) stopped the run, or would have on a `--dry-run`. Use `--force` to override if the removals are expected — this also turns a would-be `2` from `--dry-run` into `0`. |
 
 The "AD returned zero users or zero groups" guard applies to every `dolly sync`, dry-run or not, but not to `dolly adopt`, which has no guard.

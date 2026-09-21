@@ -73,7 +73,15 @@ type Op struct {
 	Attrs   []Attribute // AddEntry, AddRecord, CreateContainer
 	Changes []Change    // ModifyEntry, UpdateRecord
 	Reason  string
+	// Needs and Provides are dependency keys (see deps.go): the applier
+	// skips an operation if an earlier one that provides a key it needs
+	// failed or was skipped. They never change the order.
+	Needs    []string
+	Provides []string
 }
+
+// String describes the operation in one line, as the plan prints it.
+func (op Op) String() string { return describe(op) }
 
 // WarningKind classifies run-summary warnings.
 type WarningKind string
@@ -136,9 +144,12 @@ type Guard struct {
 
 // Plan is the planner's output.
 type Plan struct {
-	Mode     string // "sync" or "adopt"
-	Users    bool   // users were planned
-	Groups   bool   // groups were planned
+	Mode string // "sync" or "adopt"
+	// Real is set by a real run before printing, so the guard line says
+	// what this run does rather than what a real run would do.
+	Real     bool
+	Users    bool // users were planned
+	Groups   bool // groups were planned
 	Ops      []Op
 	Warnings []Warning
 	// MissingMembers are the (group, member) pairs skipped because the

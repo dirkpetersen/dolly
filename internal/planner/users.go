@@ -17,13 +17,14 @@ import (
 func (p *planner) planUsers() {
 	// Users gone from AD first, so a pruned entry frees its name for an AD
 	// user created or renamed in the same run.
+	// Each user's operations form one crash-safe sequence (see deps.go).
 	for _, guid := range model.SortedKeys(p.userRecs) {
 		if rec := p.userRecs[guid]; rec != nil && p.users[guid] == nil {
-			p.goneUser(rec)
+			p.in(func() { p.goneUser(rec) }, p.userSeq(guid))
 		}
 	}
 	for _, u := range p.sortedUsers() {
-		p.syncUser(u)
+		p.in(func() { p.syncUser(u) }, p.userSeq(u.obj.GUID))
 	}
 }
 

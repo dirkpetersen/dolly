@@ -11,7 +11,10 @@ import (
 // Every helper here appends one operation to the plan and applies it to the
 // planner's working copy of the target, so later decisions see its effect.
 
-func (p *planner) emit(op Op) { p.plan.Ops = append(p.plan.Ops, op) }
+func (p *planner) emit(op Op) {
+	p.deps(&op)
+	p.plan.Ops = append(p.plan.Ops, op)
+}
 
 // entryAttrs renders an entry as an ordered attribute list, objectClass first.
 func entryAttrs(e *model.Entry) []Attribute {
@@ -213,7 +216,15 @@ func occupant(r *model.Record, dn string) string {
 // roleOccupant. Local memberships (no roleOccupant) are removed only when
 // includeLocal is set (pruning). With keepOccupant the roleOccupant is left
 // for a following record delete.
+//
+// The operations form the membership's sequence (pair key), so a failed
+// member delete skips the roleOccupant delete: the member stays owned and is
+// removed on the next run instead of turning into a local member.
 func (p *planner) removeMembership(g *model.Entry, rec *model.Record, dn, uid string, includeLocal, keepOccupant bool, reason string) {
+	p.in(func() { p.removeMembershipOps(g, rec, dn, uid, includeLocal, keepOccupant, reason) }, pairDepKey(g.DN, dn))
+}
+
+func (p *planner) removeMembershipOps(g *model.Entry, rec *model.Record, dn, uid string, includeLocal, keepOccupant bool, reason string) {
 	occ := occupant(rec, dn)
 	if occ == "" && !includeLocal {
 		return

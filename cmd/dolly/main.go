@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,7 +73,7 @@ func commands() []command {
 	return []command{
 		{"sync", "Read all in-scope AD users and groups and apply the differences to the target.", runSync},
 		{"adopt", "Create ownership records for an existing tree, such as one written by ad2openldap. Run once before the first sync.", runAdopt},
-		{"unlock", "Show the run lock and remove it after confirmation.", notImplemented("unlock", "yes")},
+		{"unlock", "Show the run lock and remove it after confirmation.", runUnlock},
 		{"check", "Test connectivity, binds, search scopes, the target's containers and size limit, and SMTP.", notImplemented("check")},
 		{"install", "Install the binary to ~/.local/bin, create the config from the template if missing, and write the systemd --user units.", notImplemented("install")},
 		{"uninstall", "Remove the systemd --user units and the binary. The config is kept.", notImplemented("uninstall")},
@@ -173,8 +175,8 @@ func debugFlag(fs *flag.FlagSet) *bool {
 	return fs.Bool("debug", false, "print debug details to stderr, such as each group member skipped for having no entry on the target")
 }
 
-// plan loads the config and snapshots, builds the plan, and prints it.
-// With showDebug, the plan's debug details go to stderr.
+// plan loads the config, then either prints the plan (--dry-run) or runs
+// for real (see realRun). With showDebug, debug details go to stderr.
 func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
 	path, err := config.Find(cfgPath)
 	if err != nil {
@@ -186,15 +188,20 @@ func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.O
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
 		return exitError
 	}
-	if !dryRun {
-		fmt.Fprintf(stderr, "dolly %s: not implemented yet: this build can only plan; use --dry-run\n", cmd)
+	if fix != "" && !dryRun {
+		fmt.Fprintf(stderr, "dolly %s: --fixture is only valid with --dry-run\n", cmd)
 		return exitError
+	}
+	if !dryRun {
+		return realRun(cmd, cfg, force, showDebug, opt, stdout, stderr)
 	}
 	var snaps *fixture.Snapshots
 	if fix != "" {
 		snaps, err = fixture.Load(fix, cfg, opt.Users || opt.Adopt)
 	} else {
-		snaps, err = readLive(cfg, opt, stderr)
+		ctx, cleanup := runContext(cfg)
+		snaps, err = readLive(ctx, cfg, opt, stderr)
+		cleanup()
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
@@ -226,20 +233,137 @@ func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.O
 	return exitOK
 }
 
+// runContext returns the run's context: cancelled on SIGTERM or SIGINT and
+// after run_timeout. A cancelled run stops between operations and still
+// releases its lock (with a fresh context).
+func runContext(cfg *config.Config) (context.Context, func()) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithTimeout(ctx, cfg.Sync.RunTimeout.Duration)
+	return ctx, func() { cancel(); stop() }
+}
+
+// realRun is a real sync or adopt: create state_base if missing, take the
+// run lock, read AD and the target, plan, check the guard, apply, write
+// cn=status, and release the lock.
+//
+// spec: the lock is taken before reading, so the plan is made from data no
+// other Dolly run changes meanwhile. If another run holds the lock, exit 0
+// quietly (one line on stderr, no status, no mail). Every outcome after the
+// lock (success, read error, guard, per-entry errors, a stop by signal or
+// run_timeout) is recorded in cn=status.
+func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
+	ctx, cleanup := runContext(cfg)
+	defer cleanup()
+	sb := cfg.Target.StateBase
+	conn, err := dialWriter(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
+		return exitError
+	}
+	defer conn.Close()
+	created, err := target.EnsureStateBase(ctx, conn, sb)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly %s: target %s: %v\n", cmd, cfg.Target.URL, err)
+		return exitError
+	}
+	if created {
+		fmt.Fprintf(stderr, "dolly: created state_base %s\n", sb)
+	}
+	lock, held, err := target.AcquireLock(ctx, conn, target.LockOptions{StateBase: sb, TTL: cfg.Sync.LockTTL.Duration, Command: cmd, Log: stderr})
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly %s: target %s: %v\n", cmd, cfg.Target.URL, err)
+		return exitError
+	}
+	if held != nil {
+		fmt.Fprintf(stderr, "dolly %s: another run holds the lock (%s, created %s, %s ago); exiting\n",
+			cmd, held.HolderString(), held.Created.UTC().Format(time.RFC3339), held.Age(time.Now()))
+		return exitOK
+	}
+	// The run context may be cancelled by now (signal, run_timeout), so the
+	// release and the status write use fresh short-timeout contexts.
+	fresh := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), cfg.Sync.NetworkTimeout.Duration)
+	}
+	defer func() {
+		rctx, cancel := fresh()
+		defer cancel()
+		if err := lock.Release(rctx); err != nil {
+			fmt.Fprintf(stderr, "dolly %s: warning: %v\n", cmd, err)
+		}
+	}()
+	// TODO(notify): a broken stale lock (lock.Broke) sends a notification.
+
+	status := func(failure, result string) {
+		sctx, cancel := fresh()
+		defer cancel()
+		if _, _, err := target.WriteStatus(sctx, conn, sb, target.RunStatus{End: time.Now(), Failure: failure, Result: result}); err != nil {
+			fmt.Fprintf(stderr, "dolly %s: warning: %v\n", cmd, err)
+		}
+	}
+	fail := func(err error) int {
+		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
+		status(err.Error(), "")
+		return exitError
+	}
+
+	opt.Now = time.Now()
+	snaps, err := readSnapshots(ctx, cfg, opt, stderr)
+	if err != nil {
+		return fail(err)
+	}
+	p, err := planner.Build(snaps.AD, snaps.Target, snaps.Records, cfg, opt)
+	if err != nil {
+		return fail(err)
+	}
+	if showDebug {
+		p.PrintDebug(stderr)
+	}
+	p.Real = true
+	p.Print(stdout)
+	if p.Guard.Tripped {
+		if !force {
+			msg := "mass-deletion guard tripped, nothing was changed (use --force to override): " + strings.Join(p.Guard.Reasons, "; ")
+			fmt.Fprintf(stderr, "dolly %s: %s\n", cmd, msg)
+			status(msg, "")
+			return exitGuard
+		}
+		fmt.Fprintf(stdout, "\n--force: applying the plan despite the guard.\n")
+	}
+	res := target.Apply(ctx, conn, p, stderr, showDebug)
+	res.Print(stdout)
+	summary := fmt.Sprintf("%d operations: %d applied, %d already in place, %d skipped, %d failed, %d not run",
+		len(p.Ops), res.Applied, res.AlreadyDone, res.Skipped, res.Failed, res.NotRun)
+	if !res.OK() {
+		status("run incomplete: "+summary, summary)
+		return exitError
+	}
+	status("", summary)
+	return exitOK
+}
+
+// writerConn is the target connection of a real run.
+type writerConn interface {
+	target.Conn
+	Close() error
+}
+
+// readSnapshots reads AD and the target for a real run; tests replace it.
+var readSnapshots = readLive
+
+// dialWriter opens the writer connection; tests replace it.
+var dialWriter = func(cfg *config.Config) (writerConn, error) { return target.DialWriter(cfg) }
+
 // readLive reads AD and the target for a plan, printing progress to
-// stderr. It is read-only: no lock, no writes.
+// stderr. It is read-only: it takes no lock and writes nothing (a real run
+// takes the lock before calling it).
 //
 // spec: a run that syncs users (and adopt) reads the AD users base and the
 // target's users_base in full. A groups-only run reads neither: AD members
 // are fetched by DN, and the target is asked only about the uids those
 // members need (batched lookups), so a huge or size-limited users_base
 // never has to be read.
-func readLive(cfg *config.Config, opt planner.Options, stderr io.Writer) (*fixture.Snapshots, error) {
+func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stderr io.Writer) (*fixture.Snapshots, error) {
 	start := time.Now()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, cfg.Sync.RunTimeout.Duration)
-	defer cancel()
 	step := time.Now()
 	progress := func(format string, a ...any) {
 		now := time.Now()
@@ -323,7 +447,7 @@ func notImplemented(name string, boolFlags ...string) func([]string, io.Writer, 
 			}
 		}
 		fs := newFlags(name, help, stderr, "")
-		if name == "unlock" || name == "check" {
+		if name == "check" {
 			fs.String("config", "", "config file")
 		}
 		for _, b := range boolFlags {
@@ -335,6 +459,72 @@ func notImplemented(name string, boolFlags ...string) func([]string, io.Writer, 
 		fmt.Fprintf(stderr, "dolly %s: not implemented yet\n", name)
 		return exitError
 	}
+}
+
+// stdin and stdinIsTTY are the confirmation input of dolly unlock; tests
+// replace them.
+var (
+	stdin      io.Reader = os.Stdin
+	stdinIsTTY           = func() bool { return isTerminal(os.Stdin.Fd()) }
+)
+
+func runUnlock(args []string, stdout, stderr io.Writer) int {
+	fs := newFlags("unlock", "Show the run lock (holder and age by the server's createTimestamp) and remove it after confirmation.\nUse it after a crash, when no dolly run is active. Without --yes, stdin must be a terminal.", stderr, "")
+	cfgPath := fs.String("config", "", "config file")
+	yes := fs.Bool("yes", false, "remove the lock without asking")
+	if code, ok := parse(fs, args); !ok {
+		return code
+	}
+	path, err := config.Find(*cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly unlock: %v\n", err)
+		return exitError
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly unlock: %v\n", err)
+		return exitError
+	}
+	conn, err := dialWriter(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly unlock: %v\n", err)
+		return exitError
+	}
+	defer conn.Close()
+	dn := target.LockDN(cfg.Target.StateBase)
+	info, err := target.ReadLock(conn, dn)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly unlock: %v\n", err)
+		return exitError
+	}
+	if info == nil {
+		fmt.Fprintf(stdout, "No run lock is held (%s does not exist).\n", dn)
+		return exitOK
+	}
+	now := time.Now()
+	fmt.Fprintf(stdout, "Run lock %s\n  holder:  %s\n  created: %s (%s ago, by the server's createTimestamp)\n",
+		info.DN, info.HolderString(), info.Created.UTC().Format(time.RFC3339), info.Age(now))
+	if ttl := cfg.Sync.LockTTL.Duration; now.Sub(info.Created) >= ttl {
+		fmt.Fprintf(stdout, "  stale?:  createTimestamp is older than lock_ttl (%s); the next run breaks it if the holder's started= time is old too\n", ttl)
+	}
+	if !*yes {
+		if !stdinIsTTY() {
+			fmt.Fprintf(stderr, "dolly unlock: stdin is not a terminal; refusing to remove the lock without confirmation (use --yes)\n")
+			return exitError
+		}
+		fmt.Fprint(stdout, "Remove it? Only do this if no dolly run is active. [y/N] ")
+		answer, _ := bufio.NewReader(stdin).ReadString('\n')
+		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+			fmt.Fprintln(stdout, "Lock left in place.")
+			return exitOK
+		}
+	}
+	if err := target.RemoveLock(conn, dn); err != nil {
+		fmt.Fprintf(stderr, "dolly unlock: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(stdout, "Removed %s.\n", dn)
+	return exitOK
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) int {

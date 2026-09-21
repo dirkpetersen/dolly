@@ -112,6 +112,8 @@ type planner struct {
 	removedPairs, addedPairs map[string]bool
 	localRemovedPairs        map[string]bool    // local memberships removed by a prune
 	byUserDN                 map[string]*adUser // built on first use in the groups phase
+
+	scopes []scope // active dependency scopes, see deps.go
 }
 
 func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records, cfg *config.Config, opt Options) (*planner, error) {

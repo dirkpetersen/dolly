@@ -1,7 +1,8 @@
-// Package target reads (and, in a later step, writes) the target LDAP
-// server. This file is the read-only part: the snapshot of groups_base,
-// users_base, and Dolly's records under state_base, and targeted uid
-// lookups for groups-only runs. It takes no lock and writes nothing.
+// Package target reads and writes the target LDAP server. This file is the
+// read-only part: the snapshot of groups_base, users_base, and Dolly's
+// records under state_base, and targeted uid lookups for groups-only runs.
+// It takes no lock and writes nothing. The writer (apply.go, lock.go,
+// status.go) works through the Conn interface.
 package target
 
 import (

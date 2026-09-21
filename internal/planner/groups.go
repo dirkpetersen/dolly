@@ -10,14 +10,17 @@ import (
 )
 
 func (p *planner) planGroups() {
+	// Each group's record, entry, and rename operations form one crash-safe
+	// sequence; its member operations need that sequence, and each
+	// membership is a sequence of its own (see deps.go).
 	for _, g := range p.sortedGroups() {
-		p.syncGroup(g)
+		p.in(func() { p.syncGroup(g) }, p.groupSeq(g.obj.GUID))
 	}
 	// Groups are never deleted. A group gone from AD loses its Dolly-owned
 	// members and its record; the entry and its local members stay.
 	for _, guid := range model.SortedKeys(p.groupRecs) {
 		if rec := p.groupRecs[guid]; rec != nil && p.groups[guid] == nil {
-			p.goneGroup(rec)
+			p.in(func() { p.goneGroup(rec) }, p.groupSeq(guid))
 		}
 	}
 }
@@ -186,8 +189,12 @@ func (p *planner) syncGroup(g *adGroup) {
 		p.createGroup(g, rec, want, "Dolly-owned group is missing on the target; re-creating it")
 		return
 	}
-	p.updateGroupAttrs(g, cur)
-	p.syncMembers(cur, rec, want, keep)
+	// A rejected attribute change or member doesn't stop the group's other
+	// changes, but a failed rename skips them all.
+	p.detached(func() {
+		p.updateGroupAttrs(g, cur)
+		p.syncMembers(cur, rec, want, keep)
+	})
 }
 
 func (p *planner) groupConflict(e *model.Entry, guid string) {
@@ -211,6 +218,17 @@ func (p *planner) createGroup(g *adGroup, rec *model.Record, want []member, reas
 		}
 		return
 	}
+	// The initial members' entries must be in place: if a user created
+	// earlier in this run failed, the group waits for the next run, which
+	// creates it without that member.
+	var needs []string
+	for _, m := range want {
+		needs = append(needs, entryKey(m.dn))
+	}
+	p.scoped(scope{needs: needs}, func() { p.createGroupOps(g, rec, want, reason) })
+}
+
+func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, reason string) {
 	e := &model.Entry{DN: g.dn, Attrs: map[string][]string{}}
 	e.Set("objectClass", p.cfg.Mapping.Groups.ObjectClasses)
 	for _, name := range p.groupAttrs {
@@ -289,31 +307,10 @@ func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member, 
 		uids[v] = true
 	}
 	for _, m := range want {
-		k := model.MustDNKey(m.dn)
-		hasM := p.memberMode && mem[k]
-		hasU := p.uidMode && uids[m.uid]
-		if occ[k] {
-			// Owned: restore values that went missing (e.g. after a crash
-			// between writing the record and adding the member).
-			if p.memberMode && !hasM {
-				p.addMember(g, config.AttrMember, m.dn, "Dolly-owned member "+m.uid+" is missing its member value")
-			}
-			if p.uidMode && !hasU {
-				p.addMember(g, config.AttrMemberUID, m.uid, "Dolly-owned member "+m.uid+" is missing its memberUid value")
-			}
-			continue
-		}
-		if hasM || hasU {
-			continue // local member
-		}
-		p.recAddOccupant(rec, m.dn, "record ownership before adding "+m.uid)
-		if p.memberMode {
-			p.addMember(g, config.AttrMember, m.dn, m.uid+" is in the AD group")
-		}
-		if p.uidMode {
-			p.addMember(g, config.AttrMemberUID, m.uid, m.uid+" is in the AD group")
-		}
-		p.countAdd(g.DN, m.dn)
+		// The member's entry must be in place: a user whose creation failed
+		// earlier in this run isn't added to (or recorded in) any group.
+		k := pairDepKey(g.DN, m.dn)
+		p.scoped(scope{needs: []string{k, entryKey(m.dn)}, provides: []string{k}}, func() { p.syncMember(g, rec, m, occ, mem, uids) })
 	}
 
 	wantKeys := memberKeys(want)
@@ -326,6 +323,36 @@ func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member, 
 	// After the removals, so a placeholder next to a leaving member stays
 	// put instead of being deleted and added back.
 	p.dropPlaceholder(g)
+}
+
+// syncMember adds one wanted member (see syncMembers), given the indexes of
+// the group's current occupants, member values, and memberUid values.
+func (p *planner) syncMember(g *model.Entry, rec *model.Record, m member, occ, mem, uids map[string]bool) {
+	k := model.MustDNKey(m.dn)
+	hasM := p.memberMode && mem[k]
+	hasU := p.uidMode && uids[m.uid]
+	if occ[k] {
+		// Owned: restore values that went missing (e.g. after a crash
+		// between writing the record and adding the member).
+		if p.memberMode && !hasM {
+			p.addMember(g, config.AttrMember, m.dn, "Dolly-owned member "+m.uid+" is missing its member value")
+		}
+		if p.uidMode && !hasU {
+			p.addMember(g, config.AttrMemberUID, m.uid, "Dolly-owned member "+m.uid+" is missing its memberUid value")
+		}
+		return
+	}
+	if hasM || hasU {
+		return // local member
+	}
+	p.recAddOccupant(rec, m.dn, "record ownership before adding "+m.uid)
+	if p.memberMode {
+		p.addMember(g, config.AttrMember, m.dn, m.uid+" is in the AD group")
+	}
+	if p.uidMode {
+		p.addMember(g, config.AttrMemberUID, m.uid, m.uid+" is in the AD group")
+	}
+	p.countAdd(g.DN, m.dn)
 }
 
 // leftWhy explains why an owned member is no longer wanted.

@@ -218,22 +218,56 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `dolly sync --force` | Applies the run even if it trips the mass-deletion guard |
 | `--debug` | Accepted by every command that plans (`sync`, `adopt`). Prints debug details to stderr, one line per group member skipped because it has no entry on the target: `debug: skip <uid> in <group DN>: no entry on the target under <users_base>` (with `member` in the membership list: `no entry on the target at <member DN>`). Without it, the summary shows only the count |
 | `dolly adopt` | One-time takeover of an existing tree, such as one written by ad2openldap. See "Adopting an existing tree" |
-| `dolly unlock` | Shows the current run lock and removes it after asking for confirmation (`--yes` skips the prompt). Use it after a crash |
+| `dolly unlock` | Shows the current run lock (holder, and age by the server's `createTimestamp`) and removes it after asking for confirmation. Without `--yes`, stdin must be a terminal: Dolly refuses (exit `1`) rather than guess when it isn't, for example under cron. `--yes` skips the prompt. Use it after a crash, when no run is active |
 | `dolly check` | Tests connectivity, binds, search scopes, the target's containers and size limit, and SMTP |
 | `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units |
 | `dolly uninstall` | Removes the units and binary, and keeps the config |
 | `dolly version` | Prints the version |
 
-Exit codes: `0` for success, or when another host holds the lock. `1` for an error. `2` when the mass-deletion guard stopped (or, for `--dry-run`, would have stopped) the run — `--force` makes that case exit `0` instead. The "AD returned zero users or zero groups" guard applies to every `dolly sync`, dry-run or not, but not to `dolly adopt`.
+Exit codes: `0` for success, or when another host holds the lock. `1` for an error, including a single rejected operation (see "Applying the plan") and a run stopped by a signal or `run_timeout`. `2` when the mass-deletion guard stopped (or, for `--dry-run`, would have stopped) the run — `--force` makes that case exit `0` instead. The "AD returned zero users or zero groups" guard applies to every `dolly sync`, dry-run or not, but not to `dolly adopt`.
 
 ## How it works
 
-1. **Lock.** Dolly takes the run lock in the target LDAP. If another host holds it, Dolly exits quietly with code 0. `--dry-run` takes no lock. See "Run lock".
+1. **Lock.** Dolly takes the run lock in the target LDAP, creating `state_base` first if it's missing. If another host holds it, Dolly exits quietly with code 0. `--dry-run` takes no lock. See "Run lock".
 2. **Bleat.** Dolly binds to AD (trying `source.urls` in order) and runs paged searches for all in-scope groups on every run, and for all in-scope users in every run that syncs users — a `--users` run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced by a group. A `--groups` run doesn't search the users base at all: it fetches each group member by DN (base-scope lookups, several at a time), following nested groups the same way, so its cost follows the size of the synced groups, not of the users base. Large `member` attributes are fetched with ranged retrieval (`member;range=…`). Group members that the searches didn't return — outside the configured bases, or every member in a `--groups` run — are fetched by DN, and must match `source.users.filter` (users) or `source.groups.filter` (groups), exactly like the searches; a member that matches neither is skipped as filtered, as if it were out of scope. On the target, a run that syncs users reads all of `users_base`; a `--groups` run reads only `groups_base` and `state_base`, and looks up the uids of the members it would add in batches (`(|(uid=a)(uid=b)…)`, 50 per search). If any read from AD or the target fails or comes back truncated (for example `sizeLimitExceeded`), the run aborts. Dolly never plans from partial data.
 3. **Shear.** Each entry is mapped through the configured attribute rules. Entries missing a `required` attribute are ignored (a user without `uidNumber` or `gidNumber` only for its own entry; it can still be a group member), and the run summary lists them once rather than warning every run. Nested groups are flattened. Members are resolved by DN to the user's `objectGUID` and then to the target DN and uid, never by CN, because CNs aren't unique and can contain escaped commas.
 4. **Compare.** Dolly reads the target entries and its ownership records under `state_base`, then plans adds, attribute modifies, renames (`modrdn`), and member additions and removals.
 5. **Guard.** Dolly counts removals across the whole run, separately for memberships and for users. If either count is above `max_delete_min` and above `max_delete_percent` of what Dolly owns, or if AD returned no users or no groups at all, Dolly aborts, sends a notification, and changes nothing. Local memberships removed by a prune are reported in the summary but don't count toward the guard. This applies to every `dolly sync`, including `--dry-run` (which reports what the guard would trip on, exits `2`, and writes nothing regardless). `--force` overrides the guard and makes a would-be trip exit `0`. `dolly adopt` has no guard.
-6. **Clone.** Dolly applies the plan in a crash-safe order: it writes the ownership record *before* adding an entry or member, and removes the entry or member *before* removing its record. A crash can then never leave a Dolly-added member looking like a local one. Finally it updates the status entry and releases the lock.
+6. **Clone.** Dolly applies the plan in a crash-safe order: it writes the ownership record *before* adding an entry or member, and removes the entry or member *before* removing its record. A crash can then never leave a Dolly-added member looking like a local one. The operations run exactly in plan order (the step numbers `--dry-run` prints); Dolly never reorders them. Finally it updates the status entry and releases the lock. See "Applying the plan".
+
+### Applying the plan
+
+A rejected operation doesn't stop the run. Dolly logs it to stderr with its step number and DN, carries on, lists it in the result, and exits `1`. What it skips are the later operations that *depend* on the failed one, because running them would break the crash-safe order:
+
+- A failed ownership record skips the entry add it protects, and a user whose creation failed (or was skipped) this run isn't added to any group. A new group whose initial members include such a user waits for the next run.
+- Each user's and each group's record update, entry add, rename (`modrdn`), reference fix-ups, and final "rename complete" note form one sequence. The first failure skips the rest of that sequence, exactly as if the run had crashed there: after a failed `modrdn` the `renaming-from` note stays, so the next run finishes the rename. A failed attribute change or a rejected member doesn't stop the group's other members.
+- Each membership is its own sequence: a failed `roleOccupant` add skips the member values; a failed member value delete skips the `roleOccupant` delete, so the member stays Dolly-owned and is removed on the next run instead of turning into a local member. A group gone from AD keeps its record until all its owned members are removed; a pruned user keeps its entry and record until every membership is removed.
+- If the `empty_group_member` placeholder can't be added, the member deletes on that group are skipped; if a member add fails, the placeholder stays.
+
+Skipped operations are listed with the step that caused them, and are retried by the next run. On a re-run after a crash, an add whose entry already exists with the planned content, a value add that finds the value present, and a value delete that finds it gone count as "already in place". Any other server error is a failure. Each operation is bounded by `network_timeout`. On `SIGTERM`, `SIGINT`, or `run_timeout`, Dolly stops before the next operation, reports the rest as not run, and still writes `cn=status` and releases the lock.
+
+A real run prints the plan (as `--dry-run` does) and then the result:
+
+```text
+Result: 41 applied, 2 already in place, 3 skipped because an earlier step failed, 1 failed
+
+Failed (1)
+  step 12 cn=hpc-users,ou=group,dc=local: add member uid=jdoe,ou=people,dc=local
+    LDAP Result Code 65 "Object Class Violation": ...
+
+Skipped (3)
+  step 13 cn=hpc-users,ou=group,dc=local: add memberUid jdoe
+    needs step 12, which failed (pair:...)
+
+Created groups (1)
+  lab (3 members)
+
+Changed groups (2)
+  hpc-users +2 -1: +asmith +bwong -cdavis
+  staff +0 -0 (1 renamed)
+```
+
+`--debug` also prints one line per applied operation to stderr (`debug: step 7 applied: ...`).
 
 ### Ownership records
 
@@ -252,13 +286,13 @@ ou=dolly,dc=local
 └── cn=status             last successful run, current failure, last notification
 ```
 
-Dolly creates `state_base` and its children if they're missing. It doesn't create `users_base` or `groups_base`. If those are missing, it stops with a clear error. User records also keep small `description` key=value notes: `missing-since`, an RFC 3339 UTC timestamp (for example `2026-09-21T19:00:00Z`) recording when a user went missing from AD; `saved-shell`, the shell to restore after a disabled account is re-enabled; and `renaming-from=<old DN>`, present only while a rename is in progress (see below).
+Dolly creates `state_base` and its children if they're missing (`state_base` needs an `ou=` or `cn=` RDN for that; otherwise create it by hand). It doesn't create `users_base` or `groups_base`. If those are missing, it stops with a clear error. User records also keep small `description` key=value notes: `missing-since`, an RFC 3339 UTC timestamp (for example `2026-09-21T19:00:00Z`) recording when a user went missing from AD; `saved-shell`, the shell to restore after a disabled account is re-enabled; and `renaming-from=<old DN>`, present only while a rename is in progress (see below).
 
 The rules:
 
 - A user in the AD group but not in the target group is added and recorded as Dolly-owned.
 - A Dolly-owned member who left the AD group, or was deleted from AD, is removed from the target group and from the record.
-- A member who is already in the target group without a record was added locally. Dolly never removes that member, even if the same user is also in the AD group.
+- A member who is already in the target group without a record was added locally. Dolly never removes that member, even if the same user is also in the AD group. One race: a member that a local admin adds between Dolly's read and its write can end up Dolly-owned, because Dolly writes the ownership record before the member value. The window is one run.
 - A member value removed by hand on the target is re-added on the next run only if Dolly owns that membership (the group's record lists it in `roleOccupant`, because it came from AD) and the AD group still lists the user: for Dolly-owned members, AD wins. A local member removed by hand is never re-added as a repair; that's the admin's business. Known consequence: a local member who is *also* in the AD group, once removed by hand, comes back as a Dolly-owned member, because Dolly can't tell that from a new AD membership without keeping extra state.
 - A target user or group with the same `uid` or `cn` as an AD entry but no ownership record is a conflict. Dolly logs an error and leaves it untouched; a conflict user can still be added as a group member by DN, since that doesn't require an owned user entry.
 - When two AD users map to the same `uid`, the winner is chosen in order: the current owner (an ownership record already points at this AD user), then any entry with an ownership record, then an in-scope entry, then the lowest DN. The other user is a warning, nothing more.
@@ -285,11 +319,12 @@ The rules:
 
 ### Run lock
 
-Before writing anything, Dolly creates `cn=lock,<state_base>` with an LDAP add. The add is atomic, so only one host can hold the lock. The entry records the host, PID, and start time. Dolly deletes it when the run ends, even after an error or a `SIGTERM`/`SIGINT`. A run also aborts itself after `run_timeout`, which must be shorter than `lock_ttl`, so a live run never has its lock broken.
+Before reading or writing anything else, Dolly creates `state_base` if it's missing (only `state_base` itself; the record containers come with the plan), then creates `cn=lock,<state_base>` with an LDAP add. The add is atomic, so only one host can hold the lock. The entry (an `organizationalRole`) records the host, PID, start time, and command as `description` values. If another run holds a fresh lock, Dolly prints one line to stderr and exits `0` without mail and without touching `cn=status`. Dolly deletes its lock when the run ends, even after an error or a `SIGTERM`/`SIGINT`, using a fresh short timeout, and only if the lock is still its own. `dolly sync` and `dolly adopt` take the lock; `--dry-run` doesn't. A run also aborts itself after `run_timeout`, which must be shorter than `lock_ttl`, so a live run never has its lock broken.
 
 If a run crashes and leaves the lock behind:
 
-- A lock older than `lock_ttl` (by the server's `createTimestamp`) is treated as stale. The next run breaks it by first *renaming* it (`modrdn`), which only one host can win, and then deleting the renamed entry. It logs a warning and sends a notification.
+- A lock is treated as stale only when *both* its server `createTimestamp` and the holder's `started=` note are at least `lock_ttl` old by the local clock (a lock without a `started=` note is judged by `createTimestamp` alone), so one wrong clock can't break a live run's lock. If `createTimestamp` is more than 5 minutes in the local future, the clocks disagree: Dolly refuses to judge the lock, leaves it alone, and exits `1` with an error naming the skew. Keep the Dolly hosts and the LDAP server NTP-synced.
+- The next run breaks a stale lock by first *renaming* it (`modrdn` to `cn=lock-stale-<short host>-<unix time>-<pid>`), which only one host can win, and then deleting the renamed entry and taking the lock (one retry). A host that loses the rename (the lock is gone, or the stale name already exists) treats the lock as held. If the entry it renamed turns out to be fresh (another host broke the stale lock and took a new one in between), it renames it back. Breaking a lock logs a warning and sends a notification.
 - `dolly unlock` shows who holds the lock and since when, and removes it after confirmation.
 
 ### Adopting an existing tree
@@ -346,7 +381,7 @@ loginctl enable-linger "$USER"   # keep the timer running while you're logged ou
 
 With `on: changes`, Dolly mails when a run made changes. Failures are always reported, whichever setting you choose. Dolly sends at most **one email per run**. It's a summary of everything that happened: counts, then the adds, removals, renames, changed ID numbers, warnings, and errors. A hundred changed users is still one mail.
 
-Dolly keeps a `cn=status` entry under `state_base` with the last successful run, the current failure, and when it last sent mail. With `on: failure` it sends one mail when a failure first appears, a reminder at most every `remind_every` while it persists, and one mail when the run succeeds again. So an AD outage overnight is two or three mails, not 96. Ignored entries and conflicts are listed in the run summary and mailed only when the list changes.
+Dolly keeps a `cn=status` entry (an `organizationalRole`) under `state_base` with the last successful run, the current failure, and when it last sent mail, as `description` key=value notes: `last-run`, `last-success`, `last-result` (a one-line count summary), `failure-since` and `failure` (only while a failure persists), and `last-notified`. Every real run that got the lock writes it, whether it succeeded, failed to read, tripped the guard, had per-entry errors, or was stopped. With `on: failure` it sends one mail when a failure first appears, a reminder at most every `remind_every` while it persists, and one mail when the run succeeds again. So an AD outage overnight is two or three mails, not 96. Ignored entries and conflicts are listed in the run summary and mailed only when the list changes.
 
 ## TLS certificates
 
@@ -379,7 +414,7 @@ Requires Go 1.22 or later. Built on [go-ldap/ldap](https://github.com/go-ldap/ld
 
 ## Releasing
 
-CI (`.github/workflows/ci.yml`) runs `gofmt`, `go vet`, `go test -race`, and a GoReleaser config check on every push and pull request that touches Go code.
+CI (`.github/workflows/ci.yml`) runs `gofmt`, `go vet`, `go test -race`, and a GoReleaser config check on every push and pull request that touches Go code. An `integration` job starts an OpenLDAP service container (`osixia/openldap` with rfc2307bis) and runs `go test -tags integration ./...`, which tests the target writer (apply, run lock, `cn=status`) against it. To run those tests locally, point `DOLLY_IT_URL`, `DOLLY_IT_BIND_DN`, `DOLLY_IT_PASSWORD`, and `DOLLY_IT_BASE` at a scratch server (`DOLLY_IT_SCHEMA=rfc2307` for one with `nis.schema`); each test works in its own subtree and deletes it afterwards.
 
 To cut a release, push a semver tag:
 
