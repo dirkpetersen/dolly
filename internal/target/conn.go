@@ -28,8 +28,9 @@ type Conn interface {
 // DialWriter opens the connection a real run writes through: the run lock,
 // the plan, and cn=status. Unlike the reader's connection it isn't closed
 // when the run context ends, so the lock can still be released after a
-// SIGTERM or run_timeout. Every operation is bounded by network_timeout,
-// and the applier stops between operations once the run context ends.
+// SIGTERM or run_timeout. The connection setup (dial, TLS, bind) and every
+// later operation are bounded by network_timeout (see ldapconn.Dial), and
+// the applier stops between operations once the run context ends.
 func DialWriter(cfg *config.Config) (*ldap.Conn, error) {
 	pw, err := cfg.Target.Password()
 	if err != nil {
@@ -86,9 +87,15 @@ func EnsureStateBase(ctx context.Context, c Conn, stateBase string) (created boo
 	return true, nil
 }
 
+// Searcher is the read-only part of Conn (dolly check reads the run lock
+// through it).
+type Searcher interface {
+	Search(*ldap.SearchRequest) (*ldap.SearchResult, error)
+}
+
 // readEntry reads one entry by DN (base scope). It returns nil, nil if the
 // entry doesn't exist.
-func readEntry(c Conn, dn string, attrs ...string) (*ldap.Entry, error) {
+func readEntry(c Searcher, dn string, attrs ...string) (*ldap.Entry, error) {
 	res, err := c.Search(ldap.NewSearchRequest(dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 0, false,
 		"(objectClass=*)", attrs, nil))
 	switch {

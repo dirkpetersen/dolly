@@ -3,6 +3,7 @@ package target
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -289,6 +290,68 @@ func TestLockClockSkewFuture(t *testing.T) {
 	putLock(dir, "other", -2*time.Minute)
 	if l, held, err := AcquireLock(context.Background(), dir, lockOpts(&bytes.Buffer{}, 7)); err != nil || l != nil || held == nil {
 		t.Errorf("small skew: %v %v %v", l, held, err)
+	}
+}
+
+// A started= note more than 5 minutes in the local future is clock skew
+// too, even with an old createTimestamp: otherwise the lock would look
+// fresh forever and every run would exit 0 quietly.
+func TestLockClockSkewFutureStarted(t *testing.T) {
+	put := func(dir *ldapfake.Dir, startedIn time.Duration) {
+		dir.Put(lockDN, map[string][]string{"objectClass": {"organizationalRole"}, "cn": {"lock"},
+			"description": {"host=other", "started=" + time.Now().Add(startedIn).UTC().Format(time.RFC3339)}},
+			time.Now().Add(-2*time.Hour))
+	}
+	dir := withStateBase()
+	put(dir, 24*time.Hour)
+	l, held, err := AcquireLock(context.Background(), dir, lockOpts(&bytes.Buffer{}, 7))
+	var skew *ClockSkewError
+	if !errors.As(err, &skew) || skew.What != "started=" || l != nil || held != nil ||
+		!strings.Contains(err.Error(), "started=") || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("acquire: %v %v %v", l, held, err)
+	}
+	if got := dir.Values(lockDN, "description"); len(got) != 2 || got[0] != "host=other" {
+		t.Errorf("lock changed: %v", got)
+	}
+	// Less than 5 minutes ahead is judged normally: with an old
+	// createTimestamp, a started= 2 minutes in the future is fresh.
+	dir = withStateBase()
+	put(dir, 2*time.Minute)
+	if l, held, err := AcquireLock(context.Background(), dir, lockOpts(&bytes.Buffer{}, 7)); err != nil || l != nil || held == nil {
+		t.Errorf("small skew: %v %v %v", l, held, err)
+	}
+}
+
+func TestLockInfoSkew(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	info := func(created, started time.Time) *LockInfo {
+		return &LockInfo{DN: lockDN, Created: created, Holder: []string{"host=x", "started=" + started.Format(time.RFC3339)}}
+	}
+	for _, tc := range []struct {
+		name             string
+		created, started time.Duration // offsets from now
+		what             string        // "" = no skew
+		stale            bool
+	}{
+		{"both past, old", -2 * time.Hour, -2 * time.Hour, "", true},
+		{"started 4m ahead", -2 * time.Hour, 4 * time.Minute, "", false},
+		{"started 6m ahead", -2 * time.Hour, 6 * time.Minute, "started=", false},
+		{"created 6m ahead", 6 * time.Minute, -2 * time.Hour, "createTimestamp", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := info(now.Add(tc.created), now.Add(tc.started))
+			stale, err := l.Stale(now, time.Hour)
+			var skew *ClockSkewError
+			switch {
+			case tc.what == "" && err != nil:
+				t.Fatalf("unexpected error %v", err)
+			case tc.what != "" && (!errors.As(err, &skew) || skew.What != tc.what):
+				t.Fatalf("err = %v, want skew in %s", err, tc.what)
+			}
+			if stale != tc.stale {
+				t.Errorf("stale = %v, want %v", stale, tc.stale)
+			}
+		})
 	}
 }
 

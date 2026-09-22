@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -255,7 +256,8 @@ func runContext(cfg *config.Config) (context.Context, func()) {
 // other Dolly run changes meanwhile. If another run holds the lock, exit 0
 // quietly (one line on stderr, no status, no mail). Every outcome after the
 // lock (success, read error, guard, per-entry errors, a stop by signal or
-// run_timeout) is recorded in cn=status.
+// run_timeout) is recorded in cn=status, and so is a lock Dolly refuses to
+// judge because of clock skew (exit 1).
 func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
 	ctx, cleanup := runContext(cfg)
 	defer cleanup()
@@ -279,34 +281,18 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 	if created {
 		fmt.Fprintf(stderr, "dolly: created state_base %s\n", sb)
 	}
-	lock, held, err := target.AcquireLock(ctx, conn, target.LockOptions{StateBase: sb, TTL: cfg.Sync.LockTTL.Duration, Command: cmd, Log: stderr})
-	if err != nil {
-		fmt.Fprintf(stderr, "dolly %s: target %s: %v\n", cmd, cfg.Target.URL, err)
-		return exitError
-	}
-	if held != nil {
-		fmt.Fprintf(stderr, "dolly %s: another run holds the lock (%s, created %s, %s ago); exiting\n",
-			cmd, held.HolderString(), held.Created.UTC().Format(time.RFC3339), held.Age(time.Now()))
-		return exitOK
-	}
 	// The run context may be cancelled by now (signal, run_timeout), so the
 	// release and the status write use fresh short-timeout contexts.
 	fresh := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), cfg.Sync.NetworkTimeout.Duration)
 	}
-	defer func() {
-		rctx, cancel := fresh()
-		defer cancel()
-		if err := lock.Release(rctx); err != nil {
-			fmt.Fprintf(stderr, "dolly %s: warning: %v\n", cmd, err)
-		}
-	}()
 
 	// status records the outcome in cn=status and, through the Notes hook,
 	// sends the run's single notification (decided from the notes before
 	// this run). A broken stale lock and a tripped guard are mailed as
 	// failures are. A mail failure is logged and recorded as notify-error;
 	// it never changes the exit code.
+	var lock *target.Lock
 	var p *planner.Plan
 	var res *target.Result
 	status := func(failure, result string) {
@@ -316,7 +302,10 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		notes := func(before []string) map[string]string {
 			r := notify.Report{
 				Command: cmd, ConfigPath: cfg.Path, Start: start, End: end, Failure: failure,
-				Changed: res != nil && res.Applied > 0, BrokeLock: lock.Broke, Plan: p, Output: capture.String(),
+				Changed: res != nil && res.Applied > 0, Plan: p, Output: capture.String(),
+			}
+			if lock != nil {
+				r.BrokeLock = lock.Broke
 			}
 			mctx, mcancel := context.WithTimeout(context.Background(), 2*cfg.Sync.NetworkTimeout.Duration)
 			defer mcancel()
@@ -333,6 +322,32 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		status(err.Error(), "")
 		return exitError
 	}
+
+	lock, held, err := target.AcquireLock(ctx, conn, target.LockOptions{StateBase: sb, TTL: cfg.Sync.LockTTL.Duration, Command: cmd, Log: stderr})
+	if err != nil {
+		var skew *target.ClockSkewError
+		if errors.As(err, &skew) {
+			// spec: a lock Dolly refuses to judge (clock skew) would stop
+			// every run until someone acts, so it is recorded in cn=status
+			// as a failure and mailed like one, although this run holds no
+			// lock.
+			return fail(fmt.Errorf("target %s: %w", cfg.Target.URL, err))
+		}
+		fmt.Fprintf(stderr, "dolly %s: target %s: %v\n", cmd, cfg.Target.URL, err)
+		return exitError
+	}
+	if held != nil {
+		fmt.Fprintf(stderr, "dolly %s: another run holds the lock (%s, created %s, %s ago); exiting\n",
+			cmd, held.HolderString(), held.Created.UTC().Format(time.RFC3339), held.Age(time.Now()))
+		return exitOK
+	}
+	defer func() {
+		rctx, cancel := fresh()
+		defer cancel()
+		if err := lock.Release(rctx); err != nil {
+			fmt.Fprintf(stderr, "dolly %s: warning: %v\n", cmd, err)
+		}
+	}()
 
 	opt.Now = time.Now()
 	snaps, err := readSnapshots(ctx, cfg, opt, stderr)
@@ -530,8 +545,18 @@ func runUnlock(args []string, stdout, stderr io.Writer) int {
 	now := time.Now()
 	fmt.Fprintf(stdout, "Run lock %s\n  holder:  %s\n  created: %s (%s ago, by the server's createTimestamp)\n",
 		info.DN, info.HolderString(), info.Created.UTC().Format(time.RFC3339), info.Age(now))
-	if ttl := cfg.Sync.LockTTL.Duration; now.Sub(info.Created) >= ttl {
-		fmt.Fprintf(stdout, "  stale?:  createTimestamp is older than lock_ttl (%s); the next run breaks it if the holder's started= time is old too\n", ttl)
+	if started, ok := info.Started(); ok {
+		fmt.Fprintf(stdout, "  started: %s (by the holder's clock)\n", started.UTC().Format(time.RFC3339))
+	}
+	ttl := cfg.Sync.LockTTL.Duration
+	if stale, err := info.Stale(now, ttl); err != nil {
+		// A lock with a timestamp in the future is never judged stale:
+		// every run fails with this error until the lock is removed.
+		fmt.Fprintf(stdout, "  CLOCK SKEW: %v\n", err)
+	} else if stale {
+		fmt.Fprintf(stdout, "  stale?:  createTimestamp and started= are older than lock_ttl (%s); the next run breaks it\n", ttl)
+	} else if now.Sub(info.Created) >= ttl {
+		fmt.Fprintf(stdout, "  stale?:  createTimestamp is older than lock_ttl (%s), but the holder's started= time isn't yet; the next run breaks it once both are\n", ttl)
 	}
 	if !*yes {
 		if !stdinIsTTY() {
@@ -570,13 +595,15 @@ func versionString() string {
 			v = bi.Main.Version // go install ...@version
 		}
 	}
-	s := "dolly " + v
+	var parts []string
 	if c != "" {
-		s += " (commit " + c
+		parts = append(parts, "commit "+c)
 		if d != "" {
-			s += ", built " + d
+			parts = append(parts, "built "+d)
 		}
-		s += ")"
 	}
-	return s
+	// The Go toolchain the binary was built with (its stdlib, crypto/tls
+	// included).
+	parts = append(parts, runtime.Version())
+	return "dolly " + v + " (" + strings.Join(parts, ", ") + ")"
 }

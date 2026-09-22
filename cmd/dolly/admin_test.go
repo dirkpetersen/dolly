@@ -256,6 +256,38 @@ func TestCheck(t *testing.T) {
 			t.Errorf("--groups: exit %d\n%s", code, out)
 		}
 	})
+	t.Run("run lock", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			age     time.Duration
+			started string
+			want    string
+			code    int
+		}{
+			{"fresh", time.Minute, "", "- a run lock is held by host=other", 0},
+			{"older than lock_ttl", 3 * time.Hour, "", "! a run lock has been held for 3h0m", 0}, // the age may round up a second
+			{"older than lock_ttl (advice)", 3 * time.Hour, "", "(lock_ttl 1h0m0s) by host=other; if no dolly run is active, run `dolly unlock`", 0},
+			{"started= in the future", 3 * time.Hour, time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), "! the run lock cn=lock,ou=dolly,dc=local was created at", 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tgt := targetFake()
+				tgt.Put("ou=dolly,dc=local", map[string][]string{"objectClass": {"organizationalUnit"}, "ou": {"dolly"}}, time.Now())
+				desc := []string{"host=other"}
+				if tc.started != "" {
+					desc = append(desc, "started="+tc.started)
+				}
+				tgt.Put(lockDN, map[string][]string{"objectClass": {"organizationalRole"}, "cn": {"lock"}, "description": desc}, time.Now().Add(-tc.age))
+				withCheckDial(t, map[string]*ldapfake.Dir{"ldaps://dc01.example.edu:636": adFake(), "ldaps://dc02.example.edu:636": adFake(), "ldap://ldap.example.edu:389": tgt})
+				code, out, _ := runCLI("check", "--config", testConfig(t, nil))
+				if code != tc.code || !strings.Contains(out, tc.want) {
+					t.Errorf("exit %d, want %q\n%s", code, tc.want, out)
+				}
+				if !tgt.Has(lockDN) {
+					t.Error("check removed the lock")
+				}
+			})
+		}
+	})
 	t.Run("missing groups_base", func(t *testing.T) {
 		tgt := ldapfake.New()
 		tgt.Put("dc=local", map[string][]string{"objectClass": {"domain"}}, time.Now())
@@ -435,5 +467,40 @@ func TestStaleLockBreakIsMailed(t *testing.T) {
 	subj, body := mailBody(t, msgs[0])
 	if !strings.Contains(subj, "dolly sync broke a stale run lock") || !strings.Contains(body, "held by host=other pid=42") {
 		t.Errorf("subject %q\n%s", subj, body)
+	}
+}
+
+// A lock whose started= note is far in the future (clock skew) is never
+// judged: the run exits 1, records the failure in cn=status, and mails it,
+// instead of treating the lock as held forever and exiting 0 quietly.
+func TestClockSkewLockFailsAndIsMailed(t *testing.T) {
+	s := smtpfake.Start(t, smtpfake.Options{StartTLS: true})
+	withSMTPRoots(t, s)
+	cfg := testConfig(t, s)
+	dir := ldapfake.New()
+	dir.Put("ou=dolly,dc=local", map[string][]string{"objectClass": {"organizationalUnit"}, "ou": {"dolly"}}, time.Now())
+	future := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
+	dir.Put(lockDN, map[string][]string{"objectClass": {"organizationalRole"}, "cn": {"lock"},
+		"description": {"host=other", "pid=42", "started=" + future}}, time.Now().Add(-3*time.Hour))
+	withFake(t, dir, "", false)
+	withSnapshots(t, "testdata/fixture.yaml")
+	code, _, errs := runCLI("sync", "--config", cfg)
+	if code != 1 || !strings.Contains(errs, "clocks") || !strings.Contains(errs, "started=") {
+		t.Fatalf("exit %d\n%s", code, errs)
+	}
+	if !dir.Has(lockDN) {
+		t.Error("the skewed lock was removed")
+	}
+	if st := statusNotes(dir); !strings.Contains(st, "failure=") || !strings.Contains(st, "future") {
+		t.Errorf("status:\n%s", st)
+	}
+	if msgs := s.Messages(); len(msgs) != 1 {
+		t.Fatalf("%d mails", len(msgs))
+	}
+
+	// dolly unlock names the skew.
+	code, out, _ := runCLI("unlock", "--yes", "--config", cfg)
+	if code != 0 || !strings.Contains(out, "CLOCK SKEW") || !strings.Contains(out, "started: "+future) || dir.Has(lockDN) {
+		t.Errorf("unlock: exit %d\n%s", code, out)
 	}
 }

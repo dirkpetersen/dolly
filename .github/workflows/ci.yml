@@ -17,13 +17,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable              # the latest stable Go, as releases use; go.mod's go 1.22 is only the floor
+          check-latest: true
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go vet -tags integration ./...
       - run: go test -race ./...
       - run: go build ./cmd/dolly
+
+  # The code must keep compiling with the minimum Go in go.mod (1.22.x),
+  # although tests and releases use the latest stable Go.
+  go-min:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local   # never switch to a newer toolchain: this job checks the go.mod floor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go version
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go vet -tags integration ./...
 
   # The target writer (apply, run lock, cn=status) against a real OpenLDAP.
   # osixia/openldap sets up the base DN and admin from the environment and
@@ -57,7 +74,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable              # the latest stable Go, as releases use; go.mod's go 1.22 is only the floor
+          check-latest: true
       - name: Show the server's posixGroup schema
         run: >-
           docker exec ${{ job.services.openldap.id }}

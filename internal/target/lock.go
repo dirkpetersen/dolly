@@ -25,9 +25,9 @@ type LockInfo struct {
 // Age returns how old the lock is at now, by the server's createTimestamp.
 func (l *LockInfo) Age(now time.Time) time.Duration { return now.Sub(l.Created).Round(time.Second) }
 
-// maxClockSkew is how far in the local future a lock's createTimestamp may
-// be before Dolly refuses to judge it: the clocks of this host and the
-// server disagree, and breaking the lock could break a live run's.
+// maxClockSkew is how far in the local future a lock's createTimestamp or
+// started= note may be before Dolly refuses to judge it: the clocks
+// disagree, and breaking the lock could break a live run's.
 const maxClockSkew = 5 * time.Minute
 
 // Started returns the holder's started= note, if it has a parseable one.
@@ -42,17 +42,53 @@ func (l *LockInfo) Started() (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// stale reports whether the lock is at least ttl old at now. Both clocks
+// ClockSkewError is returned when a lock's createTimestamp (the server's
+// clock) or its started= note (the holder's clock) is more than
+// maxClockSkew in the local future: the clocks disagree, and Dolly refuses
+// to judge the lock either way.
+type ClockSkewError struct {
+	DN    string
+	What  string    // "createTimestamp" or "started="
+	At    time.Time // the future time
+	Ahead time.Duration
+}
+
+func (e *ClockSkewError) Error() string {
+	whose := "by the server's clock (createTimestamp)"
+	if e.What == "started=" {
+		whose = "by the holder's clock (its started= note)"
+	}
+	return fmt.Sprintf("the run lock %s was created at %s %s, %s in this host's future: "+
+		"the clocks of this host, the LDAP server, and the lock holder disagree (keep them all NTP-synced); "+
+		"not judging the lock (if no dolly run is active, remove it with dolly unlock)",
+		e.DN, e.At.UTC().Format(time.RFC3339), whose, e.Ahead.Round(time.Second))
+}
+
+// Skew returns a *ClockSkewError if the lock's createTimestamp or started=
+// note is more than maxClockSkew in the future at now, or nil.
+func (l *LockInfo) Skew(now time.Time) error {
+	if ahead := l.Created.Sub(now); ahead > maxClockSkew {
+		return &ClockSkewError{DN: l.DN, What: "createTimestamp", At: l.Created, Ahead: ahead}
+	}
+	if started, ok := l.Started(); ok {
+		if ahead := started.Sub(now); ahead > maxClockSkew {
+			return &ClockSkewError{DN: l.DN, What: "started=", At: started, Ahead: ahead}
+		}
+	}
+	return nil
+}
+
+// Stale reports whether the lock is at least ttl old at now. Both clocks
 // must agree: the server's createTimestamp and the holder's started= note
 // (written by the holder's clock) must both be ttl old, so one skewed clock
 // can't break a live run's lock. A lock without a started= note is judged
-// by createTimestamp alone. A createTimestamp more than maxClockSkew in the
-// local future is an error: the clocks disagree and nothing is judged.
-func (l *LockInfo) stale(now time.Time, ttl time.Duration) (bool, error) {
-	if ahead := l.Created.Sub(now); ahead > maxClockSkew {
-		return false, fmt.Errorf("the run lock %s was created at %s by the server's clock, %s in this host's future: "+
-			"the clocks of this host and the LDAP server disagree (keep both NTP-synced); not judging the lock",
-			l.DN, l.Created.UTC().Format(time.RFC3339), ahead.Round(time.Second))
+// by createTimestamp alone. A createTimestamp or started= note more than
+// maxClockSkew in the local future is a *ClockSkewError: the clocks
+// disagree and nothing is judged (a future started= would otherwise keep
+// the lock fresh forever).
+func (l *LockInfo) Stale(now time.Time, ttl time.Duration) (bool, error) {
+	if err := l.Skew(now); err != nil {
+		return false, err
 	}
 	if now.Sub(l.Created) < ttl {
 		return false, nil
@@ -104,7 +140,7 @@ func LockDN(stateBase string) string { return model.LockRDN + "," + stateBase }
 // A lock is stale when both the server's createTimestamp (requested
 // explicitly since it is operational) and the holder's started= note are
 // at least TTL old; a createTimestamp too far in the future is an error
-// (see LockInfo.stale). It is broken by renaming
+// (see LockInfo.Stale). It is broken by renaming
 // it to a unique name first: only one host can win that modrdn. The winner
 // deletes the renamed entry, warns, and retries the add once; a loser
 // reports the lock as held. If the renamed entry turns out to be fresh
@@ -148,7 +184,7 @@ func AcquireLock(ctx context.Context, c Conn, o LockOptions) (lock *Lock, held *
 		if cur == nil {
 			continue // released between our add and our read
 		}
-		stale, err := cur.stale(o.Now(), o.TTL)
+		stale, err := cur.Stale(o.Now(), o.TTL)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -213,10 +249,10 @@ func breakStale(c Conn, cur *LockInfo, o LockOptions) (bool, error) {
 	return true, nil
 }
 
-// isStale is LockInfo.stale for the renamed entry, where a clock-skew error
+// isStale is LockInfo.Stale for the renamed entry, where a clock-skew error
 // counts as fresh: rename it back rather than delete it.
 func isStale(l *LockInfo, now time.Time, ttl time.Duration) bool {
-	s, err := l.stale(now, ttl)
+	s, err := l.Stale(now, ttl)
 	return err == nil && s
 }
 
@@ -246,7 +282,7 @@ func lockRequest(dn string, holder []string) *ldap.AddRequest {
 
 // ReadLock reads the lock entry at dn with its createTimestamp. It returns
 // nil, nil if there is no lock.
-func ReadLock(c Conn, dn string) (*LockInfo, error) {
+func ReadLock(c Searcher, dn string) (*LockInfo, error) {
 	e, err := readEntry(c, dn, "description", "createTimestamp")
 	if err != nil {
 		return nil, fmt.Errorf("reading the run lock %s: %w", dn, err)

@@ -14,9 +14,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Release binaries are built with the latest stable Go (current
+      # crypto/tls, crypto/x509, net/* fixes); go.mod's go 1.22 is only the
+      # minimum the code compiles with (checked by ci.yml's go-min job).
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable
+          check-latest: true
+      - run: go version
       - run: go test ./...
       - uses: goreleaser/goreleaser-action@v6
         with:

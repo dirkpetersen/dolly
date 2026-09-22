@@ -18,6 +18,7 @@ import (
 	"github.com/dirkpetersen/dolly/internal/ldapconn"
 	"github.com/dirkpetersen/dolly/internal/model"
 	"github.com/dirkpetersen/dolly/internal/notify"
+	"github.com/dirkpetersen/dolly/internal/target"
 )
 
 // Conn is the part of an LDAP connection check uses.
@@ -371,6 +372,7 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 		p.fail("state_base %s: %v", t.StateBase, err)
 	case ok:
 		p.ok("state_base %s exists", t.StateBase)
+		checkLock(p, conn, cfg)
 	default:
 		attr, _, _ := model.RDN(t.StateBase)
 		parent := parentDN(t.StateBase)
@@ -389,6 +391,33 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 				p.ok("state_base %s does not exist yet; the first real run creates it under %s (needs write access there; not tested, check never writes)", t.StateBase, parent)
 			}
 		}
+	}
+}
+
+// checkLock warns about a run lock held longer than lock_ttl (by the
+// server's createTimestamp) or one no run will judge (clock skew): both
+// can stop syncing without a failed run to show for it. A younger lock is
+// just reported (a run is probably active).
+func checkLock(p *printer, conn Conn, cfg *config.Config) {
+	info, err := target.ReadLock(conn, target.LockDN(cfg.Target.StateBase))
+	if err != nil {
+		p.warn("%v", err)
+		return
+	}
+	if info == nil {
+		return
+	}
+	now := time.Now()
+	ttl := cfg.Sync.LockTTL.Duration
+	switch err := info.Skew(now); {
+	case err != nil:
+		p.warn("%v", err)
+	case info.Age(now) >= ttl:
+		p.warn("a run lock has been held for %s (lock_ttl %s) by %s; if no dolly run is active, run `dolly unlock`",
+			info.Age(now), ttl, info.HolderString())
+	default:
+		p.info("a run lock is held by %s since %s (%s); a run is probably active",
+			info.HolderString(), info.Created.UTC().Format(time.RFC3339), info.Age(now))
 	}
 }
 

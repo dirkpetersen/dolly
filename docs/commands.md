@@ -61,7 +61,7 @@ See [Adopting an existing tree](operations/adopting.md) for what it does and its
 
 ## `dolly unlock`
 
-Shows the current run lock — who holds it, and its age by the server's `createTimestamp` — and removes it after confirmation.
+Shows the current run lock — who holds it, its age by the server's `createTimestamp`, the holder's `started=` time, and a clock-skew warning if either is in the future — and removes it after confirmation.
 
 ```bash
 dolly unlock          # prompts for confirmation
@@ -86,7 +86,7 @@ Each check prints one `✓` / `✗` / `!` line, and `dolly check` exits `1` if a
 
 - **Config** — loads and validates `dolly.yaml` (including the SMTP validation rules; see [Configuration](configuration.md#config-validation)), and reads every password file: it must exist and be non-empty, and one readable by group or others is a warning.
 - **AD** — connects to each DC in `source.urls` (LDAPS, or StartTLS for `ldap://`), and binds. A DC that fails while another answers is a warning, since real runs fail over the same way; none answering is a failure. After an invalid-credentials error the remaining DCs aren't tried, since every attempt counts toward the account's lockout. On the first DC that answered, it runs a one-page search of the users base and the groups base with their filters. A base with no matching entries is a failure (the guard stops every sync when AD returns zero users or zero groups) — except the users base with `--groups`, which a groups-only run never searches.
-- **Target** — TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full-read size-limit test applies, but a truncated `users_base` is a failure only without `--groups` — with it, it's a warning, since groups-only runs never read `users_base` in full. Both truncation checks print the `olcLimits` fix; see [Permissions](operations/permissions.md). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent so the first real run can create it (write access there isn't tested, since `check` never writes).
+- **Target** — TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full-read size-limit test applies, but a truncated `users_base` is a failure only without `--groups` — with it, it's a warning, since groups-only runs never read `users_base` in full. Both truncation checks print the `olcLimits` fix; see [Permissions](operations/permissions.md). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent so the first real run can create it (write access there isn't tested, since `check` never writes). A run lock held longer than `lock_ttl` (by `createTimestamp`), or one with a timestamp in the future, is a warning that suggests `dolly unlock` if no run is active.
 - **SMTP** (if `notify.smtp_host` is set) — connects, sends `EHLO`, does StartTLS if configured, and authenticates with `AUTH PLAIN` if a username is set, otherwise reports that no authentication will be used. No mail is sent unless `--send-test-mail` is given. See [Notifications](operations/notifications.md#authentication).
 
 Run this after editing the config, and whenever `dolly sync` reports connection or truncation errors.
@@ -115,7 +115,7 @@ dolly uninstall
 
 ## `dolly version`
 
-Prints the version, commit, and build date.
+Prints the version, commit, build date, and the Go version the binary was built with.
 
 ```bash
 dolly version

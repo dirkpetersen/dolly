@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -78,7 +79,7 @@ func TestVersion(t *testing.T) {
 	version, commit, date = "v1.2.3", "abc123", "2024-06-01"
 	defer func() { version, commit, date = "", "", "" }()
 	code, out, _ := runCLI("version")
-	if code != 0 || strings.TrimSpace(out) != "dolly v1.2.3 (commit abc123, built 2024-06-01)" {
+	if code != 0 || strings.TrimSpace(out) != "dolly v1.2.3 (commit abc123, built 2024-06-01, "+runtime.Version()+")" {
 		t.Errorf("version: %d %q", code, out)
 	}
 }

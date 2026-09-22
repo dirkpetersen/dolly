@@ -159,7 +159,7 @@ sync:
   max_delete_min: 25                  # ...but never abort for this many removals or fewer
   lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
   run_timeout: 45m                    # a run aborts itself after this long; must be shorter than lock_ttl
-  network_timeout: 30s                # connect and per-operation timeout
+  network_timeout: 30s                # connection setup (dial, TLS, bind) and per-operation timeout
 
 notify:
   smtp_host: mx.example.edu
@@ -233,7 +233,7 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `dolly check` | Tests the config, every domain controller, the target's containers and size limit, and SMTP, one `✓`/`✗`/`!` line each; exits `1` if any check fails. Writes nothing. `--groups` for a groups-only deployment; `--send-test-mail` also sends one test message to `notify.to`. See "Checking a config" |
 | `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units. `--users` or `--groups` and `--config FILE` are baked into the unit's `ExecStart`. See "Running it on a schedule" |
 | `dolly uninstall` | Stops and disables the timer, removes the units and the binary, and keeps the config |
-| `dolly version` | Prints the version |
+| `dolly version` | Prints the version, commit, build date, and the Go version it was built with |
 
 ### Checking a config
 
@@ -241,7 +241,7 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 
 - **Config:** loads and validates it (including the password rules), and reads every password file: it must exist and not be empty, and a file readable by group or others is a warning.
 - **AD:** connects to *each* DC in `source.urls` (LDAPS, or StartTLS for `ldap://`) and binds. A DC that fails while another answers is a warning, since runs fail over; none answering is a failure. After an invalid-credentials error the remaining DCs aren't tried, because every attempt counts toward the account's lockout. On the first DC that answered, it runs a paged search (page size 1, first page only) of the users base and the groups base with their filters, and names that DC. A base with no matching entry is a failure (the guard stops every sync when AD returns no users or no groups), except the users base with `--groups`, which groups-only runs never search.
-- **Target:** TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it (DNs only, no client size limit) must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full read tests its size limit. A truncated `users_base` read is a failure, or with `--groups` a warning, because groups-only runs never read `users_base` in full. Both print the `olcLimits` fix (see "Permissions"). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent for the first real run to create it under (write access there isn't tested, since `check` never writes).
+- **Target:** TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it (DNs only, no client size limit) must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full read tests its size limit. A truncated `users_base` read is a failure, or with `--groups` a warning, because groups-only runs never read `users_base` in full. Both print the `olcLimits` fix (see "Permissions"). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent for the first real run to create it under (write access there isn't tested, since `check` never writes). A run lock held longer than `lock_ttl` (by `createTimestamp`), or one with a timestamp in the future, is a warning suggesting `dolly unlock` if no run is active.
 - **SMTP** (if `notify.smtp_host` is set): connects, says `EHLO`, does StartTLS if configured, and authenticates with `AUTH PLAIN` if a username is set, or reports `SMTP: no authentication (username empty)`. No mail is sent unless `--send-test-mail` is given. Connects and operations are bounded by `network_timeout`, the whole check by `run_timeout`.
 
 ```text
@@ -373,9 +373,9 @@ Before reading or writing anything else, Dolly creates `state_base` if it's miss
 
 If a run crashes and leaves the lock behind:
 
-- A lock is treated as stale only when *both* its server `createTimestamp` and the holder's `started=` note are at least `lock_ttl` old by the local clock (a lock without a `started=` note is judged by `createTimestamp` alone), so one wrong clock can't break a live run's lock. If `createTimestamp` is more than 5 minutes in the local future, the clocks disagree: Dolly refuses to judge the lock, leaves it alone, and exits `1` with an error naming the skew. Keep the Dolly hosts and the LDAP server NTP-synced.
+- A lock is treated as stale only when *both* its server `createTimestamp` and the holder's `started=` note are at least `lock_ttl` old by the local clock (a lock without a `started=` note is judged by `createTimestamp` alone), so one wrong clock can't break a live run's lock. If `createTimestamp` or the `started=` note is more than 5 minutes in the local future, the clocks disagree: Dolly refuses to judge the lock, leaves it alone, records the error naming the skew in `cn=status` as a failure (so it is mailed), and exits `1`; a future `started=` would otherwise keep the lock fresh forever. Keep the Dolly hosts and the LDAP server NTP-synced.
 - The next run breaks a stale lock by first *renaming* it (`modrdn` to `cn=lock-stale-<short host>-<unix time>-<pid>`), which only one host can win, and then deleting the renamed entry and taking the lock (one retry). A host that loses the rename (the lock is gone, or the stale name already exists) treats the lock as held. If the entry it renamed turns out to be fresh (another host broke the stale lock and took a new one in between), it renames it back. Breaking a lock logs a warning and sends a notification.
-- `dolly unlock` shows who holds the lock and since when, and removes it after confirmation.
+- `dolly unlock` shows who holds the lock and since when (flagging clock skew), and removes it after confirmation. `dolly check` warns about a lock held longer than `lock_ttl` by its `createTimestamp`, or one with clock skew.
 
 ### Adopting an existing tree
 
@@ -401,6 +401,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=1h
 ExecStart=%h/.local/bin/dolly sync
 
 # ~/.config/systemd/user/dolly.timer
@@ -415,6 +416,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+`TimeoutStartSec=1h` keeps a hung run from blocking the timer forever: it is above the default `run_timeout` (45m), and `dolly install` warns if the config's `run_timeout` isn't below it. systemd stops a timed-out service with `SIGTERM` (the default `KillMode`), which Dolly handles like `run_timeout`: it stops between operations, records `cn=status`, and releases the lock.
 
 `dolly install --groups` (or `--users`) bakes the flag into the service, for example for a groups-only deployment, and `--config FILE` adds the config's absolute path (a relative path is made absolute), which also becomes the file `dolly install` creates from the template if it's missing. Without `--config` the service relies on the default lookup (`$XDG_CONFIG_HOME/dolly/dolly.yaml`), because its working directory isn't where you ran `dolly install`:
 
@@ -485,7 +488,7 @@ go build -o dolly ./cmd/dolly
 go test ./...
 ```
 
-Requires Go 1.22 or later. Built on [go-ldap/ldap](https://github.com/go-ldap/ldap).
+Requires Go 1.22 or later to build (CI checks that the code still compiles and vets with 1.22). Release binaries are built with the latest stable Go, for its current `crypto/tls` and `crypto/x509` fixes. Built on [go-ldap/ldap](https://github.com/go-ldap/ldap).
 
 ## Releasing
 
@@ -498,7 +501,7 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` then runs the tests and [GoReleaser](https://goreleaser.com), which publishes static binaries for Linux and macOS (amd64 and arm64), `checksums.txt`, and a changelog to the GitHub release. Each archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`. `dolly version` prints the tag, commit, and build date.
+`.github/workflows/release.yml` then runs the tests and [GoReleaser](https://goreleaser.com), which publishes static binaries for Linux and macOS (amd64 and arm64), `checksums.txt`, and a changelog to the GitHub release. Each archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`. The release workflow uses the latest stable Go (`actions/setup-go` with `go-version: stable`), not the 1.22 minimum from `go.mod`. `dolly version` prints the tag, commit, build date, and Go version.
 
 ## Contributing
 

@@ -9,7 +9,7 @@ go build -o dolly ./cmd/dolly
 go test ./...
 ```
 
-Requires Go 1.22 or later. Built on [go-ldap/ldap](https://github.com/go-ldap/ldap).
+Requires Go 1.22 or later to build: CI's `go-min` job builds and vets with the Go version from `go.mod` (1.22.x), while the tests, the integration tests, and release builds use the latest stable Go. Built on [go-ldap/ldap](https://github.com/go-ldap/ldap).
 
 To run a single test:
 
@@ -55,7 +55,7 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` runs the tests and then [GoReleaser](https://goreleaser.com) (configured in `.goreleaser.yaml`), which publishes static, `CGO_ENABLED=0` binaries for Linux and macOS (amd64 and arm64), `checksums.txt`, and a changelog to the GitHub release. Each archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`. `dolly version` prints the tag, commit, and build date, set at build time via `-ldflags -X main.…`.
+`.github/workflows/release.yml` runs the tests and then [GoReleaser](https://goreleaser.com) (configured in `.goreleaser.yaml`), which publishes static, `CGO_ENABLED=0` binaries for Linux and macOS (amd64 and arm64), `checksums.txt`, and a changelog to the GitHub release. Each archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`. Release binaries are built with the latest stable Go (`actions/setup-go` with `go-version: stable` and `check-latest: true`), so they carry the current standard library fixes (`crypto/tls`, `crypto/x509`, and so on); `go.mod` keeps `go 1.22` only as the minimum. `dolly version` prints the tag, commit, and build date, set at build time via `-ldflags -X main.…`, and the Go version the binary was built with.
 
 ## Building the docs locally
 

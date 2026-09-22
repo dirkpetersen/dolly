@@ -8,6 +8,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/dirkpetersen/dolly/internal/config"
 )
 
 // fakeSystemctl records calls instead of running systemctl.
@@ -105,36 +108,95 @@ func mode(t *testing.T, path string) os.FileMode {
 	return st.Mode().Perm()
 }
 
-// The units must match README "Running it on a schedule" byte for byte.
+// The units must match README "Running it on a schedule" and the docs'
+// scheduling page byte for byte.
 func TestUnitsMatchREADME(t *testing.T) {
-	readme := read(t, "../../README.md")
-	_, sec, ok := strings.Cut(readme, "## Running it on a schedule")
-	if !ok {
-		t.Fatal("README has no scheduling section")
-	}
-	_, block, ok := strings.Cut(sec, "```ini\n")
-	if !ok {
-		t.Fatal("no ini block")
-	}
-	block, _, _ = strings.Cut(block, "```")
-	units := map[string]string{}
-	var name string
-	for _, line := range strings.SplitAfter(block, "\n") {
-		if strings.HasPrefix(line, "# ~/.config/systemd/user/") {
-			name = strings.TrimSpace(strings.TrimPrefix(line, "# ~/.config/systemd/user/"))
-			continue
+	for _, doc := range []struct{ path, heading string }{
+		{"../../README.md", "## Running it on a schedule"},
+		{"../../docs/operations/scheduling.md", "## systemd user timer (default)"},
+	} {
+		text := read(t, doc.path)
+		_, sec, ok := strings.Cut(text, doc.heading)
+		if !ok {
+			t.Fatalf("%s has no scheduling section", doc.path)
 		}
-		units[name] += line
+		_, block, ok := strings.Cut(sec, "```ini\n")
+		if !ok {
+			t.Fatalf("%s: no ini block", doc.path)
+		}
+		block, _, _ = strings.Cut(block, "```")
+		units := map[string]string{}
+		var name string
+		for _, line := range strings.SplitAfter(block, "\n") {
+			if strings.HasPrefix(line, "# ~/.config/systemd/user/") {
+				name = strings.TrimSpace(strings.TrimPrefix(line, "# ~/.config/systemd/user/"))
+				continue
+			}
+			units[name] += line
+		}
+		service, timer := Units(ExecStart(false, false, ""))
+		if got := strings.TrimRight(units["dolly.service"], "\n") + "\n"; got != service {
+			t.Errorf("dolly.service differs from %s:\n%s\nvs\n%s", doc.path, service, got)
+		}
+		if got := strings.TrimRight(units["dolly.timer"], "\n") + "\n"; got != timer {
+			t.Errorf("dolly.timer differs from %s:\n%s\nvs\n%s", doc.path, timer, got)
+		}
+		if !strings.Contains(sec, "ExecStart=%h/.local/bin/dolly sync --groups") {
+			t.Errorf("%s must show the dolly install --groups ExecStart", doc.path)
+		}
 	}
-	service, timer := Units(ExecStart(false, false, ""))
-	if got := strings.TrimRight(units["dolly.service"], "\n") + "\n"; got != service {
-		t.Errorf("dolly.service differs from README:\n%s\nvs\n%s", service, got)
+	if !strings.Contains(read(t, "../../README.md"), "TimeoutStartSec") {
+		t.Error("README must explain TimeoutStartSec")
 	}
-	if got := strings.TrimRight(units["dolly.timer"], "\n") + "\n"; got != timer {
-		t.Errorf("dolly.timer differs from README:\n%s\nvs\n%s", timer, got)
+}
+
+// TimeoutStartSec in the unit must equal ServiceStartTimeout and exceed the
+// template's run_timeout.
+func TestServiceStartTimeout(t *testing.T) {
+	service, _ := Units("x")
+	if !strings.Contains(service, "TimeoutStartSec=1h\n") || ServiceStartTimeout != time.Hour {
+		t.Fatalf("service:\n%s", service)
 	}
-	if !strings.Contains(sec, "ExecStart=%h/.local/bin/dolly sync --groups") {
-		t.Error("README must show the dolly install --groups ExecStart")
+	cfg, err := config.Load("../../dolly.yaml.template")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sync.RunTimeout.Duration >= ServiceStartTimeout {
+		t.Errorf("the default run_timeout %s is not below TimeoutStartSec %s", cfg.Sync.RunTimeout.Duration, ServiceStartTimeout)
+	}
+}
+
+// A config whose run_timeout isn't below TimeoutStartSec gets a warning;
+// the template's doesn't.
+func TestInstallWarnsAboutRunTimeout(t *testing.T) {
+	template := read(t, "../../dolly.yaml.template")
+	for _, tc := range []struct {
+		name, from, to string
+		warn           bool
+	}{
+		{"template", "", "", false},
+		{"run_timeout 90m", "  run_timeout: 45m", "  run_timeout: 90m", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := template
+			if tc.from != "" {
+				if !strings.Contains(text, tc.from) {
+					t.Fatalf("template lacks %q", tc.from)
+				}
+				text = strings.Replace(text, tc.from, tc.to, 1)
+				text = strings.Replace(text, "  lock_ttl: 60m", "  lock_ttl: 2h", 1)
+			}
+			f := newFixture(t)
+			o := f.opts()
+			o.Template = []byte(text)
+			if err := Install(f.env, o); err != nil {
+				t.Fatalf("%v\n%s", err, f.out.String())
+			}
+			out := f.out.String()
+			if got := strings.Contains(out, "warning: sync.run_timeout (1h30m0s) is not below the service's TimeoutStartSec (1h0m0s)"); got != tc.warn {
+				t.Errorf("warning = %v, want %v:\n%s", got, tc.warn, out)
+			}
+		})
 	}
 }
 

@@ -16,11 +16,11 @@ If another host already holds a fresh lock when a run starts, Dolly prints one l
 
 ## `run_timeout` vs. `lock_ttl`
 
-Every run enforces a hard `sync.run_timeout`, which must be configured shorter than `sync.lock_ttl`. This ordering guarantees that a run which is still legitimately in progress never has its own lock mistaken for stale and broken out from under it. `sync.network_timeout` additionally bounds each individual connect and operation against AD and the target, so a single hung network call can't stall a run indefinitely.
+Every run enforces a hard `sync.run_timeout`, which must be configured shorter than `sync.lock_ttl`. This ordering guarantees that a run which is still legitimately in progress never has its own lock mistaken for stale and broken out from under it. `sync.network_timeout` additionally bounds each connection setup (TCP connect, StartTLS or the LDAPS handshake, and the bind, together) and each operation against AD and the target, so a single hung network call can't stall a run indefinitely.
 
 ## Stale locks
 
-If a run crashes (killed, host rebooted, and so on) and leaves the lock behind, the *next* run checks it against `sync.lock_ttl`. The lock is stale only when *both* its server `createTimestamp` and the holder's `started=` note are at least `lock_ttl` old by the local clock (a lock without a `started=` note is judged by `createTimestamp` alone), so one wrong clock can't break a live run's lock. If `createTimestamp` is more than 5 minutes in the local future, the clocks disagree: Dolly leaves the lock alone and exits `1` with an error naming the skew.
+If a run crashes (killed, host rebooted, and so on) and leaves the lock behind, the *next* run checks it against `sync.lock_ttl`. The lock is stale only when *both* its server `createTimestamp` and the holder's `started=` note are at least `lock_ttl` old by the local clock (a lock without a `started=` note is judged by `createTimestamp` alone), so one wrong clock can't break a live run's lock. If `createTimestamp` or the holder's `started=` note is more than 5 minutes in the local future, the clocks disagree: Dolly leaves the lock alone, records the error naming the skew in `cn=status` as a failure (so it's mailed like one), and exits `1`. Without that check, a `started=` in the future would keep the lock looking fresh forever, and every run would exit `0` quietly.
 
 !!! warning
     Keep the Dolly hosts and the LDAP server NTP-synced.
@@ -33,7 +33,9 @@ A stale lock is broken like this:
 
 ## `dolly unlock`
 
-For a faster recovery than waiting out `lock_ttl`, run `dolly unlock`. It shows who currently holds the lock and its age by `createTimestamp`, then removes it after you confirm. Without `--yes`, Dolly requires stdin to be a terminal and refuses (exit `1`) otherwise, rather than guess — for example, it won't act unattended under cron. `--yes` skips the prompt and works non-interactively. Use this right after you know a run has crashed and won't clean up after itself, when no run is active. See [Commands](../commands.md#dolly-unlock).
+For a faster recovery than waiting out `lock_ttl`, run `dolly unlock`. It shows who currently holds the lock, its age by `createTimestamp`, the holder's `started=` time, and any clock skew, then removes it after you confirm. Without `--yes`, Dolly requires stdin to be a terminal and refuses (exit `1`) otherwise, rather than guess — for example, it won't act unattended under cron. `--yes` skips the prompt and works non-interactively. Use this right after you know a run has crashed and won't clean up after itself, when no run is active. See [Commands](../commands.md#dolly-unlock).
+
+`dolly check` also warns about a lock held longer than `lock_ttl` (by `createTimestamp`) or one with clock skew, and suggests `dolly unlock` if no run is active.
 
 ## One Dolly per target
 

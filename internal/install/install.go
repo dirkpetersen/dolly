@@ -17,6 +17,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/dirkpetersen/dolly/internal/config"
 )
 
 // Systemctl runs `systemctl --user <args>`.
@@ -153,6 +156,16 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// ServiceStartTimeout is dolly.service's TimeoutStartSec: a oneshot
+// service that never finishes would otherwise block the timer forever.
+// It is fixed rather than derived from the config's run_timeout, so the
+// unit doesn't depend on a config that may change (or not load yet) after
+// install: 1h is above the default run_timeout (45m) and equals the default
+// lock_ttl, and install warns when the config's run_timeout isn't below it.
+// systemd stops the service with SIGTERM, which Dolly handles like
+// run_timeout (it stops, records cn=status, and releases the lock).
+const ServiceStartTimeout = time.Hour
+
 // Units returns the content of dolly.service and dolly.timer, exactly as
 // README "Running it on a schedule" shows them (with execStart after
 // ExecStart=).
@@ -163,6 +176,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=1h
 ExecStart=` + execStart + "\n"
 	timer = `[Unit]
 Description=Run Dolly every 15 minutes
@@ -272,6 +286,11 @@ func Install(env Env, o Options) error {
 		fmt.Fprintf(w, "✓ config: created %s from the template (mode 0600)\n", p.Config)
 	default:
 		fmt.Fprintf(w, "✓ config: %s exists, left unchanged (dolly install never overwrites a config)\n", p.Config)
+	}
+	// The unit's TimeoutStartSec must leave the run time to stop on its own.
+	if cfg, err := config.Load(p.Config); err == nil && cfg.Sync.RunTimeout.Duration >= ServiceStartTimeout {
+		fmt.Fprintf(w, "  warning: sync.run_timeout (%s) is not below the service's TimeoutStartSec (%s): systemd stops a long run (SIGTERM) before run_timeout does; lower run_timeout, or raise TimeoutStartSec with systemctl --user edit dolly.service\n",
+			cfg.Sync.RunTimeout.Duration, ServiceStartTimeout)
 	}
 
 	// Units. They always live under the shell's $HOME ("$HOME always

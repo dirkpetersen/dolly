@@ -89,7 +89,7 @@ sync:
   max_delete_min: 25                  # ...but never abort for this many removals or fewer
   lock_ttl: 60m                       # a run lock older than this is treated as stale and broken
   run_timeout: 45m                    # a run aborts itself after this long; must be shorter than lock_ttl
-  network_timeout: 30s                # connect and per-operation timeout
+  network_timeout: 30s                # connection setup (dial, TLS, bind) and per-operation timeout
 
 notify:
   smtp_host: mx.example.edu
@@ -227,7 +227,7 @@ Run behavior: pruning, the mass-deletion guard, and timeouts.
 | `max_delete_min` | `25` | The guard never trips for this many removals or fewer, regardless of percentage. |
 | `lock_ttl` | `60m` | A run lock whose `createTimestamp` and holder `started=` time are both older than this is treated as stale and broken. See [Run lock](how-it-works/run-lock.md). |
 | `run_timeout` | `45m` | A run aborts itself after this long. Must be shorter than `lock_ttl` so a live run's lock is never mistaken for stale. |
-| `network_timeout` | `30s` | Connect and per-operation timeout against both AD and the target. |
+| `network_timeout` | `30s` | Timeout for each connection setup (TCP connect, StartTLS or the LDAPS handshake, and the bind, together) and for each operation, against both AD and the target. |
 
 See [How it works](how-it-works/index.md#guard) for the mass-deletion guard in detail, and [Run lock](how-it-works/run-lock.md) for locking.
 

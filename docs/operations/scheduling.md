@@ -14,6 +14,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=1h
 ExecStart=%h/.local/bin/dolly sync
 
 # ~/.config/systemd/user/dolly.timer
@@ -46,6 +47,8 @@ dolly install --groups --config ~/targets/ldap-a.yaml
 systemctl --user enable --now dolly.timer
 loginctl enable-linger "$USER"   # keep the timer running while you're logged out (may need an admin)
 ```
+
+`TimeoutStartSec=1h` on the service keeps a hung run from blocking the timer forever. It is above the default `run_timeout` (45m), and `dolly install` warns if your config's `run_timeout` isn't below it. When it expires, systemd stops the service with `SIGTERM` (the default `KillMode`), which Dolly handles like `run_timeout`: it stops between operations, records the failure in `cn=status`, and releases the lock.
 
 `RandomizedDelaySec=60` on the timer spreads out runs when several hosts are on the same schedule, so they don't all fire in the same second.
 
