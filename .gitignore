@@ -49,3 +49,7 @@ site/
 
 # Password files referenced from dolly.yaml (bind_password_file, password_file)
 *.secret
+
+# Release downloads (gh release download) in the working tree
+dolly_*.tar.gz
+checksums.txt
