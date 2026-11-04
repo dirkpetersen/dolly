@@ -59,6 +59,7 @@ Commands:
   uninstall  Remove the units and binary, keep the config
   fetch-cert Print a server's TLS certificate chain and fingerprint, or write URLs and pins to the config
              URL [--out FILE]
+             --source URL... [--target URL] [--config FILE] [--yes]
   version    Print the version
 
 Every command that reads the config accepts --config FILE. Without it Dolly
