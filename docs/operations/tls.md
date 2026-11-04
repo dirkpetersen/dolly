@@ -34,7 +34,15 @@ To pin the server's own certificate, set in dolly.yaml (instead of ca_file):
   tls_fingerprint: ["sha256:3A:9F:...:C2"]
 ```
 
-`--out` writes the chain as PEM with mode `0644`. It never overwrites an existing file. `dolly fetch-cert` reads no config file.
+`--out` writes the chain as PEM with mode `0644`. It never overwrites an existing file. This form of `dolly fetch-cert` reads no config file.
+
+## Write the pins into the config
+
+With `--source URL` (once per DC) and `--target URL`, `dolly fetch-cert` writes the config instead: `--source` replaces `source.urls` with exactly the given URLs (in that order) and `source.tls_fingerprint` with their leaf fingerprints, so the two lists always match; `--target` sets `target.url`, `target.tls_fingerprint`, and `target.start_tls` (`true` for `ldap://`, which the fetch used StartTLS on, `false` for `ldaps://`). `ca_file` is removed on a side that gets pins. The config is found as usual (`--config`, `./dolly.yaml`, `$XDG_CONFIG_HOME/dolly/dolly.yaml`). Dolly shows the changes (old and new URLs, the new pins, `ca_file` and `start_tls` changes) and asks `Write these changes to <path>? [y/N]`; without a terminal it needs `--yes`. It edits the YAML in place, so comments and the other keys stay (blank lines are not kept), writes the file atomically with mode `0600` (or the stricter original mode), and validates the result, restoring the original file if it is invalid. If any fetch fails, nothing is written. It never prints passwords.
+
+```bash
+dolly fetch-cert --source ldaps://dc01.example.edu --source ldaps://dc02.example.edu --target ldap://ldap.example.edu:389
+```
 
 !!! warning "Check the fingerprint"
     A fingerprint fetched over the network is only as trustworthy as that network. Compare it with the certificate on the server itself before you use it, for example with `openssl x509 -in /path/to/cert.pem -noout -fingerprint -sha256` on that server.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -142,16 +143,25 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// fetchTimeout bounds dolly fetch-cert's connection (it reads no config,
-// so there is no network_timeout).
+// fetchTimeout bounds each dolly fetch-cert connection (the print-only
+// form reads no config, so there is no network_timeout).
 const fetchTimeout = 30 * time.Second
 
 func runFetchCert(args []string, stdout, stderr io.Writer) int {
 	fs := newFlags("fetch-cert URL", "Connect to an LDAP server (ldaps://host[:636], or ldap://host[:389] with StartTLS) without\n"+
 		"verifying it and without sending credentials, and print the certificate chain it sends: subject,\n"+
 		"issuer, validity, and SHA-256 fingerprint of each certificate, and a tls_fingerprint line for the\n"+
-		"leaf. Compare the fingerprint with the server's own certificate (another channel) before you pin it.", stderr, "")
+		"leaf. Compare the fingerprint with the server's own certificate (another channel) before you pin it.\n\n"+
+		"With --source (once per DC) and/or --target, it writes the config instead, after confirmation:\n"+
+		"--source replaces source.urls with the given URLs and source.tls_fingerprint with their leaf\n"+
+		"fingerprints; --target sets target.url, target.tls_fingerprint, and start_tls (true for ldap://).\n"+
+		"ca_file is removed on a side that gets pins. Without a terminal, --yes is required.", stderr, "")
 	out := fs.String("out", "", "also write the chain as PEM to this file (for ca_file); an existing file is never overwritten")
+	var sources stringList
+	fs.Var(&sources, "source", "write this DC and its pin to the config (replaces source.urls); repeat once per DC")
+	targetURL := fs.String("target", "", "write this URL and its pin to the config as target.url")
+	cfgPath := fs.String("config", "", "config file to write (with --source or --target)")
+	yes := fs.Bool("yes", false, "write the config without asking")
 	var rawURL string
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		rawURL, args = args[0], args[1:]
@@ -166,33 +176,19 @@ func runFetchCert(args []string, stdout, stderr io.Writer) int {
 	if rawURL == "" && len(rest) > 0 {
 		rawURL, rest = rest[0], rest[1:]
 	}
-	if rawURL == "" || len(rest) > 0 {
-		fmt.Fprintf(stderr, "Usage: dolly fetch-cert URL [--out FILE]\n")
+	pinMode := len(sources) > 0 || *targetURL != ""
+	if len(rest) > 0 || (rawURL == "") == !pinMode || (pinMode && *out != "") || (!pinMode && (*cfgPath != "" || *yes)) {
+		fmt.Fprintf(stderr, "Usage: dolly fetch-cert URL [--out FILE]\n       dolly fetch-cert [--source URL]... [--target URL] [--config FILE] [--yes]\n")
 		return exitError
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	chain, err := ldapconn.FetchChain(ctx, rawURL, fetchTimeout)
+	if pinMode {
+		return writePins(ctx, sources, *targetURL, *cfgPath, *yes, stdout, stderr)
+	}
+	chain, err := fetchAndPrint(ctx, rawURL, stdout, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "dolly fetch-cert: %s: %v\n", rawURL, err)
 		return exitError
-	}
-	if len(chain) == 0 {
-		fmt.Fprintf(stderr, "dolly fetch-cert: %s sent no certificate\n", rawURL)
-		return exitError
-	}
-	now := time.Now()
-	fmt.Fprintf(stdout, "Certificate chain sent by %s (leaf first, not verified):\n", rawURL)
-	for i, c := range chain {
-		state := ""
-		switch {
-		case now.After(c.NotAfter):
-			state = " EXPIRED"
-		case now.Before(c.NotBefore):
-			state = " NOT YET VALID"
-		}
-		fmt.Fprintf(stdout, "\n  [%d] subject: %s\n      issuer:  %s\n      valid:   %s to %s%s\n      sha256:  %s\n",
-			i, c.Subject, c.Issuer, c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339), state, ldapconn.Fingerprint(c))
 	}
 	fmt.Fprintf(stdout, "\nTo pin the server's own certificate, set in dolly.yaml (instead of ca_file):\n  tls_fingerprint: [\"%s\"]\n", ldapconn.Fingerprint(chain[0]))
 	if *out != "" {
@@ -211,4 +207,31 @@ func runFetchCert(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "Wrote %d certificates to %s (PEM; usable as ca_file).\n", len(chain), *out)
 	}
 	return exitOK
+}
+
+// fetchAndPrint fetches the chain rawURL sends (no verification, no
+// credentials) and prints each certificate.
+func fetchAndPrint(ctx context.Context, rawURL string, stdout, stderr io.Writer) ([]*x509.Certificate, error) {
+	chain, err := ldapconn.FetchChain(ctx, rawURL, fetchTimeout)
+	if err == nil && len(chain) == 0 {
+		err = errors.New("sent no certificate")
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly fetch-cert: %s: %v\n", rawURL, err)
+		return nil, err
+	}
+	now := time.Now()
+	fmt.Fprintf(stdout, "Certificate chain sent by %s (leaf first, not verified):\n", rawURL)
+	for i, c := range chain {
+		state := ""
+		switch {
+		case now.After(c.NotAfter):
+			state = " EXPIRED"
+		case now.Before(c.NotBefore):
+			state = " NOT YET VALID"
+		}
+		fmt.Fprintf(stdout, "\n  [%d] subject: %s\n      issuer:  %s\n      valid:   %s to %s%s\n      sha256:  %s\n",
+			i, c.Subject, c.Issuer, c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339), state, ldapconn.Fingerprint(c))
+	}
+	return chain, nil
 }

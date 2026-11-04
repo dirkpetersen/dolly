@@ -117,7 +117,7 @@ dolly uninstall
 
 ## `dolly fetch-cert`
 
-Shows the certificate chain a server sends, so you can set `ca_file` or `tls_fingerprint`. It reads no config.
+Shows the certificate chain a server sends, so you can set `ca_file` or `tls_fingerprint`. With a URL as argument it reads no config; with `--source`/`--target` it writes the URLs and pins into the config (see below).
 
 ```bash
 dolly fetch-cert ldaps://dc01.example.edu            # port 636
@@ -126,6 +126,12 @@ dolly fetch-cert ldaps://dc01.example.edu --out ~/.config/dolly/ad-ca.pem
 ```
 
 Dolly connects to `ldaps://host[:636]`, or to `ldap://host[:389]` with StartTLS. It does not verify the server and sends no credentials. It prints each certificate of the chain (subject, issuer, validity with expired ones flagged, SHA-256 fingerprint), then a ready-to-paste `tls_fingerprint` line for the leaf. `--out FILE` also writes the chain as PEM (mode `0644`, usable as `ca_file`). An existing file is never overwritten. See [TLS certificates](operations/tls.md).
+
+```bash
+dolly fetch-cert --source ldaps://dc01.example.edu --source ldaps://dc02.example.edu --target ldap://ldap.example.edu:389
+```
+
+With `--source URL` (once per DC) and `--target URL` it fetches each chain, shows the changes (old and new URLs, the new pins, and `ca_file` and `start_tls` changes), and after `[y/N]` (or `--yes`; without a terminal, `--yes` is required) writes them: `--source` replaces `source.urls` and `source.tls_fingerprint` with the given URLs and their leaf fingerprints, `--target` sets `target.url`, `target.tls_fingerprint`, and `start_tls` (`true` for `ldap://`), and `ca_file` is removed on that side. Comments are kept, the write is atomic with mode `0600`, and an invalid result is rolled back. Flags: `--source`, `--target`, `--config FILE`, `--yes`. A URL argument can't be combined with `--source`/`--target`, and `--out` only works with a URL argument.
 
 ## `dolly version`
 

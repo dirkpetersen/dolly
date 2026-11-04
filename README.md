@@ -312,6 +312,7 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `dolly check` | Tests the config, every domain controller, the target's containers and size limit, and SMTP, one `✓`/`✗`/`!` line each; exits `1` if any check fails. Writes nothing. `--groups` for a groups-only deployment; `--send-test-mail` also sends one test message to `notify.to`. See "Checking a config" |
 | `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units. `--users` or `--groups` and `--config FILE` are baked into the unit's `ExecStart`. See "Running it on a schedule" |
 | `dolly uninstall` | Stops and disables the timer, removes the units and the binary, and keeps the config |
+| `dolly fetch-cert [--source URL]... [--target URL] [--config FILE] [--yes]` | Fetches each chain like the form below, then writes the given URLs and their leaf pins to the config after confirmation (`--source` replaces `source.urls` and `source.tls_fingerprint`; `--target` sets `target.url`, `target.tls_fingerprint`, and `start_tls` by the scheme; `ca_file` is removed on that side). See "TLS certificates" |
 | `dolly fetch-cert URL [--out FILE]` | Connects to `ldaps://host[:636]`, or `ldap://host[:389]` with StartTLS, without verifying the server and without sending credentials, and prints each certificate of the chain the server sends (subject, issuer, validity with expired ones flagged, SHA-256 fingerprint), then a ready-to-paste `tls_fingerprint` line for the leaf. `--out FILE` also writes the chain as PEM (mode `0644`, usable as `ca_file`); an existing file is never overwritten. Reads no config. See "TLS certificates" |
 | `dolly version` | Prints the version, commit, build date, and the Go version it was built with |
 
@@ -573,6 +574,12 @@ Certificate chain sent by ldap://ldap.example.edu:389 (leaf first, not verified)
 
 To pin the server's own certificate, set in dolly.yaml (instead of ca_file):
   tls_fingerprint: ["sha256:3A:9F:...:C2"]
+```
+
+With `--source URL` (once per DC) and `--target URL`, `dolly fetch-cert` writes the config instead: `--source` replaces `source.urls` with exactly the given URLs (in that order) and `source.tls_fingerprint` with their leaf fingerprints, so the two lists always match; `--target` sets `target.url`, `target.tls_fingerprint`, and `target.start_tls` (`true` for `ldap://`, which the fetch used StartTLS on, `false` for `ldaps://`). `ca_file` is removed on a side that gets pins. The config is found as usual (`--config`, `./dolly.yaml`, `$XDG_CONFIG_HOME/dolly/dolly.yaml`). Dolly shows the changes (old and new URLs, the new pins, `ca_file` and `start_tls` changes) and asks `Write these changes to <path>? [y/N]`; without a terminal it needs `--yes`. It edits the YAML in place, so comments and the other keys stay (blank lines are not kept), writes the file atomically with mode `0600` (or the stricter original mode), and validates the result, restoring the original file if it is invalid. If any fetch fails, nothing is written. It never prints passwords.
+
+```bash
+dolly fetch-cert --source ldaps://dc01.example.edu --source ldaps://dc02.example.edu --target ldap://ldap.example.edu:389
 ```
 
 `--out` writes the chain as PEM with mode `0644` and never overwrites an existing file. A fingerprint fetched over the network is only as trustworthy as that network: compare it with the certificate on the server itself (for example `openssl x509 -in /path/to/cert.pem -noout -fingerprint -sha256` there) before you pin it.
