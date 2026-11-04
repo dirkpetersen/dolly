@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/pem"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -9,12 +12,15 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
+	"time"
 
 	dolly "github.com/dirkpetersen/dolly"
 	"github.com/dirkpetersen/dolly/internal/check"
 	"github.com/dirkpetersen/dolly/internal/config"
 	"github.com/dirkpetersen/dolly/internal/install"
+	"github.com/dirkpetersen/dolly/internal/ldapconn"
 )
 
 // checkDial opens dolly check's LDAP connections; tests replace it.
@@ -132,6 +138,77 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 	if err := install.Uninstall(env, o); err != nil {
 		fmt.Fprintf(stderr, "dolly uninstall: %v\n", err)
 		return exitError
+	}
+	return exitOK
+}
+
+// fetchTimeout bounds dolly fetch-cert's connection (it reads no config,
+// so there is no network_timeout).
+const fetchTimeout = 30 * time.Second
+
+func runFetchCert(args []string, stdout, stderr io.Writer) int {
+	fs := newFlags("fetch-cert URL", "Connect to an LDAP server (ldaps://host[:636], or ldap://host[:389] with StartTLS) without\n"+
+		"verifying it and without sending credentials, and print the certificate chain it sends: subject,\n"+
+		"issuer, validity, and SHA-256 fingerprint of each certificate, and a tls_fingerprint line for the\n"+
+		"leaf. Compare the fingerprint with the server's own certificate (another channel) before you pin it.", stderr, "")
+	out := fs.String("out", "", "also write the chain as PEM to this file (for ca_file); an existing file is never overwritten")
+	var rawURL string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		rawURL, args = args[0], args[1:]
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitError
+	}
+	rest := fs.Args()
+	if rawURL == "" && len(rest) > 0 {
+		rawURL, rest = rest[0], rest[1:]
+	}
+	if rawURL == "" || len(rest) > 0 {
+		fmt.Fprintf(stderr, "Usage: dolly fetch-cert URL [--out FILE]\n")
+		return exitError
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	chain, err := ldapconn.FetchChain(ctx, rawURL, fetchTimeout)
+	if err != nil {
+		fmt.Fprintf(stderr, "dolly fetch-cert: %s: %v\n", rawURL, err)
+		return exitError
+	}
+	if len(chain) == 0 {
+		fmt.Fprintf(stderr, "dolly fetch-cert: %s sent no certificate\n", rawURL)
+		return exitError
+	}
+	now := time.Now()
+	fmt.Fprintf(stdout, "Certificate chain sent by %s (leaf first, not verified):\n", rawURL)
+	for i, c := range chain {
+		state := ""
+		switch {
+		case now.After(c.NotAfter):
+			state = " EXPIRED"
+		case now.Before(c.NotBefore):
+			state = " NOT YET VALID"
+		}
+		fmt.Fprintf(stdout, "\n  [%d] subject: %s\n      issuer:  %s\n      valid:   %s to %s%s\n      sha256:  %s\n",
+			i, c.Subject, c.Issuer, c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339), state, ldapconn.Fingerprint(c))
+	}
+	fmt.Fprintf(stdout, "\nTo pin the server's own certificate, set in dolly.yaml (instead of ca_file):\n  tls_fingerprint: [\"%s\"]\n", ldapconn.Fingerprint(chain[0]))
+	if *out != "" {
+		f, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			fmt.Fprintf(stderr, "dolly fetch-cert: %v (an existing file is never overwritten)\n", err)
+			return exitError
+		}
+		for _, c := range chain {
+			err = errors.Join(err, pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: c.Raw}))
+		}
+		if err = errors.Join(err, f.Close()); err != nil {
+			fmt.Fprintf(stderr, "dolly fetch-cert: writing %s: %v\n", *out, err)
+			return exitError
+		}
+		fmt.Fprintf(stdout, "Wrote %d certificates to %s (PEM; usable as ca_file).\n", len(chain), *out)
 	}
 	return exitOK
 }

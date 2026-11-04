@@ -32,7 +32,8 @@ source:
     - ldaps://dc01.example.edu:636
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
-  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
+  # tls_fingerprint: ["sha256:AB:CD:..."]   # instead of ca_file: pin each DC's certificate (dolly fetch-cert URL)
+  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # or a UPN (svc-dolly@example.edu), or a bare name (svc-dolly: the domain comes from the base's DC= parts; EXAMPLE\svc-dolly stays as it is)
   bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
@@ -47,14 +48,18 @@ target:
   url: ldap://ldap.example.edu:389
   start_tls: true
   ca_file: ldap-ca.pem                # optional, see "TLS certificates"
+  # tls_fingerprint: ["sha256:AB:CD:..."]   # instead of ca_file: pin the server's certificate (dolly fetch-cert URL)
   bind_dn: cn=admin,dc=local
   bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ldap.secret
-  users_base: ou=people,dc=local
+  users_base: ou=people,dc=local      # users_base and groups_base are created (ou= only) if missing
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
   empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
+# mapping and sync: leave a section (or mapping.users / mapping.groups) out to
+# use the values below. In a present sync section only lock_ttl, run_timeout, and
+# network_timeout default; other missing sync keys are zero (as before).
 mapping:
   users:
     rdn: uid
@@ -69,6 +74,9 @@ mapping:
       homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
       loginShell: '{{ or .loginShell "/bin/bash" }}'
       gecos: gecos
+    # gid_from_upg:                   # take gidNumber from the user's private group in AD, see "gidNumber from the user private group"
+    #   group_name: 'u-{{ .uid }}'    # Go template; matched case-insensitively against AD group names
+    #   when: missing                 # missing: only if the AD user has no valid gidNumber; always: the group wins whenever it exists
   groups:
     rdn: cn
     object_classes: [groupOfNames, posixGroup]   # RFC 2307 servers (structural posixGroup): [posixGroup] only
@@ -104,6 +112,27 @@ notify:
   on: failure                         # failure | changes | always
   remind_every: 24h                   # while a failure persists, remind at most this often
 ```
+
+## Defaults for `mapping` and `sync`
+
+A config may leave out the whole `sync` section or the whole `mapping` section. Dolly then uses the values in the full example above (they come from the built-in `dolly.yaml.template`).
+
+- In a `sync` section that is present, only `lock_ttl`, `run_timeout`, and `network_timeout` get their defaults when missing (they used to be required, so this changes no existing config). Every other missing key keeps its zero value, as before: `prune_users: false`, `prune_after_days: 0`, `disabled_shell: ""` (the shell is left alone), `max_delete_percent: 0`, `max_delete_min: 0`.
+- For `mapping`, only a whole missing subsection gets its default. Without `mapping.users`, the default user mapping applies. Without `mapping.groups`, the default group mapping applies.
+- Keys inside a `mapping.users` or `mapping.groups` that is present never get defaults. A mapping is always exactly what is written.
+- The default group mapping lists `member`, so it needs `target.empty_group_member`.
+
+## AD bind name
+
+`source.bind_dn` can be one of three forms:
+
+- a DN: `CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu`
+- a UPN: `svc-dolly@example.edu`
+- a bare account name: `svc-dolly` (no `=`, `@`, or `\`)
+
+A down-level name such as `EXAMPLE\svc-dolly` is passed to AD unchanged.
+
+Dolly turns a bare name into the UPN `<name>@<domain>`. The domain comes from the `DC=` parts of `source.users.base`, or of `source.groups.base` if the users base has none. For example, with `DC=ad,DC=example,DC=edu`, the name `svc-dolly` binds as `svc-dolly@ad.example.edu`. `dolly check` and the progress lines of a run show the UPN. If neither base has `DC=` parts, a bare name is a config error.
 
 ## Passwords
 
@@ -144,6 +173,9 @@ Dolly validates `dolly.yaml` before connecting to anything:
 - An empty `notify.smtp_host` disables notifications.
 - SMTP without authentication is allowed: with `notify.username`, `notify.password`, and `notify.password_file` all empty, Dolly never sends `AUTH` (plain relay, with or without `notify.start_tls`). A username without a password, or a password without a username, is a config error. A username also requires TLS, since `AUTH` is never sent over an unencrypted connection: `notify.start_tls: true`, or `notify.smtp_port: 465` (implicit TLS, where `notify.start_tls` must be `false`). `notify.from` and each `notify.to` entry must be valid mail addresses.
 - `source.page_size` defaults to `500` if omitted.
+- `mapping.users.gid_from_upg.group_name` must be a Go template, and `when` must be `missing` or `always` (default `missing`). With `gid_from_upg`, `mapping.users.required` may leave out the source of `gidNumber`. See [gidNumber from the user private group](operations/gid-from-upg.md).
+- `source.bind_dn` as a bare account name needs `DC=` parts in `source.users.base` or `source.groups.base`.
+- Each `tls_fingerprint` entry must be a SHA-256 fingerprint: 64 hex digits, with or without a `sha256:` prefix and colons, in any case. `ca_file` and `tls_fingerprint` can't both be set on the same side. On the target, `ca_file` or `tls_fingerprint` with a plaintext `ldap://` URL and `start_tls: false` is a config error, because no TLS would be used and the setting would be silently ignored. (The source always uses TLS.) See [TLS certificates](operations/tls.md).
 - Listing `member` in `mapping.groups.membership` requires `target.empty_group_member` to be set.
 - `target.users_base` and `target.groups_base` must differ, since Dolly tells users from groups by their container.
 - `state_base` may live inside `groups_base` or `users_base` (for example `ou=dolly,ou=group,dc=local`), and Dolly ignores that subtree when it reads users and groups. It must not equal either base, and neither base may live inside `state_base`.
@@ -155,8 +187,9 @@ Connection and search settings for Active Directory. Dolly only ever reads from 
 | Key | Default / example | Meaning |
 |---|---|---|
 | `urls` | `[ldaps://dc01.example.edu:636, ldaps://dc02.example.edu:636]` | Domain controllers, tried in random order each run to spread the load: a connect or bind failure moves on to the next one (invalid credentials don't, to spare the account's lockout counter). An `ldap://` URL is always upgraded with StartTLS. |
-| `ca_file` | `ad-ca.pem` (optional) | CA certificate to trust for AD's TLS chain. See [TLS certificates](operations/tls.md). |
-| `bind_dn` | `CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu` | The AD service account to bind as. A UPN such as `svc-dolly@example.edu` also works. |
+| `ca_file` | `ad-ca.pem` (optional) | CA certificate to trust for AD's TLS chain. See [TLS certificates](operations/tls.md). Not with `tls_fingerprint`. |
+| `tls_fingerprint` | `["sha256:AB:CD:..."]` (optional) | Pin the leaf certificate of each DC by SHA-256 fingerprint. One entry per DC. CA, expiry, and host name are then not checked. Not with `ca_file`. Get the value with `dolly fetch-cert`. See [TLS certificates](operations/tls.md). |
+| `bind_dn` | `CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu` | The AD service account to bind as. A DN, a UPN such as `svc-dolly@example.edu`, or a bare account name such as `svc-dolly`. See [AD bind name](#ad-bind-name). |
 | `bind_password` | `""` | Inline bind password. Set only one of `bind_password` / `bind_password_file`. See [Passwords](#passwords). |
 | `bind_password_file` | `ad.secret` | Path to a file holding the bind password. Resolved against the config file's directory if relative. |
 | `users.base` | `OU=People,DC=example,DC=edu` | Search base for users. |
@@ -173,12 +206,13 @@ Connection settings and base DNs for the target LDAP server. Dolly reads and wri
 |---|---|---|
 | `url` | `ldap://ldap.example.edu:389` | The target server. |
 | `start_tls` | `true` | Upgrade the connection with StartTLS. |
-| `ca_file` | `ldap-ca.pem` (optional) | CA certificate to trust for the target's TLS chain. |
+| `ca_file` | `ldap-ca.pem` (optional) | CA certificate to trust for the target's TLS chain. Not with `tls_fingerprint`. |
+| `tls_fingerprint` | `["sha256:AB:CD:..."]` (optional) | Pin the target server's leaf certificate by SHA-256 fingerprint. CA, expiry, and host name are then not checked. Not with `ca_file`. See [TLS certificates](operations/tls.md). |
 | `bind_dn` | `cn=admin,dc=local` | The bind DN used to read and write the target. See [Permissions](operations/permissions.md) for the access it needs. |
 | `bind_password` | `""` | Inline bind password. Set only one of `bind_password` / `bind_password_file`. See [Passwords](#passwords). |
 | `bind_password_file` | `ldap.secret` | Path to a file holding the bind password. |
-| `users_base` | `ou=people,dc=local` | Where user entries live. Dolly never creates this container. |
-| `groups_base` | `ou=group,dc=local` | Where group entries live. Dolly never creates this container. |
+| `users_base` | `ou=people,dc=local` | Where user entries live. A real run creates it if it is missing, but only with an `ou=` RDN, and its parent must exist. See [Ownership](how-it-works/ownership.md). |
+| `groups_base` | `ou=group,dc=local` | Where group entries live. A real run creates it if it is missing, with the same rules as `users_base`. |
 | `state_base` | `ou=dolly,dc=local` | Where Dolly's ownership records, run lock, and status entry live. Dolly creates this container and its children if missing. See [Ownership](how-it-works/ownership.md). |
 | `empty_group_member` | `cn=empty,dc=local` | Placeholder member DN used so a `groupOfNames` group never has zero members. Only used when `member` is in `mapping.groups.membership`; unused with `memberUid` only. See [Group schema](#group-schema-rfc2307bis-or-rfc-2307). |
 
@@ -201,6 +235,8 @@ How AD attributes become target entries. Attribute values are plain AD attribute
 | `attributes.homeDirectory` | `` `{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}` `` | Falls back to `/home/<uid>` when `unixHomeDirectory` is unset. |
 | `attributes.loginShell` | `` `{{ or .loginShell "/bin/bash" }}` `` | Falls back to `/bin/bash`. |
 | `attributes.gecos` | `gecos` | Transliterated to ASCII on write; see [Ownership](how-it-works/ownership.md). |
+| `gid_from_upg.group_name` | `u-{{ .uid }}` (optional) | Go template for the name of the user's private group in AD. Dolly takes `gidNumber` from that group. See [gidNumber from the user private group](operations/gid-from-upg.md). |
+| `gid_from_upg.when` | `missing` | `missing`: use the group only if the AD user has no valid `gidNumber`. `always`: the group wins whenever it exists. |
 
 ### `mapping.groups`
 

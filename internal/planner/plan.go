@@ -124,6 +124,7 @@ type Counts struct {
 	RecordsAdded, RecordsUpdated, RecordsDeleted           int
 	UnresolvedMembers, SkippedMembers, IgnoredEntries      int
 	FilteredMembers                                        int // members in AD that match neither search filter
+	GIDFromUPG                                             int // users whose gidNumber comes from their UPG group (gid_from_upg)
 	ADUsers, ADGroups, TargetUsers, TargetGroups, Followed int
 }
 

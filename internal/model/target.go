@@ -14,6 +14,10 @@ type TargetSnapshot struct {
 	Groups []*Entry
 	// HasStateBase and friends report which of Dolly's containers exist.
 	HasStateBase, HasUserRecords, HasGroupRecords bool
+	// MissingUsersBase and MissingGroupsBase report a base the read found
+	// missing (a real run creates them before reading, so only a dry run
+	// sees them; the plan shows their creation).
+	MissingUsersBase, MissingGroupsBase bool
 	// UsersRead is true when Users holds every entry under users_base. A
 	// groups-only run doesn't read users_base (it may be large and
 	// size-limited); it looks up the uids it needs instead (ExistingUsers).

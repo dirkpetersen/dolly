@@ -193,7 +193,7 @@ func checkAD(ctx context.Context, p *printer, cfg *config.Config, o Options) {
 	for i, u := range cfg.Source.URLs {
 		start := time.Now()
 		c, err := o.Dial(ctx, ldapconn.Options{
-			URL: u, StartTLS: ldapconn.Scheme(u) == "ldap", CAFile: cfg.Source.CAFile,
+			URL: u, StartTLS: ldapconn.Scheme(u) == "ldap", CAFile: cfg.Source.CAFile, Pins: cfg.Source.TLSFingerprint,
 			Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: cfg.Source.BindDN, Password: pw,
 		})
 		if err != nil {
@@ -272,7 +272,7 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 	}
 	start := time.Now()
 	conn, err := o.Dial(ctx, ldapconn.Options{
-		URL: t.URL, StartTLS: t.StartTLS, CAFile: t.CAFile,
+		URL: t.URL, StartTLS: t.StartTLS, CAFile: t.CAFile, Pins: t.TLSFingerprint,
 		Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: t.BindDN, Password: pw,
 	})
 	if err != nil {
@@ -309,6 +309,27 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 		}
 		return n, false, err
 	}
+	// missingBase reports a missing base the first real run creates, if it
+	// can: the right RDN, and an existing parent.
+	missingBase := func(name, dn string, allowCN bool) {
+		parent := parentDN(dn)
+		if _, err := model.ContainerClass(name, dn, allowCN); err != nil {
+			p.fail("%v", err)
+			return
+		}
+		if parent == "" {
+			p.fail("%s %s does not exist and has no parent to create it under", name, dn)
+			return
+		}
+		switch pok, err := exists(parent); {
+		case err != nil:
+			p.fail("%s parent %s: %v", name, parent, err)
+		case !pok && !isBaseDN(cfg, parent):
+			p.fail("%s %s does not exist, and neither does its parent %s", name, dn, parent)
+		default:
+			p.ok("%s %s does not exist (or target.bind_dn cannot see it); the first real run creates it under %s (needs write access there; not tested, check never writes)", name, dn, parent)
+		}
+	}
 	advice := fmt.Sprintf("bind as the rootdn, or raise the limit for Dolly's DN on the database entry: olcLimits: dn.exact=%q size=unlimited time=unlimited (README \"Permissions\")", t.BindDN)
 
 	// groups_base: read in full by every run.
@@ -316,7 +337,7 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 	case err != nil:
 		p.fail("groups_base %s: %v", t.GroupsBase, err)
 	case !ok:
-		p.fail("groups_base %s does not exist; create it (Dolly never creates groups_base)", t.GroupsBase)
+		missingBase("groups_base", t.GroupsBase, false)
 	default:
 		switch n, limited, err := sizeCheck(t.GroupsBase); {
 		case err != nil:
@@ -334,7 +355,7 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 	case err != nil:
 		p.fail("users_base %s: %v", t.UsersBase, err)
 	case !ok:
-		p.fail("users_base %s does not exist; create it (Dolly never creates users_base)", t.UsersBase)
+		missingBase("users_base", t.UsersBase, false)
 	default:
 		res, err := conn.Search(ldap.NewSearchRequest(t.UsersBase, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 1, 0, false, "(uid=*)", []string{"uid"}, nil))
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) && res != nil && len(res.Entries) > 0 {
@@ -374,23 +395,7 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 		p.ok("state_base %s exists", t.StateBase)
 		checkLock(p, conn, cfg)
 	default:
-		attr, _, _ := model.RDN(t.StateBase)
-		parent := parentDN(t.StateBase)
-		switch a := strings.ToLower(attr); {
-		case a != "ou" && a != "cn":
-			p.fail("state_base %s does not exist, and Dolly creates it only with an ou= or cn= RDN; create it by hand", t.StateBase)
-		case parent == "":
-			p.fail("state_base %s does not exist and has no parent to create it under", t.StateBase)
-		default:
-			switch pok, err := exists(parent); {
-			case err != nil:
-				p.fail("state_base parent %s: %v", parent, err)
-			case !pok:
-				p.fail("state_base %s does not exist, and neither does its parent %s", t.StateBase, parent)
-			default:
-				p.ok("state_base %s does not exist yet; the first real run creates it under %s (needs write access there; not tested, check never writes)", t.StateBase, parent)
-			}
-		}
+		missingBase("state_base", t.StateBase, true)
 	}
 }
 
@@ -419,6 +424,12 @@ func checkLock(p *printer, conn Conn, cfg *config.Config) {
 		p.info("a run lock is held by %s since %s (%s); a run is probably active",
 			info.HolderString(), info.Created.UTC().Format(time.RFC3339), info.Age(now))
 	}
+}
+
+// isBaseDN reports whether dn is users_base or groups_base, which a real
+// run creates before anything inside it.
+func isBaseDN(cfg *config.Config, dn string) bool {
+	return model.DNEqual(dn, cfg.Target.UsersBase) || model.DNEqual(dn, cfg.Target.GroupsBase)
 }
 
 func parentDN(dn string) string {

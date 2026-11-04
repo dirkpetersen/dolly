@@ -102,7 +102,8 @@ func (p *planner) deps(op *Op) {
 		needs = append(needs, entryKey(parentDN(op.DN)), self)
 		provides = append(provides, self)
 	case AddEntry:
-		needs = append(needs, self)
+		// The parent: a base the plan creates in the same run.
+		needs = append(needs, entryKey(parentDN(op.DN)), self)
 		provides = append(provides, self)
 	case ModRDN:
 		needs = append(needs, self, entryKey(op.NewRDN+","+parentDN(op.DN)))

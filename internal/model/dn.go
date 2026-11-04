@@ -130,3 +130,32 @@ func IsUnder(dn, base string) bool {
 	}
 	return d.EqualFold(b) || b.AncestorOfFold(d)
 }
+
+// DNDepth returns the number of RDNs in dn (0 if it doesn't parse).
+func DNDepth(dn string) int {
+	d, err := ldap.ParseDN(dn)
+	if err != nil {
+		return 0
+	}
+	return len(d.RDNs)
+}
+
+// ContainerClass returns the object class Dolly creates a missing base
+// with: organizationalUnit for an ou= RDN and, if allowCN (state_base
+// only), organizationalRole for cn=. Any other RDN is an error naming the
+// base (name), which must then be created by hand.
+func ContainerClass(name, dn string, allowCN bool) (string, error) {
+	attr, _, err := RDN(dn)
+	if err != nil {
+		return "", err
+	}
+	switch a := strings.ToLower(attr); {
+	case a == "ou":
+		return "organizationalUnit", nil
+	case a == "cn" && allowCN:
+		return "organizationalRole", nil
+	case allowCN:
+		return "", fmt.Errorf("%s %s is missing, and Dolly creates it only with an ou= or cn= RDN; create it by hand", name, dn)
+	}
+	return "", fmt.Errorf("%s %s is missing, and Dolly creates it only with an ou= RDN; create it by hand", name, dn)
+}

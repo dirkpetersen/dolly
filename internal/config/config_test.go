@@ -99,6 +99,12 @@ func TestValidationErrors(t *testing.T) {
 		{"bad from", []string{`from: "Dolly <dolly-noreply@example.edu>"`, `from: "not an address"`}, "notify.from:"},
 		{"bad to", []string{`to: [ldap-admins@example.edu]`, `to: [ldap-admins]`}, "notify.to[0]:"},
 		{"create_only unmapped", []string{"create_only: [loginShell, homeDirectory]", "create_only: [loginShell, mail]"}, `"mail" is not in mapping.users.attributes`},
+		{"pin with ca_file", []string{"ca_file: ldap-ca.pem ", `ca_file: ldap-ca.pem
+  tls_fingerprint: ["` + strings.Repeat("ab", 32) + `"] `}, "target.ca_file and target.tls_fingerprint are both set"},
+		{"TLS settings on a plaintext target", []string{"  start_tls: true\n  ca_file: ldap-ca.pem", "  start_tls: false\n  ca_file: ldap-ca.pem"}, "target.url is plaintext ldap:// with start_tls: false"},
+		{"bad pin", []string{"ca_file: ad-ca.pem ", `tls_fingerprint: [sha256:AB:CD] `}, "source.tls_fingerprint[0]:"},
+		{"bare name without DC", []string{"CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu", "svc-dolly",
+			"base: OU=People,DC=example,DC=edu", "base: OU=People,O=example", "base: OU=Groups,DC=example,DC=edu", "base: OU=Groups,O=example"}, `"svc-dolly" is a bare account name`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Parse(edit(t, tc.edits...), "/x/dolly.yaml")
@@ -300,5 +306,74 @@ func TestSMTPAuthRules(t *testing.T) {
 	_, err := Parse(edit(t, notifyAuth, "start_tls: false\n  username: dolly\n  password_file: smtp.secret", "smtp_port: 25", "smtp_port: 465"), "/x/dolly.yaml")
 	if err != nil {
 		t.Errorf("port 465 with AUTH: %v", err)
+	}
+}
+
+func TestPinsAndBareBindName(t *testing.T) {
+	pin := "sha256:" + strings.TrimSuffix(strings.Repeat("ab:", 32), ":")
+	c, err := Parse(edit(t,
+		"ca_file: ad-ca.pem ", "tls_fingerprint: ["+pin+", "+strings.Repeat("CD", 32)+"] ",
+		"CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu", "svc-dolly",
+		"base: OU=People,DC=example,DC=edu", "base: OU=People,DC=ad,DC=example,DC=edu"), "/x/dolly.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Source.TLSFingerprint) != 2 || c.Source.CAFile != "" {
+		t.Errorf("source TLS: %+v", c.Source)
+	}
+	if c.Source.BindDN != "svc-dolly@ad.example.edu" {
+		t.Errorf("bind_dn = %q", c.Source.BindDN)
+	}
+	// A down-level name is left as it is.
+	c, err = Parse(edit(t, "CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu", `'EXAMPLE\svc-dolly'`), "/x/dolly.yaml")
+	if err != nil || c.Source.BindDN != `EXAMPLE\svc-dolly` {
+		t.Errorf("down-level name: %q %v", c.Source.BindDN, err)
+	}
+	// No DC= in the users base: the groups base gives the domain.
+	c, err = Parse(edit(t, "CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu", "svc", "base: OU=People,DC=example,DC=edu", "base: OU=People,O=x"), "/x/dolly.yaml")
+	if err != nil || c.Source.BindDN != "svc@example.edu" {
+		t.Errorf("fallback: %v %v", c, err)
+	}
+}
+
+// Without mapping or sync sections the template's defaults apply; a
+// present sync section defaults its missing keys, and a present mapping
+// subsection is taken as written.
+func TestDefaultMappingAndSync(t *testing.T) {
+	s := string(dolly.ConfigTemplate)
+	head := s[:strings.Index(s, "\nmapping:")]
+	tail := s[strings.Index(s, "\nnotify:"):]
+	c, err := Parse([]byte(head+tail), "/x/dolly.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := Parse(dolly.ConfigTemplate, "/x/dolly.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Sync != tmpl.Sync || c.Mapping.Users.RDN != "uid" || len(c.Mapping.Users.Attributes) != len(tmpl.Mapping.Users.Attributes) ||
+		!c.Mapping.Groups.HasMember() || !c.Mapping.Groups.FlattenNested {
+		t.Errorf("defaults: %+v %+v", c.Sync, c.Mapping)
+	}
+
+	c, err = Parse([]byte(head+"\nsync:\n  prune_users: true\n  lock_ttl: 2h\nmapping:\n  groups:\n    rdn: cn\n    object_classes: [posixGroup]\n"+
+		"    required: [name, gidNumber]\n    attributes: {cn: name, gidNumber: gidNumber}\n    membership: [{attribute: memberUid}]\n"+tail), "/x/dolly.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only lock_ttl, run_timeout, and network_timeout default in a present
+	// section; the rest keep their zero value, as before defaults existed.
+	if !c.Sync.PruneUsers || c.Sync.LockTTL.Duration != 2*time.Hour || c.Sync.RunTimeout != tmpl.Sync.RunTimeout ||
+		c.Sync.NetworkTimeout != tmpl.Sync.NetworkTimeout || c.Sync.DisabledShell != "" || c.Sync.PruneAfterDays != 0 ||
+		c.Sync.MaxDeleteMin != 0 || c.Sync.MaxDeletePercent != 0 {
+		t.Errorf("partial sync: %+v", c.Sync)
+	}
+	if c.Mapping.Groups.HasMember() || c.Mapping.Groups.FlattenNested || c.Mapping.Users.RDN != "uid" {
+		t.Errorf("partial mapping: %+v", c.Mapping)
+	}
+
+	// A present subsection is not filled in key by key.
+	if _, err := Parse([]byte(head+"\nmapping:\n  users:\n    rdn: uid\n"+tail), "/x/dolly.yaml"); err == nil || !strings.Contains(err.Error(), "mapping.users.attributes") {
+		t.Errorf("partial users mapping: %v", err)
 	}
 }

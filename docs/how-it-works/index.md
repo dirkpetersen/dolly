@@ -4,7 +4,7 @@ Every `dolly sync` run follows the same six steps, in order. There's no incremen
 
 ## 1. Lock
 
-Dolly creates `state_base` first if it's missing, then takes the run lock in the target LDAP, at `cn=lock,<state_base>`. If another host already holds it, Dolly exits quietly with code `0` — no error, no mail. `--dry-run` takes no lock at all. See [Run lock](run-lock.md) for how the lock works and how stale locks are broken.
+Dolly creates any missing `users_base`, `groups_base`, and `state_base` first (parents first; see [Ownership records](ownership.md)), then takes the run lock in the target LDAP, at `cn=lock,<state_base>`. If another host already holds it, Dolly exits quietly with code `0` — no error, no mail. `--dry-run` takes no lock at all. See [Run lock](run-lock.md) for how the lock works and how stale locks are broken.
 
 ## 2. Bleat
 

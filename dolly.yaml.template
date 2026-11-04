@@ -8,7 +8,8 @@ source:
     - ldaps://dc01.example.edu:636
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
-  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
+  # tls_fingerprint: ["sha256:AB:CD:..."]   # instead of ca_file: pin each DC's certificate (dolly fetch-cert URL)
+  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # or a UPN (svc-dolly@example.edu), or a bare name (svc-dolly: the domain comes from the base's DC= parts; EXAMPLE\svc-dolly stays as it is)
   bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
@@ -23,14 +24,18 @@ target:
   url: ldap://ldap.example.edu:389
   start_tls: true
   ca_file: ldap-ca.pem                # optional, see "TLS certificates"
+  # tls_fingerprint: ["sha256:AB:CD:..."]   # instead of ca_file: pin the server's certificate (dolly fetch-cert URL)
   bind_dn: cn=admin,dc=local
   bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ldap.secret
-  users_base: ou=people,dc=local
+  users_base: ou=people,dc=local      # users_base and groups_base are created (ou= only) if missing
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
   empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
+# mapping and sync: leave a section (or mapping.users / mapping.groups) out to
+# use the values below. In a present sync section only lock_ttl, run_timeout, and
+# network_timeout default; other missing sync keys are zero (as before).
 mapping:
   users:
     rdn: uid
@@ -45,6 +50,9 @@ mapping:
       homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
       loginShell: '{{ or .loginShell "/bin/bash" }}'
       gecos: gecos
+    # gid_from_upg:                   # take gidNumber from the user's private group in AD, see "gidNumber from the user private group"
+    #   group_name: 'u-{{ .uid }}'    # Go template; matched case-insensitively against AD group names
+    #   when: missing                 # missing: only if the AD user has no valid gidNumber; always: the group wins whenever it exists
   groups:
     rdn: cn
     object_classes: [groupOfNames, posixGroup]   # RFC 2307 servers (structural posixGroup): [posixGroup] only

@@ -8,7 +8,7 @@ A regular, read-only service account is enough for `source.bind_dn`. Dolly never
 
 The `target.bind_dn` needs:
 
-- **Write access** to `users_base`, `groups_base`, and `state_base`, and ideally nothing else. A groups-only deployment (`dolly sync --groups` only) never writes to `users_base`, so read access is enough there.
+- **Write access** to `users_base`, `groups_base`, and `state_base` (and, for Dolly to create a missing base, to add entries under its parent), and ideally nothing else. A groups-only deployment (`dolly sync --groups` only) never writes entries under `users_base`, so read access to it is enough there; but if `users_base` is missing, the first run creates it, which needs add access on its parent.
 - **Read access to every entry** under `groups_base` and `state_base`, and under `users_base` for runs that sync users — not a filtered or size-limited view. A `--groups` run never reads all of `users_base`: it looks up only the uids it needs, 50 per search, so a `users_base` larger than the size limit is fine for it.
 
 ## `olcSizeLimit` and `olcLimits`

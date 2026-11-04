@@ -204,7 +204,7 @@ func TestCheck(t *testing.T) {
 		"✓ groups_base ou=group,dc=local exists; all 1 entries readable",
 		"✓ users_base ou=people,dc=local: readable (uid lookup found uid=",
 		"✓ users_base ou=people,dc=local: all 3 entries readable in one search",
-		"✓ state_base ou=dolly,dc=local does not exist yet; the first real run creates it under dc=local",
+		"✓ state_base ou=dolly,dc=local does not exist (or target.bind_dn cannot see it); the first real run creates it under dc=local",
 		"✓ connected to 127.0.0.1:",
 		"✓ STARTTLS (certificate verified for 127.0.0.1)",
 		"✓ SMTP: no authentication (username empty)",
@@ -288,13 +288,33 @@ func TestCheck(t *testing.T) {
 			})
 		}
 	})
-	t.Run("missing groups_base", func(t *testing.T) {
+	t.Run("bare account name and pins", func(t *testing.T) {
+		pin := "sha256:" + strings.TrimSuffix(strings.Repeat("AB:", 32), ":")
+		dialed := withCheckDial(t, map[string]*ldapfake.Dir{"ldaps://dc01.example.edu:636": adFake(), "ldap://ldap.example.edu:389": targetFake()})
+		code, out, _ := runCLI("check", "--config", testConfig(t, nil,
+			"CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu", "svc-dolly",
+			"ca_file: ad-ca.pem", "tls_fingerprint: ["+pin+"]"))
+		if !strings.Contains(out, "✓ ldaps://dc01.example.edu:636: LDAPS and bind as svc-dolly@example.edu (") {
+			t.Errorf("exit %d\n%s", code, out)
+		}
+		if o := (*dialed)[0]; o.BindDN != "svc-dolly@example.edu" || len(o.Pins) != 1 || o.CAFile != "" {
+			t.Errorf("dial options %+v", o)
+		}
+	})
+	t.Run("missing bases", func(t *testing.T) {
 		tgt := ldapfake.New()
 		tgt.Put("dc=local", map[string][]string{"objectClass": {"domain"}}, time.Now())
 		withCheckDial(t, map[string]*ldapfake.Dir{"ldaps://dc01.example.edu:636": adFake(), "ldap://ldap.example.edu:389": tgt})
 		code, out, _ := runCLI("check", "--config", testConfig(t, nil))
-		if code != 1 || !strings.Contains(out, "✗ groups_base ou=group,dc=local does not exist") || !strings.Contains(out, "✗ users_base ou=people,dc=local does not exist") {
+		if code != 0 || !strings.Contains(out, "✓ groups_base ou=group,dc=local does not exist (or target.bind_dn cannot see it); the first real run creates it under dc=local") ||
+			!strings.Contains(out, "✓ users_base ou=people,dc=local does not exist (or target.bind_dn cannot see it); the first real run creates it") {
 			t.Errorf("exit %d\n%s", code, out)
+		}
+		// No parent: a failure.
+		withCheckDial(t, map[string]*ldapfake.Dir{"ldaps://dc01.example.edu:636": adFake(), "ldap://ldap.example.edu:389": ldapfake.New()})
+		code, out, _ = runCLI("check", "--config", testConfig(t, nil))
+		if code != 1 || !strings.Contains(out, "✗ groups_base ou=group,dc=local does not exist, and neither does its parent dc=local") {
+			t.Errorf("no parent: exit %d\n%s", code, out)
 		}
 	})
 	t.Run("invalid credentials stop at the first DC", func(t *testing.T) {

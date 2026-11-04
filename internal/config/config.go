@@ -26,6 +26,9 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 	"gopkg.in/yaml.v3"
+
+	dolly "github.com/dirkpetersen/dolly"
+	"github.com/dirkpetersen/dolly/internal/ldapconn"
 )
 
 // Config mirrors dolly.yaml (see dolly.yaml.template).
@@ -44,6 +47,7 @@ type Config struct {
 type Source struct {
 	URLs             []string `yaml:"urls"`
 	CAFile           string   `yaml:"ca_file"`
+	TLSFingerprint   []string `yaml:"tls_fingerprint"`
 	BindDN           string   `yaml:"bind_dn"`
 	BindPassword     string   `yaml:"bind_password"`
 	BindPasswordFile string   `yaml:"bind_password_file"`
@@ -60,16 +64,17 @@ type Search struct {
 
 // Target is the OpenLDAP side.
 type Target struct {
-	URL              string `yaml:"url"`
-	StartTLS         bool   `yaml:"start_tls"`
-	CAFile           string `yaml:"ca_file"`
-	BindDN           string `yaml:"bind_dn"`
-	BindPassword     string `yaml:"bind_password"`
-	BindPasswordFile string `yaml:"bind_password_file"`
-	UsersBase        string `yaml:"users_base"`
-	GroupsBase       string `yaml:"groups_base"`
-	StateBase        string `yaml:"state_base"`
-	EmptyGroupMember string `yaml:"empty_group_member"`
+	URL              string   `yaml:"url"`
+	StartTLS         bool     `yaml:"start_tls"`
+	CAFile           string   `yaml:"ca_file"`
+	TLSFingerprint   []string `yaml:"tls_fingerprint"`
+	BindDN           string   `yaml:"bind_dn"`
+	BindPassword     string   `yaml:"bind_password"`
+	BindPasswordFile string   `yaml:"bind_password_file"`
+	UsersBase        string   `yaml:"users_base"`
+	GroupsBase       string   `yaml:"groups_base"`
+	StateBase        string   `yaml:"state_base"`
+	EmptyGroupMember string   `yaml:"empty_group_member"`
 }
 
 // Mapping holds the attribute mapping for users and groups.
@@ -85,7 +90,24 @@ type UserMapping struct {
 	Required      []string          `yaml:"required"`
 	CreateOnly    []string          `yaml:"create_only"`
 	Attributes    map[string]string `yaml:"attributes"`
+	GIDFromUPG    *GIDFromUPG       `yaml:"gid_from_upg"`
 }
+
+// GIDFromUPG takes a user's gidNumber from its user private group in AD,
+// found by name (see README "gidNumber from the user private group").
+type GIDFromUPG struct {
+	// GroupName is a Go template rendered with the user's AD attributes
+	// and .uid set to the user's mapped uid, such as 'u-{{ .uid }}'.
+	GroupName string `yaml:"group_name"`
+	// When is GIDWhenMissing (default) or GIDWhenAlways.
+	When string `yaml:"when"`
+}
+
+// gid_from_upg.when values.
+const (
+	GIDWhenMissing = "missing" // only when the AD user has no valid gidNumber
+	GIDWhenAlways  = "always"  // the group's gidNumber wins whenever the group exists
+)
 
 // GroupMapping maps AD groups to target entries.
 type GroupMapping struct {
@@ -191,8 +213,17 @@ func Load(path string) (*Config, error) {
 
 // Parse decodes and validates config data. path is the config file's
 // absolute path, used to resolve relative paths; it is not read.
+//
+// spec: a missing sync section takes all its values from
+// dolly.yaml.template. In a present sync section only the keys that used to
+// be required (lock_ttl, run_timeout, network_timeout) default; the others
+// keep their zero value, so an existing config behaves as before. A missing
+// mapping.users or mapping.groups subsection defaults only as a whole: keys
+// inside a present subsection never default, so a mapping is always exactly
+// what is written.
 func Parse(data []byte, path string) (*Config, error) {
-	c := &Config{Path: path}
+	def := templateDefaults()
+	c := &Config{Path: path, Sync: Sync{LockTTL: def.Sync.LockTTL, RunTimeout: def.Sync.RunTimeout, NetworkTimeout: def.Sync.NetworkTimeout}} // keys in the file overwrite these
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(c); err != nil {
@@ -200,6 +231,21 @@ func Parse(data []byte, path string) (*Config, error) {
 			return nil, fmt.Errorf("%s: config is empty", path)
 		}
 		return nil, fmt.Errorf("%s: %w", path, explainRemoved(err))
+	}
+	var present struct {
+		Mapping map[string]yaml.Node `yaml:"mapping"`
+		Sync    *yaml.Node           `yaml:"sync"`
+	}
+	if err := yaml.Unmarshal(data, &present); err == nil {
+		if present.Sync == nil {
+			c.Sync = def.Sync
+		}
+		if _, ok := present.Mapping["users"]; !ok {
+			c.Mapping.Users = def.Mapping.Users
+		}
+		if _, ok := present.Mapping["groups"]; !ok {
+			c.Mapping.Groups = def.Mapping.Groups
+		}
 	}
 	c.applyDefaults()
 	c.resolvePaths()
@@ -230,11 +276,53 @@ func explainRemoved(err error) error {
 	return te
 }
 
+// templateDefaults returns the mapping and sync sections of
+// dolly.yaml.template, freshly decoded (so callers may keep the maps).
+func templateDefaults() Config {
+	var d Config
+	if err := yaml.Unmarshal(dolly.ConfigTemplate, &d); err != nil {
+		panic("dolly.yaml.template: " + err.Error()) // a test parses the template
+	}
+	return Config{Mapping: d.Mapping, Sync: d.Sync}
+}
+
 func (c *Config) applyDefaults() {
 	// spec: README says paged AD searches use a page size of 500.
 	if c.Source.PageSize == 0 {
 		c.Source.PageSize = 500
 	}
+	if g := c.Mapping.Users.GIDFromUPG; g != nil && g.When == "" {
+		g.When = GIDWhenMissing
+	}
+	// spec: a bare AD account name becomes the UPN <name>@<domain>, the
+	// domain taken from the DC= components of the users (else groups) base.
+	// A down-level name (DOMAIN\name) is left as it is.
+	if b := c.Source.BindDN; b != "" && !strings.ContainsAny(b, "=@\\") {
+		for _, base := range []string{c.Source.Users.Base, c.Source.Groups.Base} {
+			if d := dnsDomain(base); d != "" {
+				c.Source.BindDN = strings.TrimSpace(b) + "@" + d
+				break
+			}
+		}
+	}
+}
+
+// dnsDomain returns the DNS domain of a DN's DC= components
+// (DC=ad,DC=example,DC=edu -> ad.example.edu), or "".
+func dnsDomain(dn string) string {
+	d, err := ldap.ParseDN(dn)
+	if err != nil {
+		return ""
+	}
+	var parts []string
+	for _, r := range d.RDNs {
+		for _, a := range r.Attributes {
+			if strings.EqualFold(a.Type, "dc") {
+				parts = append(parts, a.Value)
+			}
+		}
+	}
+	return strings.Join(parts, ".")
 }
 
 func (c *Config) resolvePaths() {
@@ -401,9 +489,14 @@ func (c *Config) Validate() error {
 			add("source.urls[%d]: %v", i, err)
 		}
 	}
-	if c.Source.BindDN == "" {
-		add("source.bind_dn: required (a DN or a UPN such as svc-dolly@example.edu)")
+	switch b := c.Source.BindDN; {
+	case b == "":
+		add("source.bind_dn: required (a DN, a UPN such as svc-dolly@example.edu, or a bare account name)")
+	case !strings.ContainsAny(b, "=@\\"):
+		// applyDefaults turns a bare name into a UPN when it can.
+		add("source.bind_dn: %q is a bare account name, but source.users.base and source.groups.base have no DC= components to take the domain from; write it as a UPN (name@domain) or a DN", b)
 	}
+	checkTLS("source", c.Source.CAFile, c.Source.TLSFingerprint, add)
 	checkPassword("source.bind_password", c.Source.BindPassword, c.Source.BindPasswordFile, true, add)
 	for _, s := range []struct {
 		name string
@@ -427,6 +520,12 @@ func (c *Config) Validate() error {
 		add("target.url: %v", err)
 	} else if c.Target.StartTLS && strings.HasPrefix(strings.ToLower(c.Target.URL), "ldaps://") {
 		add("target.start_tls: can't be combined with an ldaps:// URL")
+	}
+	checkTLS("target", c.Target.CAFile, c.Target.TLSFingerprint, add)
+	// The source always uses TLS (LDAPS, or StartTLS for ldap://); the
+	// target may be plaintext, and then TLS settings would be silently unused.
+	if ldapconn.Scheme(c.Target.URL) == "ldap" && !c.Target.StartTLS && (c.Target.CAFile != "" || len(c.Target.TLSFingerprint) > 0) {
+		add("target.ca_file / target.tls_fingerprint: set, but target.url is plaintext ldap:// with start_tls: false, so no TLS is used; set start_tls: true or use ldaps://, or remove them")
 	}
 	checkDN("target.bind_dn", c.Target.BindDN, true, add)
 	checkPassword("target.bind_password", c.Target.BindPassword, c.Target.BindPasswordFile, true, add)
@@ -571,8 +670,24 @@ func (c *Config) validateMapping(add func(string, ...any)) {
 			}
 			continue
 		}
+		// spec: with gid_from_upg the user's gidNumber may come from its
+		// group, so its AD source need not be required.
+		if name == "gidNumber" && u.GIDFromUPG != nil {
+			continue
+		}
 		if v, err := CompileValue(name, src); err == nil && v.Attr != "" {
 			hasAll("mapping.users", "required", u.Required, v.Attr)
+		}
+	}
+	if g := u.GIDFromUPG; g != nil {
+		switch v, err := CompileValue("group_name", g.GroupName); {
+		case err == nil && v.Tmpl == nil, g.GroupName == "":
+			add("mapping.users.gid_from_upg.group_name: must be a Go template such as 'u-{{ .uid }}'")
+		case err != nil:
+			add("mapping.users.gid_from_upg.group_name: %v", err)
+		}
+		if g.When != GIDWhenMissing && g.When != GIDWhenAlways {
+			add("mapping.users.gid_from_upg.when: must be %s or %s, got %q", GIDWhenMissing, GIDWhenAlways, g.When)
 		}
 	}
 	if u.RDN == "" {
@@ -669,6 +784,19 @@ func (c *Config) checkStateBase(add func(string, ...any)) {
 			add("target.state_base and target.%s must differ; state_base may live inside %s, but not be it", b.name, b.name)
 		case sb.AncestorOfFold(d):
 			add("target.%s must not be inside target.state_base (state_base may be inside %s, not the other way round)", b.name, b.name)
+		}
+	}
+}
+
+// checkTLS checks the tls_fingerprint list and that it isn't combined with
+// ca_file (a pin replaces CA verification).
+func checkTLS(side, caFile string, pins []string, add func(string, ...any)) {
+	if caFile != "" && len(pins) > 0 {
+		add("%s.ca_file and %s.tls_fingerprint are both set; set only one (a pinned certificate is not checked against a CA)", side, side)
+	}
+	for i, p := range pins {
+		if _, err := ldapconn.ParseFingerprint(p); err != nil {
+			add("%s.tls_fingerprint[%d]: %v", side, i, err)
 		}
 	}
 }

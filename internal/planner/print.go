@@ -102,6 +102,9 @@ func (p *Plan) Print(w io.Writer) {
 	fmt.Fprintf(w, "  memberships: +%d -%d (%d of them local, removed by a prune; %d values renamed)\n", c.MembersAdded, c.MembersRemoved, p.Guard.LocalRemovals, c.MembersRenamed)
 	fmt.Fprintf(w, "  records:     +%d ~%d -%d\n", c.RecordsAdded, c.RecordsUpdated, c.RecordsDeleted)
 	fmt.Fprintf(w, "  ignored:     %d entries missing required attributes\n", c.IgnoredEntries)
+	if p.Users && c.GIDFromUPG > 0 {
+		fmt.Fprintf(w, "  gidNumber:   %d users take it from their UPG group (gid_from_upg)\n", c.GIDFromUPG)
+	}
 	// Not a warning: members without a target entry are expected in a
 	// groups-only deployment and are picked up once the entry exists.
 	if n := len(p.MissingMembers); n > 0 {

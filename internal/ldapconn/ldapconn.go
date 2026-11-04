@@ -1,7 +1,8 @@
 // Package ldapconn opens authenticated LDAP connections for the AD source
-// and the target: TLS setup (ca_file or system roots, never
-// InsecureSkipVerify), timeouts, and the bind. It also runs searches that
-// fail on any incomplete result.
+// and the target: TLS setup (ca_file or system roots, or a pinned leaf
+// certificate; InsecureSkipVerify only ever together with the pin check),
+// timeouts, and the bind. It also runs searches that fail on any incomplete
+// result, and fetches a server's certificate chain (dolly fetch-cert).
 package ldapconn
 
 import (
@@ -24,6 +25,10 @@ type Options struct {
 	URL      string // ldap:// or ldaps://
 	StartTLS bool   // upgrade an ldap:// connection with StartTLS
 	CAFile   string // PEM bundle added to the system roots; "" uses the system roots only
+	// Pins are SHA-256 fingerprints of the server's leaf certificate
+	// (tls_fingerprint). When set, the pin replaces CA, expiry, and
+	// hostname checks.
+	Pins     []string
 	Timeout  time.Duration
 	BindDN   string // a DN, or for AD also a UPN
 	Password string
@@ -52,23 +57,14 @@ func Dial(ctx context.Context, o Options) (*ldap.Conn, error) {
 	if o.Timeout <= 0 {
 		return nil, errors.New("the network timeout must be positive")
 	}
-	tlsCfg, err := TLSConfig(u.Hostname(), o.CAFile)
+	tlsCfg, err := TLSConfig(u.Hostname(), o.CAFile, o.Pins)
 	if err != nil {
 		return nil, err
 	}
-	var port string
-	switch strings.ToLower(u.Scheme) {
-	case "ldap":
-		port = ldap.DefaultLdapPort
-	case "ldaps":
-		port = ldap.DefaultLdapsPort
-	default:
-		return nil, fmt.Errorf("%s: scheme must be ldap:// or ldaps://", o.URL)
+	addr, err := hostPort(u)
+	if err != nil {
+		return nil, err
 	}
-	if p := u.Port(); p != "" {
-		port = p
-	}
-	addr := net.JoinHostPort(u.Hostname(), port)
 
 	setupCtx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
@@ -87,19 +83,15 @@ func Dial(ctx context.Context, o Options) (*ldap.Conn, error) {
 		raw.Close()
 		return nil, ldap.NewError(ldap.ErrorNetwork, err)
 	}
-	netConn := raw
-	isTLS := false
-	if strings.EqualFold(u.Scheme, "ldaps") {
-		tc := tls.Client(raw, tlsCfg)
-		if err := tc.HandshakeContext(setupCtx); err != nil {
-			raw.Close()
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, explainTLS(ldap.NewError(ldap.ErrorNetwork, fmt.Errorf("TLS handshake with %s: %w", addr, timeoutHint(err, o.Timeout))), o.CAFile)
+	netConn, err := secure(setupCtx, raw, addr, strings.ToLower(u.Scheme), o.StartTLS, tlsCfg)
+	if err != nil {
+		raw.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		netConn, isTLS = tc, true
+		return nil, explainTLS(ldap.NewError(ldap.ErrorNetwork, timeoutHint(err, o.Timeout)), o.URL, o.CAFile)
 	}
+	_, isTLS := netConn.(*tls.Conn)
 	conn := ldap.NewConn(netConn, isTLS)
 	conn.Start()
 	conn.SetTimeout(o.Timeout)
@@ -112,11 +104,6 @@ func Dial(ctx context.Context, o Options) (*ldap.Conn, error) {
 		}
 		return nil, err
 	}
-	if strings.EqualFold(u.Scheme, "ldap") && o.StartTLS {
-		if err := conn.StartTLS(tlsCfg); err != nil {
-			return fail(fmt.Errorf("StartTLS: %w", explainTLS(timeoutHint(err, o.Timeout), o.CAFile)))
-		}
-	}
 	if err := conn.Bind(o.BindDN, o.Password); err != nil {
 		return fail(fmt.Errorf("bind as %s: %w", o.BindDN, timeoutHint(err, o.Timeout)))
 	}
@@ -126,6 +113,24 @@ func Dial(ctx context.Context, o Options) (*ldap.Conn, error) {
 		return fail(ldap.NewError(ldap.ErrorNetwork, err))
 	}
 	return conn, nil
+}
+
+// hostPort returns host:port of an ldap:// or ldaps:// URL, with the
+// scheme's default port if none is given.
+func hostPort(u *url.URL) (string, error) {
+	var port string
+	switch strings.ToLower(u.Scheme) {
+	case "ldap":
+		port = ldap.DefaultLdapPort
+	case "ldaps":
+		port = ldap.DefaultLdapsPort
+	default:
+		return "", fmt.Errorf("%s: scheme must be ldap:// or ldaps://", u)
+	}
+	if p := u.Port(); p != "" {
+		port = p
+	}
+	return net.JoinHostPort(u.Hostname(), port), nil
 }
 
 // timeoutHint names network_timeout in an error caused by the setup
@@ -143,8 +148,16 @@ func timeoutHint(err error, timeout time.Duration) error {
 }
 
 // TLSConfig returns a TLS config that verifies host against the system
-// roots plus the certificates in caFile (if set).
-func TLSConfig(host, caFile string) (*tls.Config, error) {
+// roots plus the certificates in caFile (if set). With pins, it instead
+// accepts exactly the servers whose leaf certificate has one of the pinned
+// SHA-256 fingerprints, and checks nothing else.
+func TLSConfig(host, caFile string, pins []string) (*tls.Config, error) {
+	if len(pins) > 0 {
+		if caFile != "" {
+			return nil, errors.New("ca_file and tls_fingerprint can't both be set")
+		}
+		return pinnedConfig(host, pins)
+	}
 	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
@@ -161,20 +174,35 @@ func TLSConfig(host, caFile string) (*tls.Config, error) {
 	return &tls.Config{ServerName: host, RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
 }
 
-// explainTLS adds a hint to certificate verification errors.
-func explainTLS(err error, caFile string) error {
+// explainTLS adds a hint to certificate verification errors: what to do,
+// and the server's leaf fingerprint for tls_fingerprint.
+func explainTLS(err error, rawURL, caFile string) error {
 	var ua x509.UnknownAuthorityError
 	var hn x509.HostnameError
+	var hint string
 	switch {
 	case errors.As(err, &ua), strings.Contains(err.Error(), "certificate signed by unknown authority"):
 		if caFile == "" {
-			return fmt.Errorf("%w (the server's CA isn't trusted: fetch its chain and set ca_file, see README \"TLS certificates\")", err)
+			hint = "the server's CA isn't trusted: set ca_file or tls_fingerprint"
+		} else {
+			hint = "the server's CA isn't in ca_file " + caFile + ": fix ca_file, or set tls_fingerprint instead"
 		}
-		return fmt.Errorf("%w (the server's CA isn't in ca_file %s, see README \"TLS certificates\")", err, caFile)
 	case errors.As(err, &hn), strings.Contains(err.Error(), "certificate is valid for"):
-		return fmt.Errorf("%w (connect by a name the certificate lists)", err)
+		hint = "connect by a name the certificate lists, or set tls_fingerprint"
+	case errors.Is(err, errPinMismatch):
+		hint = "the server's certificate changed, or this is not the server you pinned"
 	}
-	return err
+	var cve *tls.CertificateVerificationError
+	if errors.As(err, &cve) && len(cve.UnverifiedCertificates) > 0 {
+		if hint == "" {
+			hint = "set ca_file, or set tls_fingerprint"
+		}
+		hint += "; the server's leaf certificate is " + Fingerprint(cve.UnverifiedCertificates[0])
+	}
+	if hint == "" {
+		return err
+	}
+	return fmt.Errorf("%w (%s; run `dolly fetch-cert %s` to inspect the chain, see README \"TLS certificates\")", err, hint, rawURL)
 }
 
 // IsNoSuchObject reports whether err is LDAP noSuchObject (32).

@@ -42,7 +42,7 @@ func Dial(ctx context.Context, cfg *config.Config) (*Reader, error) {
 		return nil, fmt.Errorf("target: %w", err)
 	}
 	conn, err := ldapconn.Dial(ctx, ldapconn.Options{
-		URL: cfg.Target.URL, StartTLS: cfg.Target.StartTLS, CAFile: cfg.Target.CAFile,
+		URL: cfg.Target.URL, StartTLS: cfg.Target.StartTLS, CAFile: cfg.Target.CAFile, Pins: cfg.Target.TLSFingerprint,
 		Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: cfg.Target.BindDN, Password: pw,
 	})
 	if err != nil {
@@ -57,18 +57,30 @@ func (r *Reader) Close() error { return r.conn.Close() }
 // Read returns the target snapshot and Dolly's ownership records. It reads
 // groups_base and state_base, and users_base only if readUsers is set: a
 // groups-only run doesn't need it, and users_base may be larger than the
-// server lets any search return. A missing groups_base or users_base is an
-// error (Dolly never creates them); a missing state_base means no records
-// yet (a real run creates it).
+// server lets any search return. A missing base reads as empty and is
+// flagged in the snapshot (MissingUsersBase, MissingGroupsBase,
+// HasStateBase), so a dry run before the first real run plans its
+// creation; a real run creates the bases before reading.
 func (r *Reader) Read(ctx context.Context, readUsers bool) (*model.TargetSnapshot, *model.Records, error) {
-	return readSnapshot(r.cfg, r.URL, readUsers, func(base, name string, attrs []string, optional bool) ([]*model.Entry, error) {
-		return r.subtree(ctx, base, name, attrs, optional)
+	snap, recs, err := readSnapshot(r.cfg, r.URL, readUsers, func(base, name string, attrs []string) ([]*model.Entry, error) {
+		return r.subtree(ctx, base, name, attrs)
 	})
+	if err != nil || readUsers {
+		return snap, recs, err
+	}
+	// A groups-only run doesn't read users_base, so only ask whether it exists.
+	e, err := readEntry(r.conn, r.cfg.Target.UsersBase, "1.1")
+	if err != nil {
+		return nil, nil, fmt.Errorf("target %s: reading users_base %s: %w", r.URL, r.cfg.Target.UsersBase, err)
+	}
+	snap.MissingUsersBase = e == nil
+	return snap, recs, nil
 }
 
 // subtreeFunc reads every entry under base with the given attributes. A
-// missing base is an error unless optional is set.
-type subtreeFunc func(base, name string, attrs []string, optional bool) ([]*model.Entry, error)
+// missing base returns nil (an existing one returns a non-nil list holding
+// at least the base itself).
+type subtreeFunc func(base, name string, attrs []string) ([]*model.Entry, error)
 
 // readSnapshot does Read's three subtree reads through read, then combines
 // and classifies them. Errors from read are returned as they are; url names
@@ -76,19 +88,19 @@ type subtreeFunc func(base, name string, attrs []string, optional bool) ([]*mode
 func readSnapshot(cfg *config.Config, url string, readUsers bool, read subtreeFunc) (*model.TargetSnapshot, *model.Records, error) {
 	t := cfg.Target
 	groupAttrs := append([]string{"objectClass", "cn", config.AttrMember, config.AttrMemberUID}, model.SortedKeys(cfg.Mapping.Groups.Attributes)...)
-	groups, err := read(t.GroupsBase, "groups_base", groupAttrs, false)
+	groups, err := read(t.GroupsBase, "groups_base", groupAttrs)
 	if err != nil {
 		return nil, nil, err
 	}
 	var users []*model.Entry
 	if readUsers {
 		userAttrs := append([]string{"objectClass", "uid"}, model.SortedKeys(cfg.Mapping.Users.Attributes)...)
-		users, err = read(t.UsersBase, "users_base", userAttrs, false)
+		users, err = read(t.UsersBase, "users_base", userAttrs)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	state, err := read(t.StateBase, "state_base", []string{"objectClass", "cn", "ou", "seeAlso", "roleOccupant", "description"}, true)
+	state, err := read(t.StateBase, "state_base", []string{"objectClass", "cn", "ou", "seeAlso", "roleOccupant", "description"})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -97,6 +109,8 @@ func readSnapshot(cfg *config.Config, url string, readUsers bool, read subtreeFu
 		return nil, nil, fmt.Errorf("target %s: %w", url, err)
 	}
 	snap.UsersRead = readUsers
+	snap.MissingGroupsBase = groups == nil
+	snap.MissingUsersBase = readUsers && users == nil
 	return snap, recs, nil
 }
 
@@ -158,16 +172,13 @@ func mergeAttrs(dst, src *model.Entry) {
 	}
 }
 
-// subtree reads every entry under base (paged). A missing base is an error
-// unless optional is set.
-func (r *Reader) subtree(ctx context.Context, base, name string, attrs []string, optional bool) ([]*model.Entry, error) {
+// subtree reads every entry under base (paged). A missing base returns nil.
+func (r *Reader) subtree(ctx context.Context, base, name string, attrs []string) ([]*model.Entry, error) {
 	req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, "(objectClass=*)", dedupFold(attrs), nil)
 	res, err := ldapconn.SearchPaged(ctx, r.conn, req, pageSize)
 	switch {
-	case err != nil && optional && ldapconn.IsNoSuchObject(err):
-		return nil, nil
 	case err != nil && ldapconn.IsNoSuchObject(err):
-		return nil, fmt.Errorf("target %s: %s %s does not exist; create it first (Dolly never creates users_base or groups_base)", r.URL, name, base)
+		return nil, nil
 	case err != nil:
 		return nil, fmt.Errorf("target %s: reading %s %s: %w", r.URL, name, base, err)
 	}
@@ -177,7 +188,8 @@ func (r *Reader) subtree(ctx context.Context, base, name string, attrs []string,
 // LookupUsers finds which of uids have an entry under users_base, without
 // reading all of users_base: subtree searches for (|(uid=a)(uid=b)...) in
 // chunks of lookupChunk, requesting only uid. A truncated or failed search
-// aborts the lookup.
+// aborts the lookup; a missing users_base holds no users (a dry run before
+// the first real run, which creates it).
 func (r *Reader) LookupUsers(ctx context.Context, uids []string) (*model.UserSet, error) {
 	set := model.NewUserSet()
 	uniq := map[string]string{}
@@ -196,7 +208,7 @@ func (r *Reader) LookupUsers(ctx context.Context, uids []string) (*model.UserSet
 		res, err := ldapconn.Search(ctx, r.conn, lookupRequest(base, chunk))
 		switch {
 		case err != nil && ldapconn.IsNoSuchObject(err):
-			return nil, fmt.Errorf("target %s: users_base %s does not exist", r.URL, base)
+			return set, nil
 		case err != nil:
 			return nil, fmt.Errorf("target %s: looking up member uids under %s: %w", r.URL, base, err)
 		}

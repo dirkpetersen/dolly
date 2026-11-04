@@ -37,7 +37,9 @@ func Build(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records,
 		return nil, fmt.Errorf("planning groups needs the target's users: read users_base or look up the member uids (TargetSnapshot.ExistingUsers)")
 	}
 	p.prepare(ad)
-	p.containers(tgt)
+	if err := p.containers(tgt); err != nil {
+		return nil, err
+	}
 	switch {
 	case opt.Adopt:
 		p.plan.Mode = "adopt"
@@ -64,6 +66,8 @@ type adUser struct {
 	uid      string
 	dn       string // DN the entry should have
 	disabled bool
+	// gidFromUPG: the gidNumber in attrs came from the user's UPG group.
+	gidFromUPG bool
 }
 
 // adGroup is a synced AD group, mapped to its target form.
@@ -86,6 +90,11 @@ type planner struct {
 	userAttrs, groupAttrs []string // sorted mapped attribute names
 	memberMode, uidMode   bool
 	placeholder           string
+	// gid_from_upg: AD groups by lowercased name (DN order), and the names
+	// whose duplicates were already reported.
+	upgByName map[string][]upgGroup
+	upgWarned map[string]bool
+	upgName   config.Value
 
 	// AD side
 	byDN         map[string]*model.ADObject // DNKey -> object
@@ -162,6 +171,13 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		}
 		p.groupVals[name] = v
 	}
+	if g := cfg.Mapping.Users.GIDFromUPG; g != nil {
+		v, err := config.CompileValue("group_name", g.GroupName)
+		if err != nil || v.Tmpl == nil {
+			return nil, fmt.Errorf("mapping.users.gid_from_upg.group_name: must be a Go template (%v)", err)
+		}
+		p.upgName = v
+	}
 	p.userAttrs = model.SortedKeys(p.userVals)
 	p.groupAttrs = model.SortedKeys(p.groupVals)
 
@@ -226,6 +242,9 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 	p.plan.Counts.ADUsers = ad.Count(model.KindUser)
 	p.plan.Counts.ADGroups = ad.Count(model.KindGroup)
 
+	if p.cfg.Mapping.Users.GIDFromUPG != nil {
+		p.indexUPGs(objs)
+	}
 	// spec: every user with a mapped uid can be a group member; only users
 	// that also have every required attribute (uidNumber, gidNumber, ...)
 	// get a user entry. A groups-only deployment therefore works with AD
@@ -254,7 +273,10 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 			continue
 		}
 		p.memberUsers[o.GUID] = u
-		why := badIDs(u.attrs, "uidNumber", "gidNumber")
+		why := p.gidFromUPG(u)
+		if why == "" {
+			why = badIDs(u.attrs, "uidNumber", "gidNumber")
+		}
 		if len(miss) > 0 {
 			why = "missing required attribute " + strings.Join(miss, ", ")
 		}
@@ -266,6 +288,9 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 			continue
 		}
 		p.validUsers[o.GUID] = u
+		if u.gidFromUPG && o.InScope {
+			p.plan.Counts.GIDFromUPG++
+		}
 	}
 
 	// Valid in-scope groups, deduplicated by cn.
@@ -495,6 +520,102 @@ func badIDs(attrs map[string][]string, names ...string) string {
 	return ""
 }
 
+// upgGroup is an AD group that can give a user its gidNumber.
+type upgGroup struct {
+	obj *model.ADObject
+	gid string // the group's mapped gidNumber
+}
+
+// indexUPGs indexes the in-scope AD groups that pass the group mapping
+// (required attributes, a gidNumber) by lowercased name, in DN order.
+//
+// shortcut: the shared groups set is the only one; when a UPG set exists,
+// index that one instead.
+func (p *planner) indexUPGs(objs []*model.ADObject) {
+	p.upgByName, p.upgWarned = map[string][]upgGroup{}, map[string]bool{}
+	for _, o := range objs {
+		if o.Kind != model.KindGroup || !o.InScope || len(o.Missing(p.cfg.Mapping.Groups.Required)) > 0 {
+			continue
+		}
+		name := first(o.Get("name"))
+		g, err := p.mapGroup(o)
+		if name == "" || err != nil {
+			continue
+		}
+		gid := first(attrFold(g.attrs, "gidNumber"))
+		if gid == "" {
+			continue
+		}
+		k := strings.ToLower(name)
+		p.upgByName[k] = append(p.upgByName[k], upgGroup{o, gid})
+	}
+}
+
+// gidFromUPG applies mapping.users.gid_from_upg to u: it sets u's gidNumber
+// from the AD group named by group_name when the user has no valid one
+// (when: missing) or whenever the group exists (when: always). It returns
+// why the user has no usable gidNumber, or "".
+func (p *planner) gidFromUPG(u *adUser) string {
+	g := p.cfg.Mapping.Users.GIDFromUPG
+	if g == nil {
+		return ""
+	}
+	key := "gidNumber"
+	for _, a := range p.userAttrs {
+		if strings.EqualFold(a, key) {
+			key = a
+		}
+	}
+	own := u.attrs[key]
+	ownOK := len(own) > 0 && badIDs(map[string][]string{key: own}, key) == ""
+	if ownOK && g.When == config.GIDWhenMissing {
+		return ""
+	}
+	data := map[string]string{}
+	for k, v := range u.obj.Attrs {
+		if len(v) > 0 {
+			data[k] = v[0]
+		}
+	}
+	data["uid"] = u.uid
+	var b bytes.Buffer
+	if err := p.upgName.Tmpl.Execute(&b, data); err != nil {
+		return "gid_from_upg.group_name: " + err.Error()
+	}
+	name := strings.TrimSpace(b.String())
+	cands := p.upgByName[strings.ToLower(name)]
+	switch {
+	case len(cands) == 0 && ownOK:
+		return "" // when: always, but no group: the user's own value stays
+	case len(cands) == 0 && len(own) == 0:
+		return fmt.Sprintf("has no gidNumber, and no AD group is named %q (gid_from_upg)", name)
+	case len(cands) == 0:
+		return fmt.Sprintf("%s, and no AD group is named %q (gid_from_upg)", badIDs(map[string][]string{key: own}, key), name)
+	}
+	if len(cands) > 1 && !p.upgWarned[strings.ToLower(name)] {
+		p.upgWarned[strings.ToLower(name)] = true
+		for _, c := range cands[1:] {
+			p.warn(WarnDuplicate, c.obj.DN, fmt.Sprintf("another AD group is also named %q; gid_from_upg uses the first by DN, %s", name, cands[0].obj.DN))
+		}
+	}
+	c := cands[0]
+	if why := badIDs(map[string][]string{key: {c.gid}}, key); why != "" {
+		return fmt.Sprintf("gets its gidNumber from AD group %s, but %s", c.obj.DN, why)
+	}
+	u.attrs[key] = []string{c.gid}
+	u.gidFromUPG = true
+	return ""
+}
+
+func attrFold(attrs map[string][]string, name string) []string {
+	for k, v := range attrs {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return nil
+}
+
 // looseUID returns the uid an AD user would have on the target, ignoring
 // the required-attribute rule (for adopt).
 func (p *planner) looseUID(o *model.ADObject) string {
@@ -577,29 +698,48 @@ func (p *planner) mapAttrs(o *model.ADObject, vals map[string]config.Value, name
 	return out, nil
 }
 
-// containers plans state_base and its record containers if missing. It
-// never creates users_base or groups_base.
-func (p *planner) containers(t *model.TargetSnapshot) {
-	add := func(dn string) {
+// containers plans the missing bases (parents first) and state_base's
+// record containers. A real run creates the bases before reading
+// (target.EnsureBases), so only a dry run plans them here.
+func (p *planner) containers(t *model.TargetSnapshot) error {
+	add := func(name, dn string, allowCN bool, reason string) error {
 		attr, val, _ := model.RDN(dn)
-		class := "organizationalUnit"
-		if strings.EqualFold(attr, "cn") {
-			class = "organizationalRole"
+		class, err := model.ContainerClass(name, dn, allowCN)
+		if err != nil {
+			return err
 		}
 		p.emit(Op{Kind: CreateContainer, Section: SectionContainers, DN: dn,
 			Attrs:  []Attribute{{"objectClass", []string{class}}, {attr, []string{val}}},
-			Reason: "Dolly's state container is missing"})
+			Reason: reason})
+		return nil
 	}
-	sb := p.cfg.Target.StateBase
-	if !t.HasStateBase {
-		add(sb)
+	tb := p.cfg.Target
+	type base struct {
+		name, dn string
+		missing  bool
 	}
+	bases := []base{{"users_base", tb.UsersBase, t.MissingUsersBase}, {"groups_base", tb.GroupsBase, t.MissingGroupsBase}, {"state_base", tb.StateBase, !t.HasStateBase}}
+	sort.SliceStable(bases, func(i, j int) bool { return model.DNDepth(bases[i].dn) < model.DNDepth(bases[j].dn) })
+	for _, b := range bases {
+		if !b.missing {
+			continue
+		}
+		reason := b.name + " is missing"
+		if b.name == "state_base" {
+			reason = "Dolly's state container is missing"
+		}
+		if err := add(b.name, b.dn, b.name == "state_base", reason); err != nil {
+			return err
+		}
+	}
+	sb := tb.StateBase
 	if !t.HasUserRecords {
-		add(model.RecordsBase(sb, model.UserRecord))
+		add("record container", model.RecordsBase(sb, model.UserRecord), false, "Dolly's state container is missing")
 	}
 	if !t.HasGroupRecords {
-		add(model.RecordsBase(sb, model.GroupRecord))
+		add("record container", model.RecordsBase(sb, model.GroupRecord), false, "Dolly's state container is missing")
 	}
+	return nil
 }
 
 func (p *planner) finish() {

@@ -48,7 +48,7 @@ func DialAD(ctx context.Context, cfg *config.Config) (*AD, error) {
 	// a connect or bind failure falls over to the next one.
 	for _, u := range shuffleURLs(cfg.Source.URLs) {
 		conn, err := ldapconn.Dial(ctx, ldapconn.Options{
-			URL: u, StartTLS: ldapconn.Scheme(u) == "ldap", CAFile: cfg.Source.CAFile,
+			URL: u, StartTLS: ldapconn.Scheme(u) == "ldap", CAFile: cfg.Source.CAFile, Pins: cfg.Source.TLSFingerprint,
 			Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: cfg.Source.BindDN, Password: pw,
 		})
 		if err == nil {

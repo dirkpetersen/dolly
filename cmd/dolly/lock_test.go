@@ -14,6 +14,7 @@ import (
 	"github.com/dirkpetersen/dolly/internal/config"
 	"github.com/dirkpetersen/dolly/internal/fixture"
 	"github.com/dirkpetersen/dolly/internal/ldapfake"
+	"github.com/dirkpetersen/dolly/internal/model"
 	"github.com/dirkpetersen/dolly/internal/planner"
 )
 
@@ -89,6 +90,9 @@ func TestRealRunLockHeld(t *testing.T) {
 	template := templateCopy(t)
 	for _, cmd := range []string{"sync", "adopt"} {
 		dir := fakeWithLock(time.Minute)
+		for _, b := range []string{"ou=people,dc=local", "ou=group,dc=local"} {
+			dir.Put(b, map[string][]string{"objectClass": {"organizationalUnit"}}, time.Now())
+		}
 		withFake(t, dir, "", false)
 		code, out, errs := runCLI(cmd, "--config", template)
 		if code != 0 || out != "" || !strings.Contains(errs, "another run holds the lock (host=other") || strings.Count(errs, "\n") != 1 {
@@ -141,8 +145,15 @@ func TestRealRun(t *testing.T) {
 		if st := statusNotes(dir); !strings.Contains(st, "last-success=") || strings.Contains(st, "failure") {
 			t.Errorf("status:\n%s", st)
 		}
-		if dir.Calls[0] != "search ou=dolly,dc=local" || dir.Calls[1] != "add ou=dolly,dc=local" || dir.Calls[2] != "add "+lockDN {
-			t.Errorf("state_base and lock must come first: %v", dir.Calls[:3])
+		// The bases (parents first, here all under dc=local) and then the lock.
+		var writes []string
+		for _, c := range dir.Calls {
+			if !strings.HasPrefix(c, "search ") {
+				writes = append(writes, c)
+			}
+		}
+		if want := "add ou=people,dc=local,add ou=group,dc=local,add ou=dolly,dc=local,add " + lockDN; len(writes) < 4 || strings.Join(writes[:4], ",") != want {
+			t.Errorf("bases and lock must come first: %v", writes)
 		}
 	})
 	t.Run("per-entry error", func(t *testing.T) {
@@ -163,6 +174,43 @@ func TestRealRun(t *testing.T) {
 			t.Errorf("status:\n%s", st)
 		}
 	})
+	// A base the bind DN can't see: the server answers noSuchObject on
+	// search although the entry exists, so it can't be created either, and
+	// the read finds it missing. The run aborts before planning, and writes
+	// nothing but the lock and cn=status.
+	t.Run("hidden base", func(t *testing.T) {
+		dir := ldapfake.New()
+		dir.Put("ou=group,dc=local", map[string][]string{"objectClass": {"organizationalUnit"}, "ou": {"group"}}, time.Now())
+		dir.Fail = func(op, dn string, _ any) error {
+			if op == "search" && model.DNEqual(dn, "ou=group,dc=local") {
+				return ldapfake.Error(ldap.LDAPResultNoSuchObject, "hidden")
+			}
+			return nil
+		}
+		withFake(t, dir, "", false)
+		old := readSnapshots
+		readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, w io.Writer) (*fixture.Snapshots, error) {
+			s, err := fixture.Load("testdata/fixture.yaml", cfg, true)
+			if err == nil {
+				s.Target.MissingGroupsBase = true // what the reader reports for a hidden base
+			}
+			return s, err
+		}
+		t.Cleanup(func() { readSnapshots = old })
+		code, out, errs := runCLI("sync", "--config", template)
+		if code != 1 || !strings.Contains(errs, "base groups_base ou=group,dc=local is missing or not readable by target.bind_dn") || strings.Contains(out, "Result:") {
+			t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
+		}
+		for _, c := range dir.Calls {
+			if !strings.HasPrefix(c, "search ") && !strings.HasSuffix(c, lockDN) && !strings.HasSuffix(c, "cn=status,ou=dolly,dc=local") &&
+				c != "add ou=dolly,dc=local" && c != "add ou=people,dc=local" && c != "add ou=group,dc=local" {
+				t.Errorf("hidden-base run wrote %q", c)
+			}
+		}
+		if st := statusNotes(dir); !strings.Contains(st, "failure=target ") {
+			t.Errorf("status:\n%s", st)
+		}
+	})
 	t.Run("guard", func(t *testing.T) {
 		fix := filepath.Join(t.TempDir(), "empty.yaml")
 		if err := os.WriteFile(fix, []byte("ad: {}\ntarget: {}\n"), 0o644); err != nil {
@@ -177,7 +225,7 @@ func TestRealRun(t *testing.T) {
 		}
 		for _, c := range dir.Calls {
 			if !strings.HasPrefix(c, "search ") && !strings.HasSuffix(c, lockDN) && !strings.HasSuffix(c, "cn=status,ou=dolly,dc=local") &&
-				c != "add ou=dolly,dc=local" {
+				c != "add ou=dolly,dc=local" && c != "add ou=people,dc=local" && c != "add ou=group,dc=local" {
 				t.Errorf("guard run wrote %q", c)
 			}
 		}

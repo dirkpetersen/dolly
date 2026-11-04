@@ -3,7 +3,7 @@ package target
 import (
 	"context"
 	"fmt"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -37,7 +37,7 @@ func DialWriter(cfg *config.Config) (*ldap.Conn, error) {
 		return nil, fmt.Errorf("target: %w", err)
 	}
 	conn, err := ldapconn.Dial(context.Background(), ldapconn.Options{
-		URL: cfg.Target.URL, StartTLS: cfg.Target.StartTLS, CAFile: cfg.Target.CAFile,
+		URL: cfg.Target.URL, StartTLS: cfg.Target.StartTLS, CAFile: cfg.Target.CAFile, Pins: cfg.Target.TLSFingerprint,
 		Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: cfg.Target.BindDN, Password: pw,
 	})
 	if err != nil {
@@ -47,42 +47,70 @@ func DialWriter(cfg *config.Config) (*ldap.Conn, error) {
 }
 
 // EnsureStateBase creates state_base (and only it) if it is missing, so the
-// run lock can be created under it. A concurrent creation by another host
-// (entryAlreadyExists) is fine. The record containers below it are created
-// by the plan.
+// run lock can be created under it. The record containers below it are
+// created by the plan.
 func EnsureStateBase(ctx context.Context, c Conn, stateBase string) (created bool, err error) {
+	return ensureBase(ctx, c, "state_base", stateBase, true)
+}
+
+// EnsureBases creates users_base, groups_base, and state_base where
+// missing, parents first (one base may sit inside another), before the run
+// lock is taken. It returns what it created. Each outermost base's parent
+// must exist. A base that exists but that the bind DN can't see (OpenLDAP
+// answers noSuchObject without a disclose ACL) can't be added either
+// (entryAlreadyExists); that is not an error here, but the read then finds
+// it missing and the real run aborts (cmd/dolly checkBasesRead).
+func EnsureBases(ctx context.Context, c Conn, t config.Target) (created []string, err error) {
+	bases := []struct {
+		name, dn string
+		cn       bool
+	}{{"users_base", t.UsersBase, false}, {"groups_base", t.GroupsBase, false}, {"state_base", t.StateBase, true}}
+	sort.SliceStable(bases, func(i, j int) bool { return model.DNDepth(bases[i].dn) < model.DNDepth(bases[j].dn) })
+	for _, b := range bases {
+		ok, err := ensureBase(ctx, c, b.name, b.dn, b.cn)
+		if err != nil {
+			return created, err
+		}
+		if ok {
+			created = append(created, b.name+" "+b.dn)
+		}
+	}
+	return created, nil
+}
+
+// ensureBase creates the container dn (as organizationalUnit for ou=, and,
+// if allowCN, organizationalRole for cn=) if it is missing. A concurrent
+// creation by another host (entryAlreadyExists) is fine.
+func ensureBase(ctx context.Context, c Conn, name, dn string, allowCN bool) (created bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	_, err = c.Search(ldap.NewSearchRequest(stateBase, ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 0, false,
+	_, err = c.Search(ldap.NewSearchRequest(dn, ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 0, false,
 		"(objectClass=*)", []string{"1.1"}, nil))
 	switch {
 	case err == nil:
 		return false, nil
 	case !ldapconn.IsNoSuchObject(err):
-		return false, fmt.Errorf("reading state_base %s: %w", stateBase, err)
+		return false, fmt.Errorf("reading %s %s: %w", name, dn, err)
 	}
-	attr, val, err := model.RDN(stateBase)
+	attr, val, err := model.RDN(dn)
 	if err != nil {
 		return false, err
 	}
-	var class string
-	switch strings.ToLower(attr) {
-	case "ou":
-		class = "organizationalUnit"
-	case "cn":
-		class = "organizationalRole"
-	default:
-		return false, fmt.Errorf("state_base %s is missing, and Dolly creates it only with an ou= or cn= RDN; create it by hand", stateBase)
+	class, err := model.ContainerClass(name, dn, allowCN)
+	if err != nil {
+		return false, err
 	}
-	req := ldap.NewAddRequest(stateBase, nil)
+	req := ldap.NewAddRequest(dn, nil)
 	req.Attribute("objectClass", []string{class})
 	req.Attribute(attr, []string{val})
 	switch err := c.Add(req); {
 	case ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists):
-		return false, nil // another host created it first
+		return false, nil // another host created it first, or the bind DN can't see it
+	case ldapconn.IsNoSuchObject(err):
+		return false, fmt.Errorf("creating %s %s: its parent does not exist; create the parent first (Dolly creates only the base itself): %w", name, dn, err)
 	case err != nil:
-		return false, fmt.Errorf("creating state_base %s: %w", stateBase, err)
+		return false, fmt.Errorf("creating %s %s: %w", name, dn, err)
 	}
 	return true, nil
 }

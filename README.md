@@ -102,7 +102,8 @@ source:
     - ldaps://dc01.example.edu:636
     - ldaps://dc02.example.edu:636
   ca_file: ad-ca.pem                  # optional, see "TLS certificates"
-  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # a UPN such as svc-dolly@example.edu also works
+  # tls_fingerprint: ["sha256:AB:CD:..."]   # instead of ca_file: pin each DC's certificate (dolly fetch-cert URL)
+  bind_dn: CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu   # or a UPN (svc-dolly@example.edu), or a bare name (svc-dolly: the domain comes from the base's DC= parts; EXAMPLE\svc-dolly stays as it is)
   bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ad.secret       # relative paths resolve against the config file's directory
   users:
@@ -117,14 +118,18 @@ target:
   url: ldap://ldap.example.edu:389
   start_tls: true
   ca_file: ldap-ca.pem                # optional, see "TLS certificates"
+  # tls_fingerprint: ["sha256:AB:CD:..."]   # instead of ca_file: pin the server's certificate (dolly fetch-cert URL)
   bind_dn: cn=admin,dc=local
   bind_password: ""                   # inline password, or use bind_password_file (set only one)
   bind_password_file: ldap.secret
-  users_base: ou=people,dc=local
+  users_base: ou=people,dc=local      # users_base and groups_base are created (ou= only) if missing
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
   empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
+# mapping and sync: leave a section (or mapping.users / mapping.groups) out to
+# use the values below. In a present sync section only lock_ttl, run_timeout, and
+# network_timeout default; other missing sync keys are zero (as before).
 mapping:
   users:
     rdn: uid
@@ -139,6 +144,9 @@ mapping:
       homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
       loginShell: '{{ or .loginShell "/bin/bash" }}'
       gecos: gecos
+    # gid_from_upg:                   # take gidNumber from the user's private group in AD, see "gidNumber from the user private group"
+    #   group_name: 'u-{{ .uid }}'    # Go template; matched case-insensitively against AD group names
+    #   when: missing                 # missing: only if the AD user has no valid gidNumber; always: the group wins whenever it exists
   groups:
     rdn: cn
     object_classes: [groupOfNames, posixGroup]   # RFC 2307 servers (structural posixGroup): [posixGroup] only
@@ -175,6 +183,10 @@ notify:
   remind_every: 24h                   # while a failure persists, remind at most this often
 ```
 
+**Defaults for `mapping` and `sync`.** A config may leave out the whole `sync` section, or the whole `mapping` section, and gets the values shown above (they come from the built-in `dolly.yaml.template`). Inside a present `sync` section, only `lock_ttl`, `run_timeout`, and `network_timeout` get their defaults when missing (they used to be required, so this changes no existing config). Every other missing key in a present section keeps its zero value, as before: `prune_users: false`, `prune_after_days: 0`, `disabled_shell: ""` (the shell is left alone), `max_delete_percent: 0`, `max_delete_min: 0`. For `mapping`, only a whole missing subsection defaults: without `mapping.users`, the default user mapping applies, and without `mapping.groups`, the default group mapping. Keys inside a present `mapping.users` or `mapping.groups` never default, so a mapping is always exactly what is written. The default group mapping lists `member`, so it needs `target.empty_group_member`.
+
+**AD bind name.** `source.bind_dn` can be a DN (`CN=svc-dolly,OU=Service Accounts,DC=example,DC=edu`), a UPN (`svc-dolly@example.edu`), or a bare account name (`svc-dolly`, no `=`, `@`, or `\`). A down-level name such as `EXAMPLE\svc-dolly` is passed to AD unchanged. Dolly turns a bare name into the UPN `<name>@<domain>`, where the domain comes from the `DC=` parts of `source.users.base` (or of `source.groups.base` if the users base has none): with `DC=ad,DC=example,DC=edu`, `svc-dolly` binds as `svc-dolly@ad.example.edu`. `dolly check` and the run's progress lines show the UPN. If neither base has `DC=` parts, the bare name is a config error.
+
 **Passwords.** Each password can be given inline (`bind_password`, `password`) or in a separate file (`bind_password_file`, `password_file`). Setting both to a non-empty value is a config error; an empty value counts as unset. If `dolly.yaml` contains an inline password, Dolly refuses to run unless the file is readable only by its owner (mode `0600` or stricter), the same way `ssh` treats private keys. `dolly.yaml` is git-ignored, so an inline password never ends up in the repository.
 
 **Group schema: rfc2307bis or RFC 2307.** The defaults assume rfc2307bis, where `posixGroup` is auxiliary and can be combined with `groupOfNames`, so members are written as both `member` DNs and `memberUid` values. Many older servers use RFC 2307 (`nis.schema`), where `posixGroup` is structural and can't be combined with `groupOfNames`. For those, configure `memberUid` only:
@@ -202,9 +214,44 @@ Attribute values are plain AD attribute names or Go templates. Dolly only writes
 - An empty `notify.smtp_host` disables notifications.
 - SMTP without authentication is allowed: with `notify.username`, `password`, and `password_file` all empty, Dolly never sends `AUTH` (plain relay, with or without `start_tls`). A username without a password, or a password without a username, is a config error. A username also requires TLS, since `AUTH` is never sent over an unencrypted connection: `start_tls: true`, or `smtp_port: 465` (implicit TLS, where `start_tls` must be `false`). `notify.from` and each `notify.to` entry must be valid mail addresses.
 - `page_size` defaults to `500` if omitted.
+- `mapping.users.gid_from_upg.group_name` must be a Go template, and `when` must be `missing` or `always` (default `missing`). With it, `mapping.users.required` may leave out the source of `gidNumber`.
+- `source.bind_dn` as a bare account name needs `DC=` parts in `source.users.base` or `source.groups.base` (see "AD bind name").
+- Each `tls_fingerprint` entry must be a SHA-256 fingerprint: 64 hex digits, optionally with a `sha256:` prefix and colons, in any case. `ca_file` and `tls_fingerprint` can't both be set on the same side. On the target, `ca_file` or `tls_fingerprint` with a plaintext `ldap://` URL and `start_tls: false` is a config error, because no TLS would be used and the setting would be silently ignored. (The source always uses TLS.)
 - Listing `member` in `mapping.groups.membership` requires `empty_group_member` to be set.
 - `users_base` and `groups_base` must differ, since Dolly tells users from groups by their container.
 - `state_base` may live inside `groups_base` or `users_base` (for example `ou=dolly,ou=group,dc=local`), and Dolly ignores that subtree when it reads users and groups. It must not equal either base, and neither base may live inside `state_base`.
+
+### gidNumber from the user private group
+
+Many sites give every user a *user private group* (UPG): a group of the same or a similar name whose `gidNumber` is the user's primary group. On the target, the user's `gidNumber` must then be the UPG's `gidNumber`. Often an Enterprise IAM team owns the AD user objects and won't fill in `gidNumber` on them (or fills in a placeholder), but it can create the UPG groups, for example a group named `u-<username>` with its own `gidNumber`. `mapping.users.gid_from_upg` lets Dolly build a correct target from that source: it takes each user's `gidNumber` from the AD group found by a naming convention.
+
+```yaml
+mapping:
+  users:
+    required: [uid, uidNumber]        # gidNumber's source may be left out with gid_from_upg
+    attributes:
+      uid: uid
+      gidNumber: gidNumber            # keep it mapped: it is the attribute Dolly writes
+      # ...
+    gid_from_upg:
+      group_name: 'u-{{ .uid }}'      # the UPG's AD name for this user
+      when: missing                   # or: always
+```
+
+- **`group_name`** (required) is a Go template, rendered with the same engine as the mapping: the data are the user's AD attributes (first values), and `.uid` is the user's mapped uid (the target uid, also when `uid` is mapped from `sAMAccountName`). The result is compared case-insensitively with the AD `name` of each group. A plain name without `{{ }}` is a config error.
+- **`when`** (default `missing`):
+  - `missing`: the group's `gidNumber` is used only when the AD user has no valid `gidNumber` (none, more than one value, or not an integer from 0 to 4294967294). A valid user value always wins.
+  - `always`: the group's `gidNumber` wins whenever the group exists. Users without a group keep their own value.
+- **Which groups.** The UPG groups are the AD groups Dolly already reads: the in-scope groups under `source.groups.base` that match `source.groups.filter`, and that the group mapping accepts (they have every `mapping.groups.required` attribute and a mapped `gidNumber`). The value used is the group's mapped `gidNumber`, the same value its target group gets. So the UPG groups must be inside the groups search; they are also synced as target groups like any other group. Out-of-scope groups found only as members are not used.
+- **Precedence**, per user: with `when: missing`, a valid AD `gidNumber`, else the UPG's; with `when: always`, the UPG's, else a valid AD `gidNumber`. If neither gives a value, the user is missing a required attribute: it gets no user entry, is listed once under "Warnings" as `ignored` (`has no gidNumber, and no AD group is named "u-jdoe" (gid_from_upg)`), and stays a valid group member, exactly like a user without `gidNumber` today.
+- **ID range.** A UPG `gidNumber` that Dolly would use must pass the same check as any ID (an integer from 0 to 4294967294). If it doesn't, the user is ignored and listed (`gets its gidNumber from AD group CN=u-jdoe,..., but gidNumber "4294967295" is not a valid ID`); Dolly doesn't fall back to the user's own value, so a broken UPG is visible.
+- **Duplicates.** If several AD groups have the name, the first by DN wins, and each other one is listed once as a `duplicate` warning (`another AD group is also named "u-jdoe"; gid_from_upg uses the first by DN, CN=u-jdoe,OU=Groups,...`). This matches how duplicate uids are handled.
+- **Changes.** If a UPG's `gidNumber` changes, every user who takes it from that group gets the new value on the next run that syncs users; the change is applied and reported as an `id-changed` warning, as any `gidNumber` change is.
+- **Which runs.** Only the `gidNumber` that Dolly writes on user entries changes, so this matters only in runs that sync users (`dolly sync` and `dolly sync --users`), which always read the AD groups. A `--groups` run writes no user entries and is unaffected. `dolly adopt` claims users by uid as before.
+- **Config validation.** With `gid_from_upg`, `mapping.users.required` may leave out the source of `gidNumber` (without it, the source must be listed). It must still list the uid source and `uidNumber`, and `gidNumber` must still be mapped. `when` must be `missing` or `always`.
+- **Summary.** A run that syncs users prints, when any user's `gidNumber` came from a UPG, one line: `gidNumber:   12 users take it from their UPG group (gid_from_upg)`.
+
+Example: the AD user `jdoe` has `uidNumber: 51234` and no `gidNumber`, and the AD group `u-jdoe` has `gidNumber: 51234`. With `group_name: 'u-{{ .uid }}'` and `when: missing`, Dolly creates `uid=jdoe,ou=people,dc=local` with `gidNumber: 51234`, and the group `cn=u-jdoe,ou=group,dc=local` as usual. If IAM later sets `gidNumber: 100` (a placeholder) on every user, `when: missing` would switch jdoe to 100; `when: always` keeps 51234 as long as `u-jdoe` exists.
 
 ### File locations (XDG)
 
@@ -233,6 +280,7 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `dolly check` | Tests the config, every domain controller, the target's containers and size limit, and SMTP, one `✓`/`✗`/`!` line each; exits `1` if any check fails. Writes nothing. `--groups` for a groups-only deployment; `--send-test-mail` also sends one test message to `notify.to`. See "Checking a config" |
 | `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units. `--users` or `--groups` and `--config FILE` are baked into the unit's `ExecStart`. See "Running it on a schedule" |
 | `dolly uninstall` | Stops and disables the timer, removes the units and the binary, and keeps the config |
+| `dolly fetch-cert URL [--out FILE]` | Connects to `ldaps://host[:636]`, or `ldap://host[:389]` with StartTLS, without verifying the server and without sending credentials, and prints each certificate of the chain the server sends (subject, issuer, validity with expired ones flagged, SHA-256 fingerprint), then a ready-to-paste `tls_fingerprint` line for the leaf. `--out FILE` also writes the chain as PEM (mode `0644`, usable as `ca_file`); an existing file is never overwritten. Reads no config. See "TLS certificates" |
 | `dolly version` | Prints the version, commit, build date, and the Go version it was built with |
 
 ### Checking a config
@@ -241,7 +289,7 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 
 - **Config:** loads and validates it (including the password rules), and reads every password file: it must exist and not be empty, and a file readable by group or others is a warning.
 - **AD:** connects to *each* DC in `source.urls` (LDAPS, or StartTLS for `ldap://`) and binds. A DC that fails while another answers is a warning, since runs fail over; none answering is a failure. After an invalid-credentials error the remaining DCs aren't tried, because every attempt counts toward the account's lockout. On the first DC that answered, it runs a paged search (page size 1, first page only) of the users base and the groups base with their filters, and names that DC. A base with no matching entry is a failure (the guard stops every sync when AD returns no users or no groups), except the users base with `--groups`, which groups-only runs never search.
-- **Target:** TLS and bind (plain `ldap://` without StartTLS is a warning). `groups_base` must exist, and a full unpaged read of it (DNs only, no client size limit) must not hit the server's size limit, since every run reads it. `users_base` must exist and answer a `(uid=*)` lookup; the same full read tests its size limit. A truncated `users_base` read is a failure, or with `--groups` a warning, because groups-only runs never read `users_base` in full. Both print the `olcLimits` fix (see "Permissions"). `state_base` must exist, or have an `ou=`/`cn=` RDN and an existing parent for the first real run to create it under (write access there isn't tested, since `check` never writes). A run lock held longer than `lock_ttl` (by `createTimestamp`), or one with a timestamp in the future, is a warning suggesting `dolly unlock` if no run is active.
+- **Target:** TLS and bind (plain `ldap://` without StartTLS is a warning). If `groups_base` exists, a full unpaged read of it (DNs only, no client size limit) must not hit the server's size limit, since every run reads it. If `users_base` exists, it must answer a `(uid=*)` lookup, and the same full read tests its size limit. A truncated `users_base` read is a failure, or with `--groups` a warning, because groups-only runs never read `users_base` in full. Both print the `olcLimits` fix (see "Permissions"). A missing `users_base`, `groups_base`, or `state_base` is reported as `does not exist (or target.bind_dn cannot see it); the first real run creates it`, if Dolly can create it: an `ou=` RDN (for `state_base` also `cn=`), and a parent that exists (or is itself a base the run creates first). Otherwise it is a failure. Write access there isn't tested, since `check` never writes. A run lock held longer than `lock_ttl` (by `createTimestamp`), or one with a timestamp in the future, is a warning suggesting `dolly unlock` if no run is active.
 - **SMTP** (if `notify.smtp_host` is set): connects, says `EHLO`, does StartTLS if configured, and authenticates with `AUTH PLAIN` if a username is set, or reports `SMTP: no authentication (username empty)`. No mail is sent unless `--send-test-mail` is given. Connects and operations are bounded by `network_timeout`, the whole check by `run_timeout`.
 
 ```text
@@ -278,7 +326,7 @@ Exit codes: `0` for success, or when another host holds the lock. `1` for an err
 
 ## How it works
 
-1. **Lock.** Dolly takes the run lock in the target LDAP, creating `state_base` first if it's missing. If another host holds it, Dolly exits quietly with code 0. `--dry-run` takes no lock. See "Run lock".
+1. **Lock.** Dolly creates any missing `users_base`, `groups_base`, and `state_base` (parents first, see "Ownership records"), then takes the run lock in the target LDAP. If another host holds it, Dolly exits quietly with code 0. `--dry-run` takes no lock. See "Run lock".
 2. **Bleat.** Dolly binds to AD (trying `source.urls` in random order) and runs paged searches for all in-scope groups on every run, and for all in-scope users in every run that syncs users — a `--users` run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced by a group. A `--groups` run doesn't search the users base at all: it fetches each group member by DN (base-scope lookups, several at a time), following nested groups the same way, so its cost follows the size of the synced groups, not of the users base. Large `member` attributes are fetched with ranged retrieval (`member;range=…`). Group members that the searches didn't return — outside the configured bases, or every member in a `--groups` run — are fetched by DN, and must match `source.users.filter` (users) or `source.groups.filter` (groups), exactly like the searches; a member that matches neither is skipped as filtered, as if it were out of scope. On the target, a run that syncs users reads all of `users_base`; a `--groups` run reads only `groups_base` and `state_base`, and looks up the uids of the members it would add in batches (`(|(uid=a)(uid=b)…)`, 50 per search). If any read from AD or the target fails or comes back truncated (for example `sizeLimitExceeded`), the run aborts. Dolly never plans from partial data.
 3. **Shear.** Each entry is mapped through the configured attribute rules. Entries missing a `required` attribute are ignored (a user without `uidNumber` or `gidNumber` only for its own entry; it can still be a group member), and the run summary lists them once rather than warning every run. Nested groups are flattened. Members are resolved by DN to the user's `objectGUID` and then to the target DN and uid, never by CN, because CNs aren't unique and can contain escaped commas.
 4. **Compare.** Dolly reads the target entries and its ownership records under `state_base`, then plans adds, attribute modifies, renames (`modrdn`), and member additions and removals.
@@ -336,7 +384,7 @@ ou=dolly,dc=local
 └── cn=status             last successful run, current failure, last notification
 ```
 
-Dolly creates `state_base` and its children if they're missing (`state_base` needs an `ou=` or `cn=` RDN for that; otherwise create it by hand). It doesn't create `users_base` or `groups_base`. If those are missing, it stops with a clear error. User records also keep small `description` key=value notes: `missing-since`, an RFC 3339 UTC timestamp (for example `2026-09-21T19:00:00Z`) recording when a user went missing from AD; `saved-shell`, the shell to restore after a disabled account is re-enabled; and `renaming-from=<old DN>`, present only while a rename is in progress (see below).
+Dolly creates `state_base` and its children if they're missing (`state_base` needs an `ou=` or `cn=` RDN for that; otherwise create it by hand). A real run also creates a missing `users_base` or `groups_base` as an `organizationalUnit`, if its RDN is `ou=`; with any other RDN the run stops with a clear error, and you create it by hand. Dolly never creates parent entries: the parent of each base must exist. A real run creates the missing bases before it takes the run lock, parents first (another host creating one at the same moment is fine). A groups-only run creates `users_base` too, so members can be added once their entries appear there. In a dry run a missing base reads as empty, so `--dry-run` works before the first real run and shows the bases a real run would create under "Containers", parents first. A base that exists but that `target.bind_dn` can't see (OpenLDAP answers `noSuchObject` without a `disclose` ACL) also reads as empty; a real run never plans from that. After the read it aborts, before any change, with `base groups_base ... is missing or not readable by target.bind_dn` (recorded in `cn=status` and mailed like any failure), because planning from an empty base would claim every AD member as Dolly-owned and later remove local members. User records also keep small `description` key=value notes: `missing-since`, an RFC 3339 UTC timestamp (for example `2026-09-21T19:00:00Z`) recording when a user went missing from AD; `saved-shell`, the shell to restore after a disabled account is re-enabled; and `renaming-from=<old DN>`, present only while a rename is in progress (see below).
 
 The rules:
 
@@ -463,7 +511,41 @@ SMTP without authentication (plain relay, the usual campus relay on port 25) nee
 
 ## TLS certificates
 
-If the TLS handshake fails because the server's CA isn't trusted locally (common with an internal AD CA), pull the server's certificate chain and point `ca_file` at it:
+Dolly verifies every LDAP server's certificate. There are two ways to make an untrusted server work:
+
+- **`ca_file`:** a PEM bundle of the CA (or chain) that signed the server's certificate, added to the system roots. Use it for a real CA, such as an internal AD CA. Dolly then checks the chain, the expiry, and the host name as usual.
+- **`tls_fingerprint`:** pin the server's own (leaf) certificate. It is a list of SHA-256 fingerprints of the certificate's DER bytes, written `sha256:AB:CD:...` or as plain hex, with or without colons, in any case. Dolly accepts the connection only if the leaf certificate matches one entry; the CA chain, the expiry, and the host name are not checked, because the pin itself identifies the server. `source.tls_fingerprint` is a list because each DC has its own certificate: list one entry per DC (any DC may match any entry). When a certificate is renewed, add the new fingerprint before the change and remove the old one after it. Pinning suits self-signed certificates, or a CA you shouldn't trust, such as the demo certificate of the `osixia/openldap` image, whose CA has expired and whose CA private key is public. `ca_file` and `tls_fingerprint` can't both be set on the same side.
+
+`dolly fetch-cert` shows what a server sends. It connects without verifying, sends no credentials, and prints each certificate's subject, issuer, validity (expired ones flagged), and SHA-256 fingerprint, then a line to paste into `dolly.yaml`:
+
+```bash
+dolly fetch-cert ldaps://dc01.example.edu            # port 636
+dolly fetch-cert ldap://ldap.example.edu:389         # StartTLS
+dolly fetch-cert ldaps://dc01.example.edu --out ~/.config/dolly/ad-ca.pem   # also save the chain as PEM, for ca_file
+```
+
+```text
+Certificate chain sent by ldap://ldap.example.edu:389 (leaf first, not verified):
+
+  [0] subject: CN=ldap.example.org,O=Example Inc.
+      issuer:  CN=docker-light-baseimage
+      valid:   2018-01-01T00:00:00Z to 2028-01-01T00:00:00Z
+      sha256:  sha256:3A:9F:...:C2
+
+  [1] subject: CN=docker-light-baseimage
+      issuer:  CN=docker-light-baseimage
+      valid:   2015-06-01T00:00:00Z to 2025-06-01T00:00:00Z EXPIRED
+      sha256:  sha256:91:0B:...:7E
+
+To pin the server's own certificate, set in dolly.yaml (instead of ca_file):
+  tls_fingerprint: ["sha256:3A:9F:...:C2"]
+```
+
+`--out` writes the chain as PEM with mode `0644` and never overwrites an existing file. A fingerprint fetched over the network is only as trustworthy as that network: compare it with the certificate on the server itself (for example `openssl x509 -in /path/to/cert.pem -noout -fingerprint -sha256` there) before you pin it.
+
+When a TLS connection fails certificate verification, in `dolly sync` and in `dolly check`, the error names the cause, the server's leaf fingerprint, and the `dolly fetch-cert URL` command to run. A pinned server whose certificate doesn't match says so and prints the fingerprint it sent.
+
+`openssl` works too, if you prefer it:
 
 ```bash
 openssl s_client -connect dc01.example.edu:636 -showcerts </dev/null 2>/dev/null \
@@ -472,12 +554,12 @@ openssl s_client -connect dc01.example.edu:636 -showcerts </dev/null 2>/dev/null
 openssl x509 -in ~/.config/dolly/ad-ca.pem -noout -subject -issuer -fingerprint -sha256
 ```
 
-Check the fingerprint against a trusted source before relying on it. Dolly never silently disables certificate verification.
+Dolly never disables certificate verification: without a pin it verifies the chain against the system roots plus `ca_file`, and with a pin it checks the pin.
 
 ## Permissions
 
 - **AD:** a regular read-only service account is enough. Dolly never writes to AD.
-- **Target LDAP:** the bind DN needs write access to `users_base`, `groups_base`, and `state_base`, and ideally nothing else (a groups-only deployment needs only read access to `users_base`). It must also be able to read *every* entry under `groups_base` and `state_base`, and under `users_base` in runs that sync users. OpenLDAP's default `olcSizeLimit` (500, or 10000 in the ad2openldap config) truncates searches for any DN except the rootdn, so either bind as the rootdn or raise the limit for Dolly's DN with `olcLimits` on the database entry, for example `olcLimits: dn.exact="cn=dolly,dc=local" size=unlimited time=unlimited`. Dolly aborts on a truncated read, and `dolly check` tests for it. A `--groups` run never reads all of `users_base`, so a large `users_base` behind a hard limit is fine there.
+- **Target LDAP:** the bind DN needs write access to `users_base`, `groups_base`, and `state_base` (and, for Dolly to create a missing base, to add entries under its parent), and ideally nothing else (a groups-only deployment needs only read access to `users_base`, plus add access on its parent if `users_base` is missing, since the first run creates it). It must also be able to read *every* entry under `groups_base` and `state_base`, and under `users_base` in runs that sync users. OpenLDAP's default `olcSizeLimit` (500, or 10000 in the ad2openldap config) truncates searches for any DN except the rootdn, so either bind as the rootdn or raise the limit for Dolly's DN with `olcLimits` on the database entry, for example `olcLimits: dn.exact="cn=dolly,dc=local" size=unlimited time=unlimited`. Dolly aborts on a truncated read, and `dolly check` tests for it. A `--groups` run never reads all of `users_base`, so a large `users_base` behind a hard limit is fine there.
 
 ## Building from source
 

@@ -24,7 +24,7 @@ func TestDialRefusesEmptyPassword(t *testing.T) {
 }
 
 func TestTLSConfig(t *testing.T) {
-	c, err := TLSConfig("dc01.example.edu", "")
+	c, err := TLSConfig("dc01.example.edu", "", nil)
 	if err != nil || c.ServerName != "dc01.example.edu" || c.InsecureSkipVerify || c.RootCAs == nil {
 		t.Fatalf("config %+v, %v", c, err)
 	}
@@ -33,10 +33,10 @@ func TestTLSConfig(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("not a certificate"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := TLSConfig("h", bad); err == nil || !strings.Contains(err.Error(), "no PEM certificates") {
+	if _, err := TLSConfig("h", bad, nil); err == nil || !strings.Contains(err.Error(), "no PEM certificates") {
 		t.Errorf("bad ca_file: %v", err)
 	}
-	if _, err := TLSConfig("h", filepath.Join(dir, "missing.pem")); err == nil {
+	if _, err := TLSConfig("h", filepath.Join(dir, "missing.pem"), nil); err == nil {
 		t.Error("missing ca_file must be an error")
 	}
 }
@@ -187,33 +187,7 @@ func TestDialTimesOutWhenTheBindGetsNoAnswer(t *testing.T) {
 // A bind that succeeds must leave no deadline on the socket: an operation
 // after network_timeout has passed still works.
 func TestDialClearsTheSetupDeadline(t *testing.T) {
-	addr := stallServer(t, func(c net.Conn) {
-		for {
-			id, tag, err := readRequest(c)
-			if err != nil {
-				return
-			}
-			var op ber.Tag
-			switch tag {
-			case ldap.ApplicationBindRequest:
-				op = ldap.ApplicationBindResponse
-			case ldap.ApplicationExtendedRequest:
-				op = ldap.ApplicationExtendedResponse
-			default:
-				return
-			}
-			p := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
-			p.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, id, "MessageID"))
-			r := ber.Encode(ber.ClassApplication, ber.TypeConstructed, op, nil, "Response")
-			r.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, int64(ldap.LDAPResultSuccess), "resultCode"))
-			r.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN"))
-			r.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "diagnosticMessage"))
-			p.AppendChild(r)
-			if _, err := c.Write(p.Bytes()); err != nil {
-				return
-			}
-		}
-	})
+	addr := stallServer(t, answer)
 	timeout := 300 * time.Millisecond
 	conn, err := Dial(context.Background(), Options{URL: "ldap://" + addr, Timeout: timeout, BindDN: "cn=x", Password: "p"})
 	if err != nil {
@@ -223,5 +197,35 @@ func TestDialClearsTheSetupDeadline(t *testing.T) {
 	time.Sleep(2 * timeout)
 	if err := conn.Bind("cn=x", "p"); err != nil {
 		t.Errorf("a bind after the setup deadline failed: %v", err)
+	}
+}
+
+// answer answers every bind and extended request with success, until the
+// connection ends.
+func answer(c net.Conn) {
+	for {
+		id, tag, err := readRequest(c)
+		if err != nil {
+			return
+		}
+		var op ber.Tag
+		switch tag {
+		case ldap.ApplicationBindRequest:
+			op = ldap.ApplicationBindResponse
+		case ldap.ApplicationExtendedRequest:
+			op = ldap.ApplicationExtendedResponse
+		default:
+			return
+		}
+		p := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
+		p.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, id, "MessageID"))
+		r := ber.Encode(ber.ClassApplication, ber.TypeConstructed, op, nil, "Response")
+		r.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, int64(ldap.LDAPResultSuccess), "resultCode"))
+		r.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN"))
+		r.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "diagnosticMessage"))
+		p.AppendChild(r)
+		if _, err := c.Write(p.Bytes()); err != nil {
+			return
+		}
 	}
 }

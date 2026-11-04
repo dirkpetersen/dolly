@@ -57,6 +57,8 @@ Commands:
   install    Install the binary, config, and systemd --user units
              [--users|--groups] [--config FILE]
   uninstall  Remove the units and binary, keep the config
+  fetch-cert Print a server's TLS certificate chain and fingerprint
+             URL [--out FILE]
   version    Print the version
 
 Every command that reads the config accepts --config FILE. Without it Dolly
@@ -83,6 +85,7 @@ func commands() []command {
 		{"check", "Test connectivity, binds, search scopes, the target's containers and size limit, and SMTP.", runCheck},
 		{"install", "Install the binary to ~/.local/bin, create the config from the template if missing, and write the systemd --user units.", runInstall},
 		{"uninstall", "Remove the systemd --user units and the binary. The config is kept.", runUninstall},
+		{"fetch-cert", "Print an LDAP server's TLS certificate chain and the tls_fingerprint line for its leaf.", runFetchCert},
 		{"version", "Print the version.", runVersion},
 	}
 }
@@ -248,7 +251,7 @@ func runContext(cfg *config.Config) (context.Context, func()) {
 	return ctx, func() { cancel(); stop() }
 }
 
-// realRun is a real sync or adopt: create state_base if missing, take the
+// realRun is a real sync or adopt: create the bases if missing, take the
 // run lock, read AD and the target, plan, check the guard, apply, write
 // cn=status, and release the lock.
 //
@@ -273,13 +276,13 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		return exitError
 	}
 	defer conn.Close()
-	created, err := target.EnsureStateBase(ctx, conn, sb)
+	created, err := target.EnsureBases(ctx, conn, cfg.Target)
+	for _, c := range created {
+		fmt.Fprintf(stderr, "dolly: created %s\n", c)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: target %s: %v\n", cmd, cfg.Target.URL, err)
 		return exitError
-	}
-	if created {
-		fmt.Fprintf(stderr, "dolly: created state_base %s\n", sb)
 	}
 	// The run context may be cancelled by now (signal, run_timeout), so the
 	// release and the status write use fresh short-timeout contexts.
@@ -351,6 +354,9 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 
 	opt.Now = time.Now()
 	snaps, err := readSnapshots(ctx, cfg, opt, stderr)
+	if err == nil {
+		err = checkBasesRead(cfg, snaps.Target)
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -383,6 +389,25 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 	}
 	status("", summary)
 	return exitOK
+}
+
+// checkBasesRead fails a real run whose read found a base missing, although
+// the run created the missing bases before the lock.
+//
+// spec: a base the bind DN can't see reads as empty (OpenLDAP answers
+// noSuchObject), and planning from that would claim every AD member of
+// every group as Dolly-owned, so local members would later be removed.
+// Only a dry run plans from a missing base.
+func checkBasesRead(cfg *config.Config, t *model.TargetSnapshot) error {
+	for _, b := range []struct {
+		name, dn string
+		missing  bool
+	}{{"users_base", cfg.Target.UsersBase, t.MissingUsersBase}, {"groups_base", cfg.Target.GroupsBase, t.MissingGroupsBase}} {
+		if b.missing {
+			return fmt.Errorf("target %s: base %s %s is missing or not readable by target.bind_dn (%s); nothing was changed", cfg.Target.URL, b.name, b.dn, cfg.Target.BindDN)
+		}
+	}
+	return nil
 }
 
 // notifyOptions are the notification options other than the config

@@ -24,6 +24,7 @@ nav = [
     "operations/scheduling.md",
     "operations/notifications.md",
     "operations/tls.md",
+    "operations/gid-from-upg.md",
     "operations/permissions.md",
   ] },
   { "Development" = "development.md" },
