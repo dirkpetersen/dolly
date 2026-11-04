@@ -46,14 +46,14 @@ mapping:
   users:
     rdn: uid
     object_classes: [account, posixAccount]
-    required: [uid, uidNumber, gidNumber]   # needed for a user entry; a group member needs only uid's source
+    required: [sAMAccountName, uidNumber, gidNumber]   # needed for a user entry; a group member needs only uid's source
     create_only: [loginShell, homeDirectory]  # set on creation, then never overwritten (local overrides survive)
-    attributes:
-      uid: uid
-      cn: uid
+    attributes:                       # AD attribute names; for AD's uid attribute set uid, cn, required, and homeDirectory to uid
+      uid: sAMAccountName
+      cn: sAMAccountName
       uidNumber: uidNumber
       gidNumber: gidNumber
-      homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
+      homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .sAMAccountName) }}'
       loginShell: '{{ or .loginShell "/bin/bash" }}'
       gecos: gecos
     # gid_from_upg:                   # take gidNumber from the user's private group in AD, see "gidNumber from the user private group"

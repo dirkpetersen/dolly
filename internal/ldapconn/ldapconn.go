@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -208,30 +209,56 @@ func explainTLS(err error, rawURL, caFile string) error {
 // IsNoSuchObject reports whether err is LDAP noSuchObject (32).
 func IsNoSuchObject(err error) bool { return ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) }
 
+// Searcher is the search half of an LDAP connection (*ldap.Conn, or a
+// fake in tests).
+type Searcher interface {
+	Search(*ldap.SearchRequest) (*ldap.SearchResult, error)
+}
+
 // SearchPaged runs a paged search and returns every entry. Any error, a
 // sizeLimitExceeded included, fails the whole search: a truncated result is
 // never returned as if it were complete. Search continuation references
-// (referrals to other naming contexts) are not followed.
-func SearchPaged(ctx context.Context, conn *ldap.Conn, req *ldap.SearchRequest, pageSize int) ([]*ldap.Entry, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	res, err := conn.SearchWithPaging(req, uint32(pageSize))
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+// (referrals to other naming contexts) are not followed. If count is not
+// nil, each page's entries are added to it as the page arrives (progress).
+func SearchPaged(ctx context.Context, conn Searcher, req *ldap.SearchRequest, pageSize int, count *atomic.Int64) ([]*ldap.Entry, error) {
+	// The paging loop of go-ldap's SearchWithPaging, page by page.
+	paging := ldap.NewControlPaging(uint32(pageSize))
+	req.Controls = append(req.Controls, paging)
+	var entries []*ldap.Entry
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) {
-			return nil, fmt.Errorf("%w (result truncated after %d entries; Dolly never plans from partial data)", err, len(res.Entries))
+		res, err := conn.Search(req)
+		if res != nil {
+			entries = append(entries, res.Entries...)
+			if count != nil {
+				count.Add(int64(len(res.Entries)))
+			}
 		}
-		return nil, err
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) {
+				return nil, fmt.Errorf("%w (result truncated after %d entries; Dolly never plans from partial data)", err, len(entries))
+			}
+			return nil, err
+		}
+		if res == nil {
+			return nil, ldap.NewError(ldap.ErrorNetwork, errors.New("ldap: packet not received"))
+		}
+		c, _ := ldap.FindControl(res.Controls, ldap.ControlTypePaging).(*ldap.ControlPaging)
+		if c == nil || len(c.Cookie) == 0 {
+			return entries, nil
+		}
+		paging.SetCookie(c.Cookie)
 	}
-	return res.Entries, nil
 }
 
 // Search runs an unpaged search (base-scope lookups and small bounded
 // searches) with the same all-or-nothing rule as SearchPaged.
-func Search(ctx context.Context, conn *ldap.Conn, req *ldap.SearchRequest) ([]*ldap.Entry, error) {
+func Search(ctx context.Context, conn Searcher, req *ldap.SearchRequest) ([]*ldap.Entry, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

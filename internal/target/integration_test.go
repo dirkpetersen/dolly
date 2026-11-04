@@ -102,7 +102,7 @@ func setup(t *testing.T) *itEnv {
 // deleteTree removes the test subtree, leaves first.
 func (e *itEnv) deleteTree(t *testing.T) {
 	res, err := ldapconn.SearchPaged(context.Background(), e.conn, ldap.NewSearchRequest(e.root, ldap.ScopeWholeSubtree,
-		ldap.NeverDerefAliases, 0, 0, false, "(objectClass=*)", []string{"1.1"}, nil), 500)
+		ldap.NeverDerefAliases, 0, 0, false, "(objectClass=*)", []string{"1.1"}, nil), 500, nil)
 	if err != nil {
 		t.Logf("cleanup: %v", err)
 		return

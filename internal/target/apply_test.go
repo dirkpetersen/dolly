@@ -42,6 +42,11 @@ func templateConfig(t *testing.T) *config.Config {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The AD objects of these tests carry uid, the alternative to the
+	// template's sAMAccountName.
+	u := &c.Mapping.Users
+	u.Attributes["uid"], u.Attributes["cn"], u.Required[0] = "uid", "uid", "uid"
+	u.Attributes["homeDirectory"] = `{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}`
 	return c
 }
 

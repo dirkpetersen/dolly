@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -28,10 +29,30 @@ const lookupChunk = 50
 
 // Reader reads the target server.
 type Reader struct {
-	conn *ldap.Conn
+	conn ReadConn
 	// URL is the server in use.
 	URL string
 	cfg *config.Config
+	// Progress counts what Read and LookupUsers have done, for progress lines.
+	Progress ReadProgress
+}
+
+// ReadConn is the part of an LDAP connection Reader uses (*ldap.Conn, or
+// ldapfake in tests).
+type ReadConn interface {
+	Searcher
+	Close() error
+}
+
+// ReadProgress counts entries read and uids looked up so far.
+type ReadProgress struct {
+	Entries             atomic.Int64 // entries of the subtree reads
+	UIDsDone, UIDsTotal atomic.Int64 // LookupUsers: distinct uids looked up so far, and in all
+}
+
+// NewReader wraps a bound connection to url (Dial uses it; tests pass a fake).
+func NewReader(conn ReadConn, url string, cfg *config.Config) *Reader {
+	return &Reader{conn: conn, URL: url, cfg: cfg}
 }
 
 // Dial connects and binds to target.url, with StartTLS if target.start_tls
@@ -48,7 +69,7 @@ func Dial(ctx context.Context, cfg *config.Config) (*Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("target %s: %w", cfg.Target.URL, err)
 	}
-	return &Reader{conn: conn, URL: cfg.Target.URL, cfg: cfg}, nil
+	return NewReader(conn, cfg.Target.URL, cfg), nil
 }
 
 // Close closes the connection.
@@ -182,7 +203,7 @@ func mergeAttrs(dst, src *model.Entry) {
 // subtree reads every entry under base (paged). A missing base returns nil.
 func (r *Reader) subtree(ctx context.Context, base, name string, attrs []string) ([]*model.Entry, error) {
 	req := ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, "(objectClass=*)", dedupFold(attrs), nil)
-	res, err := ldapconn.SearchPaged(ctx, r.conn, req, pageSize)
+	res, err := ldapconn.SearchPaged(ctx, r.conn, req, pageSize, &r.Progress.Entries)
 	switch {
 	case err != nil && ldapconn.IsNoSuchObject(err):
 		return nil, nil
@@ -206,6 +227,7 @@ func (r *Reader) LookupUsers(ctx context.Context, uids []string) (*model.UserSet
 		}
 	}
 	keys := model.SortedKeys(uniq)
+	r.Progress.UIDsTotal.Store(int64(len(keys)))
 	base := r.cfg.Target.UsersBase
 	for i := 0; i < len(keys); i += lookupChunk {
 		var chunk []string
@@ -222,6 +244,7 @@ func (r *Reader) LookupUsers(ctx context.Context, uids []string) (*model.UserSet
 		for _, e := range res {
 			set.Add(e.DN, e.GetEqualFoldAttributeValues("uid")...)
 		}
+		r.Progress.UIDsDone.Add(int64(len(chunk)))
 	}
 	return set, nil
 }

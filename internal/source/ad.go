@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -22,10 +23,12 @@ const lookupWorkers = 8
 
 // AD is the Source backed by Active Directory.
 type AD struct {
-	conn *ldap.Conn
+	conn Conn
 	// URL is the domain controller in use.
 	URL string
 	cfg *config.Config
+	// Progress counts entries as they arrive, for progress lines.
+	Progress Progress
 
 	userAttrs, groupAttrs, lookupAttrs []string
 	// spelling maps a lowercased attribute name to the spelling the config
@@ -52,7 +55,7 @@ func DialAD(ctx context.Context, cfg *config.Config) (*AD, error) {
 			Timeout: cfg.Sync.NetworkTimeout.Duration, BindDN: cfg.Source.BindDN, Password: pw,
 		})
 		if err == nil {
-			return newAD(conn, u, cfg), nil
+			return NewAD(conn, u, cfg), nil
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -65,7 +68,20 @@ func DialAD(ctx context.Context, cfg *config.Config) (*AD, error) {
 	return nil, fmt.Errorf("no AD domain controller could be used:\n  %s", strings.Join(fails, "\n  "))
 }
 
-func newAD(conn *ldap.Conn, url string, cfg *config.Config) *AD {
+// Conn is the part of an LDAP connection AD uses (*ldap.Conn, or a fake).
+type Conn interface {
+	ldapconn.Searcher
+	Close() error
+}
+
+// Progress counts what a read has fetched so far; Read's caller prints it.
+type Progress struct {
+	Users, Groups, UPGs atomic.Int64 // entries of the paged searches
+	Members             atomic.Int64 // DNs looked up by base-scope searches
+}
+
+// NewAD wraps a bound connection to url (DialAD uses it; tests pass a fake).
+func NewAD(conn Conn, url string, cfg *config.Config) *AD {
 	a := &AD{conn: conn, URL: url, cfg: cfg, spelling: map[string]string{}}
 	base := []string{"objectGUID", "objectClass"}
 	collect := func(extra []string, attrs map[string]string, required []string) []string {
@@ -107,13 +123,13 @@ func (a *AD) Close() error { return a.conn.Close() }
 
 // Users implements Source: a paged subtree search of source.users.
 func (a *AD) Users(ctx context.Context) ([]*model.ADObject, error) {
-	return a.search(ctx, a.cfg.Source.Users, a.userAttrs)
+	return a.search(ctx, a.cfg.Source.Users, a.userAttrs, &a.Progress.Users)
 }
 
 // Groups implements Source: a paged subtree search of source.groups, with
 // every group's members fetched in full by ranged retrieval.
 func (a *AD) Groups(ctx context.Context) ([]*model.ADObject, error) {
-	return a.search(ctx, a.cfg.Source.Groups, a.groupAttrs)
+	return a.search(ctx, a.cfg.Source.Groups, a.groupAttrs, &a.Progress.Groups)
 }
 
 // UPGGroups implements Source: a paged subtree search of source.upg (with
@@ -123,12 +139,12 @@ func (a *AD) UPGGroups(ctx context.Context) ([]*model.ADObject, error) {
 		return nil, nil
 	}
 	u := a.cfg.Source.UPG
-	return a.search(ctx, config.Search{Base: u.Base, Filter: u.Filter}, a.groupAttrs)
+	return a.search(ctx, config.Search{Base: u.Base, Filter: u.Filter}, a.groupAttrs, &a.Progress.UPGs)
 }
 
-func (a *AD) search(ctx context.Context, s config.Search, attrs []string) ([]*model.ADObject, error) {
+func (a *AD) search(ctx context.Context, s config.Search, attrs []string, count *atomic.Int64) ([]*model.ADObject, error) {
 	req := ldap.NewSearchRequest(s.Base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, s.Filter, attrs, nil)
-	entries, err := ldapconn.SearchPaged(ctx, a.conn, req, a.cfg.Source.PageSize)
+	entries, err := ldapconn.SearchPaged(ctx, a.conn, req, a.cfg.Source.PageSize, count)
 	if err != nil {
 		return nil, fmt.Errorf("AD %s: searching %s with %s: %w", a.URL, s.Base, s.Filter, err)
 	}
@@ -165,6 +181,7 @@ func (a *AD) Lookup(ctx context.Context, dns []string) ([]*model.ADObject, []str
 			for i := range jobs {
 				o, filtered, err := a.lookupOne(ctx, dns[i])
 				results[i] = result{o, filtered, err}
+				a.Progress.Members.Add(1)
 				if err != nil {
 					cancel()
 				}

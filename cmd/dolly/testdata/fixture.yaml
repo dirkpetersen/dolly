@@ -4,15 +4,15 @@ ad:
   users:
     - guid: 00000000-0000-0000-0000-000000000001
       dn: CN=Doe\, Jane,OU=People,DC=example,DC=edu
-      attrs: {uid: [jdoe], uidNumber: ["1001"], gidNumber: ["100"], gecos: [Jane Doé]}
+      attrs: {sAMAccountName: [jdoe], uidNumber: ["1001"], gidNumber: ["100"], gecos: [Jane Doé]}
       userAccountControl: 512
     - guid: 00000000-0000-0000-0000-000000000002
       dn: CN=Smith\, Al,OU=People,DC=example,DC=edu
-      attrs: {uid: [asmith], uidNumber: ["1002"], gidNumber: ["100"], loginShell: [/bin/zsh]}
+      attrs: {sAMAccountName: [asmith], uidNumber: ["1002"], gidNumber: ["100"], loginShell: [/bin/zsh]}
       userAccountControl: 514
     - guid: 00000000-0000-0000-0000-000000000003
       dn: CN=No Gid,OU=People,DC=example,DC=edu
-      attrs: {uid: [nogid], uidNumber: ["1003"]}
+      attrs: {sAMAccountName: [nogid], uidNumber: ["1003"]}
   groups:
     - guid: 00000000-0000-0000-0000-0000000000a1
       dn: CN=hpc-users,OU=Groups,DC=example,DC=edu

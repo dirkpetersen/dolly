@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -54,6 +56,7 @@ type wizardWorld struct {
 	adURL, tgtURL string
 	adFP, tgtFP   string
 	dials         *[]ldapconn.Options
+	tgt           *ldapfake.Dir
 }
 
 func newWizardWorld(t *testing.T) *wizardWorld {
@@ -70,6 +73,7 @@ func newWizardWorld(t *testing.T) *wizardWorld {
 	tgt := ldapfake.New()
 	tgt.Put("", map[string][]string{"namingContexts": {"dc=local"}}, now)
 	tgt.Put("ou=people,dc=local", map[string][]string{"objectClass": {"organizationalUnit"}}, now)
+	w.tgt = tgt
 	old := checkDial
 	checkDial = func(_ context.Context, o ldapconn.Options) (check.Conn, error) {
 		*w.dials = append(*w.dials, o)
@@ -107,7 +111,7 @@ func (w *wizardWorld) newAnswers() []string {
 		w.tgtURL, "", // 4
 		"cn=admin,dc=local", tgtPw, // 5
 		"", "", "", // 6: the defaults under dc=local
-		"rfc2307", "sAMAccountName", // 7
+		"rfc2307", "", // 7: Enter takes sAMAccountName
 		"y", // write
 	}
 }
@@ -145,6 +149,9 @@ func TestConfigWizardNew(t *testing.T) {
 	}
 	data, _ := os.ReadFile(path)
 	noSecrets(t, out, errs, string(data))
+	if strings.Contains(out, "\033") {
+		t.Error("color codes with scripted input")
+	}
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +159,7 @@ func TestConfigWizardNew(t *testing.T) {
 	if strings.Join(cfg.Source.URLs, ",") != w.adURL || strings.Join(cfg.Source.TLSFingerprint, ",") != w.adFP || cfg.Source.CAFile != "" ||
 		cfg.Target.URL != w.tgtURL || cfg.Target.StartTLS || strings.Join(cfg.Target.TLSFingerprint, ",") != w.tgtFP || cfg.Target.CAFile != "" ||
 		cfg.Target.UsersBase != "ou=people,dc=local" || cfg.Target.StateBase != "ou=dolly,dc=local" ||
-		cfg.Mapping.Users.Attributes["uid"] != "sAMAccountName" || cfg.Mapping.Users.Required[0] != "sAMAccountName" ||
+		cfg.Mapping.Users.Attributes["uid"] != "sAMAccountName" || cfg.Mapping.Users.Attributes["cn"] != "sAMAccountName" || cfg.Mapping.Users.Required[0] != "sAMAccountName" ||
 		!strings.Contains(cfg.Mapping.Users.Attributes["homeDirectory"], ".sAMAccountName") ||
 		strings.Join(cfg.Mapping.Groups.ObjectClasses, ",") != "posixGroup" || cfg.Mapping.Groups.HasMember() || cfg.Notify.SMTPHost != "" {
 		t.Errorf("config:\n%s", data)
@@ -359,7 +366,7 @@ func TestConfigWizardAbortAndTemplateUID(t *testing.T) {
 		t.Errorf("abort: exit %d\n%s\n%s", code, out, errs)
 	}
 	data, _ := os.ReadFile(templateCopy(t))
-	data = []byte(strings.Replace(string(data), "      uid: uid\n", "      uid: '{{ .sAMAccountName }}'\n", 1))
+	data = []byte(strings.Replace(string(data), "      uid: sAMAccountName\n", "      uid: '{{ .sAMAccountName }}'\n", 1))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -419,5 +426,50 @@ func TestConfigWizardUneditedTemplate(t *testing.T) {
 	}
 	if cfg, err := config.Load(path); err != nil || cfg.Notify.SMTPHost != "" {
 		t.Errorf("config: %v", err)
+	}
+}
+
+// Prompts are yellow only when enabled, with the reset before the input;
+// NO_COLOR or a non-terminal turns the color off.
+func TestPromptColor(t *testing.T) {
+	var buf bytes.Buffer
+	tio := &ttyIO{r: bufio.NewReader(strings.NewReader("a\n")), out: &buf, color: true}
+	if v, err := tio.Line("Q [x]: "); err != nil || v != "a" || buf.String() != "\033[33mQ [x]: \033[0m" {
+		t.Errorf("colored prompt %q, answer %q, %v", buf.String(), v, err)
+	}
+	if promptColor(&buf) {
+		t.Error("a buffer is not a terminal")
+	}
+	t.Setenv("NO_COLOR", "1")
+	if promptColor(os.Stdout) {
+		t.Error("NO_COLOR set, but color on")
+	}
+	buf.Reset()
+	tio = newWizardIO(&buf).(*ttyIO)
+	tio.r = bufio.NewReader(strings.NewReader("a\n"))
+	if _, err := tio.Line("Q: "); err != nil || strings.Contains(buf.String(), "\033") {
+		t.Errorf("uncolored prompt %q, %v", buf.String(), err)
+	}
+}
+
+// The server's posixGroup kind sets the schema default; choosing the
+// other schema warns and asks once more.
+func TestConfigWizardDetectsSchema(t *testing.T) {
+	w := newWizardWorld(t)
+	w.tgt.Put("", map[string][]string{"namingContexts": {"dc=local"}, "subschemaSubentry": {"cn=Subschema"}}, time.Now())
+	w.tgt.Put("cn=Subschema", map[string][]string{"objectClass": {"subschema"}, "objectClasses": {nisPosixGroup}}, time.Now())
+	a := w.newAnswers()
+	n := len(a)
+	// Step 7: rfc2307bis (warned), not confirmed, then Enter (rfc2307), Enter for the uid.
+	a = append(append(a[:n-3:n-3], "rfc2307bis", "n", "", ""), a[n-1])
+	code, out, errs := runWizard(t, filepath.Join(t.TempDir(), "dolly.yaml"), a...)
+	if !written(code, errs) {
+		t.Fatalf("exit %d\n%s\n%s", code, out, errs)
+	}
+	for _, want := range []string{"server schema: posixGroup is STRUCTURAL (RFC 2307), so the default is rfc2307", "Group schema (rfc2307bis or rfc2307) [rfc2307]",
+		"! the server's posixGroup is STRUCTURAL; rfc2307bis groups will fail to add", "Use rfc2307bis anyway? [y/N]", "group schema:        rfc2307"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
 	}
 }

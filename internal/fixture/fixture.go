@@ -6,7 +6,7 @@
 //
 //	now: 2024-06-01T00:00:00Z      # optional run time, default: the real clock
 //	ad:
-//	  users:  [ {guid, dn, attrs: {uid: [jdoe], ...}, userAccountControl} ]
+//	  users:  [ {guid, dn, attrs: {sAMAccountName: [jdoe], ...}, userAccountControl} ]
 //	  groups: [ {guid, dn, attrs: {name: [...], gidNumber: [...]}, members: [dn, ...]} ]
 //	  upgs:   [ {guid, dn, attrs, members} ]  # the UPG search (source.upg, from: ad)
 //	  others: [ {guid, dn, kind: user|group|other, attrs, members} ]  # out of scope, found by DN only

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime/quotedprintable"
 	"net/mail"
@@ -16,9 +17,12 @@ import (
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/dirkpetersen/dolly/internal/check"
+	"github.com/dirkpetersen/dolly/internal/config"
+	"github.com/dirkpetersen/dolly/internal/fixture"
 	"github.com/dirkpetersen/dolly/internal/install"
 	"github.com/dirkpetersen/dolly/internal/ldapconn"
 	"github.com/dirkpetersen/dolly/internal/ldapfake"
+	"github.com/dirkpetersen/dolly/internal/planner"
 	"github.com/dirkpetersen/dolly/internal/smtpfake"
 )
 
@@ -159,8 +163,16 @@ func targetFake() *ldapfake.Dir {
 	d.Put("uid=jdoe,ou=people,dc=local", map[string][]string{"objectClass": {"account"}, "uid": {"jdoe"}}, now)
 	d.Put("uid=asmith,ou=people,dc=local", map[string][]string{"objectClass": {"account"}, "uid": {"asmith"}}, now)
 	d.Put("ou=group,dc=local", map[string][]string{"objectClass": {"organizationalUnit"}}, now)
+	d.Put("", map[string][]string{"subschemaSubentry": {"cn=Subschema"}}, now)
+	d.Put("cn=Subschema", map[string][]string{"objectClass": {"subschema"}, "objectClasses": {bisPosixGroup}}, now)
 	return d
 }
+
+// posixGroup as OpenLDAP's rfc2307bis.schema and nis.schema define it.
+const (
+	bisPosixGroup = "( 1.3.6.1.1.1.2.2 NAME 'posixGroup' DESC 'Abstraction of a group of accounts' SUP top AUXILIARY MUST gidNumber MAY ( userPassword $ memberUid $ description ) )"
+	nisPosixGroup = "( 1.3.6.1.1.1.2.2 NAME 'posixGroup' DESC 'Abstraction of a group of accounts' SUP top STRUCTURAL MUST ( cn $ gidNumber ) MAY ( userPassword $ memberUid $ description ) )"
+)
 
 // withCheckDial serves dolly check's connections from fakes by URL; a URL
 // without a fake fails like an unreachable server.
@@ -209,7 +221,8 @@ func TestCheck(t *testing.T) {
 		"✓ STARTTLS (certificate verified for 127.0.0.1)",
 		"✓ SMTP: no authentication (username empty)",
 		"- no mail sent (use --send-test-mail",
-		"All 14 checks passed, with 2 warnings.",
+		"✓ posixGroup is AUXILIARY, which matches mapping.groups.object_classes [groupOfNames, posixGroup]",
+		"All 15 checks passed, with 2 warnings.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
@@ -226,6 +239,15 @@ func TestCheck(t *testing.T) {
 			t.Errorf("check wrote to the target: %s", c)
 		}
 	}
+
+	t.Run("schema mismatch", func(t *testing.T) {
+		tgt := targetFake()
+		tgt.Put("cn=Subschema", map[string][]string{"objectClass": {"subschema"}, "objectClasses": {nisPosixGroup}}, time.Now())
+		withCheckDial(t, map[string]*ldapfake.Dir{"ldaps://dc02.example.edu:636": adFake(), "ldap://ldap.example.edu:389": tgt})
+		if _, out, _ := runCLI("check", "--config", testConfig(t, s)); !strings.Contains(out, "! posixGroup is STRUCTURAL (RFC 2307), but mapping.groups.object_classes is [groupOfNames, posixGroup]") {
+			t.Errorf("no mismatch warning:\n%s", out)
+		}
+	})
 
 	t.Run("no DC answers", func(t *testing.T) {
 		withCheckDial(t, map[string]*ldapfake.Dir{"ldap://ldap.example.edu:389": targetFake()})
@@ -368,6 +390,11 @@ func TestRealRunNotifications(t *testing.T) {
 	dir := ldapfake.New()
 	withFake(t, dir, "", false)
 	withSnapshots(t, "testdata/fixture.yaml")
+	read := readSnapshots // a read progress line goes to the uncaptured stderr only
+	readSnapshots = func(ctx context.Context, c *config.Config, opt planner.Options, log, progress io.Writer) (*fixture.Snapshots, error) {
+		fmt.Fprintln(progress, "dolly: reading AD: progress marker")
+		return read(ctx, c, opt, log, progress)
+	}
 
 	// 1. Success with a first warnings list (a conflict, an ignored user):
 	// one mail, with the run's output.
@@ -382,6 +409,9 @@ func TestRealRunNotifications(t *testing.T) {
 	subj, body := mailBody(t, msgs[0])
 	if !strings.Contains(subj, "[dolly] ") || !strings.Contains(subj, "dolly sync warnings changed") {
 		t.Errorf("subject %q", subj)
+	}
+	if !strings.Contains(errs, "progress marker") || strings.Contains(body, "progress marker") || strings.Contains(statusNotes(dir), "progress marker") {
+		t.Errorf("the read progress line must reach stderr only:\n%s", errs)
 	}
 	for _, want := range []string{"Outcome:  succeeded", "list of warnings", "Plan: dolly sync (users and groups)", "conflict     cn=hpc-users,ou=group,dc=local", "Result: 6 applied", "connected to"} {
 		if want == "connected to" {

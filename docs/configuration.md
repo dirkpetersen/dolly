@@ -70,14 +70,14 @@ mapping:
   users:
     rdn: uid
     object_classes: [account, posixAccount]
-    required: [uid, uidNumber, gidNumber]   # needed for a user entry; a group member needs only uid's source
+    required: [sAMAccountName, uidNumber, gidNumber]   # needed for a user entry; a group member needs only uid's source
     create_only: [loginShell, homeDirectory]  # set on creation, then never overwritten (local overrides survive)
-    attributes:
-      uid: uid
-      cn: uid
+    attributes:                       # AD attribute names; for AD's uid attribute set uid, cn, required, and homeDirectory to uid
+      uid: sAMAccountName
+      cn: sAMAccountName
       uidNumber: uidNumber
       gidNumber: gidNumber
-      homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}'
+      homeDirectory: '{{ or .unixHomeDirectory (printf "/home/%s" .sAMAccountName) }}'
       loginShell: '{{ or .loginShell "/bin/bash" }}'
       gecos: gecos
     # gid_from_upg:                   # take gidNumber from the user's private group in AD, see "gidNumber from the user private group"
@@ -156,14 +156,14 @@ mapping:
       - attribute: memberUid
 ```
 
-To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. With `memberUid` only, Dolly doesn't need to write user entries on the target to manage groups, and `empty_group_member` isn't used.
+To check which one a server uses, look up `posixGroup` in its schema (`ldapsearch -x -o ldif-wrap=no -b cn=Subschema -s base objectClasses | grep -i posixGroup`). `STRUCTURAL` means RFC 2307, and `AUXILIARY` means rfc2307bis. `dolly config` and `dolly check` read it for you (from the root DSE's `subschemaSubentry`): `dolly config` sets the default from it and warns if you choose the other schema, and `dolly check` warns if `mapping.groups.object_classes` doesn't match. With `memberUid` only, Dolly doesn't need to write user entries on the target to manage groups, and `empty_group_member` isn't used.
 
 ## Groups-only deployments
 
 Dolly can manage groups without ever creating users. Run `dolly sync --groups` (for example in the systemd unit): the user entries then come from somewhere else, and Dolly only adds and removes group members.
 
 - `target.users_base` can be read-only for Dolly, and larger than the server's search size limit. A `--groups` run never reads it in full; it looks up only the uids of the members it would add, 50 per search.
-- AD users need only the attribute `uid` is mapped from to be group members. If your Unix identity is `sAMAccountName` and the Unix numbers live only on the target, map `uid: sAMAccountName` (and `cn: sAMAccountName`) and put `sAMAccountName` in `mapping.users.required` instead of `uid`. `uidNumber` and `gidNumber` stay in the list; they only matter for user entries, which a groups-only run never creates.
+- AD users need only the attribute `uid` is mapped from to be group members. By default `uid` comes from `sAMAccountName`. If your Unix identity is AD's `uid` attribute, map `uid: uid` and `cn: uid`, put `uid` in `mapping.users.required` instead of `sAMAccountName`, and use `.uid` in the `homeDirectory` template. `uidNumber` and `gidNumber` stay in the list; they only matter for user entries, which a groups-only run never creates.
 - A member is added only if an entry with its uid already exists under `users_base` (this is always on; there's no setting for it). Neither the AD user nor the target entry needs `uidNumber` for this check; only groups need `gidNumber`. Members without a target entry are skipped, not warned about: the run summary shows one count line, and `--debug` lists each skipped (group, user) pair. A skipped member is picked up automatically once its entry exists.
 - The AD users base isn't searched either: every member is fetched from AD by DN, and must still match `source.users.filter`.
 
@@ -172,7 +172,7 @@ Dolly can manage groups without ever creating users. Run `dolly sync --groups` (
 Dolly validates `dolly.yaml` before connecting to anything:
 
 - Unknown keys are a config error. The removed key `sync.require_member_on_target` gets an explanation: its rule (group members must exist on the target) is now always on, so delete the line.
-- `mapping.users.required` must include the AD attributes that `uid`, `uidNumber`, and `gidNumber` are mapped from, when they're mapped from a plain attribute. With the defaults that's `uid`, `uidNumber`, `gidNumber`; with `uid: sAMAccountName` it's `sAMAccountName` instead of `uid`. `uidNumber` and `gidNumber` must be mapped.
+- `mapping.users.required` must include the AD attributes that `uid`, `uidNumber`, and `gidNumber` are mapped from, when they're mapped from a plain attribute. With the defaults that's `sAMAccountName`, `uidNumber`, `gidNumber`; with `uid: uid` it's `uid` instead of `sAMAccountName`. `uidNumber` and `gidNumber` must be mapped.
 - `mapping.groups.required` must include `name` and `gidNumber`.
 - `mapping.users.rdn` must map to the same value as `uid`.
 - Every `create_only` entry must also be a mapped attribute.
@@ -237,13 +237,13 @@ How AD attributes become target entries. Attribute values are plain AD attribute
 |---|---|---|
 | `rdn` | `uid` | The attribute used as the RDN for user entries. |
 | `object_classes` | `[account, posixAccount]` | Object classes written on new user entries. |
-| `required` | `[uid, uidNumber, gidNumber]` | Needed for a user entry. A user missing one gets no entry, but can still be a group member as long as it has the attribute `uid` is mapped from. |
+| `required` | `[sAMAccountName, uidNumber, gidNumber]` | Needed for a user entry. A user missing one gets no entry, but can still be a group member as long as it has the attribute `uid` is mapped from. |
 | `create_only` | `[loginShell, homeDirectory]` | Written only when the user is created; never overwritten afterward, so local admin overrides survive. `disabled_shell` is the one exception (see [Ownership](how-it-works/ownership.md)). |
-| `attributes.uid` | `uid` | Source is AD's `uid` attribute by default (as with ad2openldap). Map `sAMAccountName` instead if that's your Unix identity, and list it in `required`. |
-| `attributes.cn` | `uid` | |
+| `attributes.uid` | `sAMAccountName` | Source is `sAMAccountName` by default (since v0.0.5). Map AD's `uid` attribute instead (as ad2openldap did) if that's your Unix identity, and change `cn`, `required`, and `homeDirectory` to match. |
+| `attributes.cn` | `sAMAccountName` | |
 | `attributes.uidNumber` | `uidNumber` | |
 | `attributes.gidNumber` | `gidNumber` | |
-| `attributes.homeDirectory` | `` `{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}` `` | Falls back to `/home/<uid>` when `unixHomeDirectory` is unset. |
+| `attributes.homeDirectory` | `` `{{ or .unixHomeDirectory (printf "/home/%s" .sAMAccountName) }}` `` | Falls back to `/home/<uid>` when `unixHomeDirectory` is unset. |
 | `attributes.loginShell` | `` `{{ or .loginShell "/bin/bash" }}` `` | Falls back to `/bin/bash`. |
 | `attributes.gecos` | `gecos` | Transliterated to ASCII on write; see [Ownership](how-it-works/ownership.md). |
 | `gid_from_upg.group_name` | `u-{{ .uid }}` (optional) | Go template for the name of the user's private group in AD. Dolly takes `gidNumber` from that group. See [gidNumber from the user private group](operations/gid-from-upg.md). |

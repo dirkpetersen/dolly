@@ -6,6 +6,7 @@ package check
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -409,6 +410,34 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 		checkLock(p, conn, cfg)
 	default:
 		missingBase("state_base", t.StateBase, true)
+	}
+	checkSchema(p, conn, cfg)
+}
+
+// checkSchema compares the server's posixGroup kind with
+// mapping.groups.object_classes: groupOfNames + posixGroup needs an
+// AUXILIARY posixGroup (rfc2307bis), posixGroup alone a STRUCTURAL one.
+func checkSchema(p *printer, conn Conn, cfg *config.Config) {
+	kind, err := ReadPosixGroupKind(conn)
+	if err == nil && kind == "" {
+		err = errors.New("posixGroup is not defined")
+	}
+	if err != nil {
+		p.warn("could not read the server schema (%v); check which group schema your server has", err)
+		return
+	}
+	bis := false
+	for _, c := range cfg.Mapping.Groups.ObjectClasses {
+		bis = bis || strings.EqualFold(c, "groupOfNames")
+	}
+	classes := strings.Join(cfg.Mapping.Groups.ObjectClasses, ", ")
+	switch {
+	case kind == "STRUCTURAL" && bis:
+		p.warn("posixGroup is STRUCTURAL (RFC 2307), but mapping.groups.object_classes is [%s]: adding these groups will fail (use [posixGroup] with memberUid only)", classes)
+	case kind == "AUXILIARY" && !bis:
+		p.warn("posixGroup is AUXILIARY (rfc2307bis), but mapping.groups.object_classes is [%s] without groupOfNames: OpenLDAP may reject a group without a structural class (rfc2307bis is [groupOfNames, posixGroup])", classes)
+	default:
+		p.ok("posixGroup is %s, which matches mapping.groups.object_classes [%s]", kind, classes)
 	}
 }
 

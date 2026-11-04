@@ -143,11 +143,11 @@ ad:
   users:
     - guid: 00000000-0000-0000-0000-000000000001
       dn: CN=jdoe,OU=People,DC=example,DC=edu
-      attrs: {uid: [jdoe]}
+      attrs: {sAMAccountName: [jdoe]}
       userAccountControl: 512
     - guid: 00000000-0000-0000-0000-000000000002
       dn: CN=bob,OU=People,DC=example,DC=edu
-      attrs: {uid: [bob]}
+      attrs: {sAMAccountName: [bob]}
       userAccountControl: 512
   groups:
     - guid: 00000000-0000-0000-0000-0000000000a1

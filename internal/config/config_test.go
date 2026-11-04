@@ -82,7 +82,7 @@ func TestValidationErrors(t *testing.T) {
 		{"member needs placeholder", []string{"empty_group_member: cn=empty,dc=local", `empty_group_member: ""`}, "target.empty_group_member: required when"},
 		{"bad template", []string{`'{{ or .loginShell "/bin/bash" }}'`, `'{{ or .loginShell }'`}, "mapping.users.attributes.loginShell"},
 		{"not an attribute", []string{"gecos: gecos", "gecos: two words"}, "neither an AD attribute name nor a Go template"},
-		{"required is absolute", []string{"required: [uid, uidNumber, gidNumber]", "required: [uid, uidNumber]"}, "mapping.users.required: must include gidNumber"},
+		{"required is absolute", []string{"required: [sAMAccountName, uidNumber, gidNumber]", "required: [sAMAccountName, uidNumber]"}, "mapping.users.required: must include gidNumber"},
 		{"unknown key", []string{"page_size: 500", "page_size: 500\n  pagesize: 1"}, "field pagesize not found"},
 		{"bad filter", []string{"filter: (objectClass=group)", "filter: (objectClass=group"}, "source.groups.filter"},
 		{"same bases", []string{"groups_base: ou=group,dc=local", "groups_base: OU=People,dc=local"}, "target.users_base and target.groups_base must differ"},
@@ -230,16 +230,16 @@ func TestRemovedRequireMemberOnTarget(t *testing.T) {
 // The users required list must hold the AD attributes uid, uidNumber, and
 // gidNumber are mapped from, whatever they are called.
 func TestRequiredFollowsUIDSource(t *testing.T) {
-	sam := []string{"      uid: uid\n      cn: uid\n", "      uid: sAMAccountName\n      cn: sAMAccountName\n"}
-	_, err := Parse(edit(t, sam...), "/x/dolly.yaml")
-	if err == nil || !strings.Contains(err.Error(), "mapping.users.required: must include sAMAccountName") {
-		t.Errorf("uid from sAMAccountName, required without it: %v", err)
+	adUID := []string{"      uid: sAMAccountName\n      cn: sAMAccountName\n", "      uid: uid\n      cn: uid\n"}
+	_, err := Parse(edit(t, adUID...), "/x/dolly.yaml")
+	if err == nil || !strings.Contains(err.Error(), "mapping.users.required: must include uid") {
+		t.Errorf("uid from AD uid, required without it: %v", err)
 	}
-	c, err := Parse(edit(t, append(sam, "required: [uid, uidNumber, gidNumber]", "required: [sAMAccountName, uidNumber, gidNumber]")...), "/x/dolly.yaml")
+	c, err := Parse(edit(t, append(adUID, "required: [sAMAccountName, uidNumber, gidNumber]", "required: [uid, uidNumber, gidNumber]")...), "/x/dolly.yaml")
 	if err != nil {
-		t.Fatalf("required with sAMAccountName: %v", err)
+		t.Fatalf("required with uid: %v", err)
 	}
-	if got := c.Mapping.Users.Required; strings.Join(got, ",") != "sAMAccountName,uidNumber,gidNumber" {
+	if got := c.Mapping.Users.Required; strings.Join(got, ",") != "uid,uidNumber,gidNumber" {
 		t.Errorf("required = %v", got)
 	}
 	_, err = Parse(edit(t, "      uidNumber: uidNumber\n", "      uidNumber: employeeNumber\n"), "/x/dolly.yaml")

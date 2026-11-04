@@ -15,11 +15,11 @@ With `gid_from_upg`, Dolly builds a correct target from this AD data. It finds t
 ```yaml
 mapping:
   users:
-    required: [uid, uidNumber]        # gidNumber's source may be left out with gid_from_upg
+    required: [sAMAccountName, uidNumber]  # gidNumber's source may be left out with gid_from_upg
     attributes:
-      uid: uid
+      uid: sAMAccountName
       gidNumber: gidNumber            # keep it mapped: it is the attribute Dolly writes
-      # ...
+      # ... (a present mapping.users must list every attribute: cn, homeDirectory, and so on)
     gid_from_upg:
       group_name: 'u-{{ .uid }}'      # the UPG's AD name for this user
       when: missing                   # or: always

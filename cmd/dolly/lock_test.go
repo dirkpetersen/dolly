@@ -113,7 +113,7 @@ func TestRealRunLockHeld(t *testing.T) {
 func withSnapshots(t *testing.T, fix string) {
 	t.Helper()
 	old := readSnapshots
-	readSnapshots = func(_ context.Context, cfg *config.Config, opt planner.Options, _ io.Writer) (*fixture.Snapshots, error) {
+	readSnapshots = func(_ context.Context, cfg *config.Config, opt planner.Options, _, _ io.Writer) (*fixture.Snapshots, error) {
 		return fixture.Load(fix, cfg, opt.Users || opt.Adopt)
 	}
 	t.Cleanup(func() { readSnapshots = old })
@@ -188,7 +188,7 @@ func TestRealRun(t *testing.T) {
 		}
 		withFake(t, dir, "", false)
 		old := readSnapshots
-		readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, w io.Writer) (*fixture.Snapshots, error) {
+		readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, w, _ io.Writer) (*fixture.Snapshots, error) {
 			s, err := fixture.Load("testdata/fixture.yaml", cfg, true)
 			if err == nil {
 				s.Target.MissingGroupsBase = true // what the reader reports for a hidden base
@@ -221,7 +221,7 @@ func TestRealRun(t *testing.T) {
 		}
 		withFake(t, dir, "", false)
 		old := readSnapshots
-		readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, w io.Writer) (*fixture.Snapshots, error) {
+		readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, w, _ io.Writer) (*fixture.Snapshots, error) {
 			s, err := fixture.Load("testdata/fixture.yaml", cfg, true)
 			if err == nil {
 				s.Target.MissingUPGBase = true
@@ -315,9 +315,9 @@ func TestRealRunUPGFromUsers(t *testing.T) {
 	dir := ldapfake.New()
 	withFake(t, dir, "", false)
 	u := &model.ADObject{GUID: "00000000-0000-0000-0000-000000000001", DN: "CN=a,OU=People,DC=example,DC=edu", Kind: model.KindUser, InScope: true,
-		UserAccountControl: 512, Attrs: map[string][]string{"uid": {"a"}, "uidNumber": {"1001"}, "gidNumber": {"1001"}}}
+		UserAccountControl: 512, Attrs: map[string][]string{"sAMAccountName": {"a"}, "uidNumber": {"1001"}, "gidNumber": {"1001"}}}
 	old := readSnapshots
-	readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, _ io.Writer) (*fixture.Snapshots, error) {
+	readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, _, _ io.Writer) (*fixture.Snapshots, error) {
 		g := &model.ADObject{GUID: "00000000-0000-0000-0000-0000000000a1", DN: "CN=lab,OU=Groups,DC=example,DC=edu", Kind: model.KindGroup, InScope: true,
 			Attrs: map[string][]string{"name": {"lab"}, "gidNumber": {"5001"}}, Members: []string{u.DN}}
 		ad, err := source.Read(ctx, &source.Fake{InScopeUsers: []*model.ADObject{u}, InScopeGroups: []*model.ADObject{g}}, true)

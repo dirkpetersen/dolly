@@ -34,6 +34,7 @@ func cfg(t *testing.T, mod ...func(*config.Config)) *config.Config {
 	if err != nil {
 		t.Fatal(err)
 	}
+	adUID(c) // the AD objects of these tests carry uid; the sAMAccountName default is tested in config and cmd/dolly
 	for _, m := range mod {
 		m(c)
 	}
@@ -41,6 +42,14 @@ func cfg(t *testing.T, mod ...func(*config.Config)) *config.Config {
 		t.Fatal(err)
 	}
 	return c
+}
+
+// adUID maps the uid (and cn, required, homeDirectory) from the AD uid
+// attribute, the alternative to the template's sAMAccountName.
+func adUID(c *config.Config) {
+	u := &c.Mapping.Users
+	u.Attributes["uid"], u.Attributes["cn"], u.Required[0] = "uid", "uid", "uid"
+	u.Attributes["homeDirectory"] = `{{ or .unixHomeDirectory (printf "/home/%s" .uid) }}`
 }
 
 // uidOnly configures RFC 2307 groups (memberUid only).

@@ -213,7 +213,7 @@ func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.O
 		snaps, err = fixture.Load(fix, cfg, opt.Users || opt.Adopt)
 	} else {
 		ctx, cleanup := runContext(cfg)
-		snaps, err = readLive(ctx, cfg, opt, stderr)
+		snaps, err = readLive(ctx, cfg, opt, stderr, stderr)
 		cleanup()
 	}
 	if err != nil {
@@ -369,7 +369,7 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 	}
 
 	opt.Now = time.Now()
-	snaps, err := readSnapshots(ctx, cfg, opt, stderr)
+	snaps, err := readSnapshots(ctx, cfg, opt, stderr, rawErr)
 	if err == nil {
 		err = checkBasesRead(cfg, snaps.Target)
 	}
@@ -454,45 +454,57 @@ type writerConn interface {
 	Close() error
 }
 
-// Progress intervals during apply; tests shorten them.
+// Progress intervals: the first line of a phase after progressFirst, then
+// one every progressEvery (apply) or readProgressEvery (reads); tests
+// shorten them.
 var (
-	progressFirst = 10 * time.Second
-	progressEvery = 60 * time.Second
+	progressFirst     = 10 * time.Second
+	progressEvery     = 60 * time.Second
+	readProgressEvery = 10 * time.Second
 )
 
-// applyWithProgress applies the plan, printing a plain progress line to
-// progress after progressFirst and then every progressEvery while it runs.
-func applyWithProgress(ctx context.Context, conn target.Conn, p *planner.Plan, log, progress io.Writer, debug bool) *target.Result {
-	var prog target.Progress
-	stop, done := make(chan struct{}), make(chan struct{})
+// ticker prints "dolly: <line(elapsed)>" to w after progressFirst and then
+// every `every` until the returned stop is called; stop waits for it, and
+// a phase that ends before progressFirst prints nothing.
+func ticker(w io.Writer, every time.Duration, line func(elapsed time.Duration) string) (stop func()) {
+	quit, done := make(chan struct{}), make(chan struct{})
 	start := time.Now()
 	go func() {
 		defer close(done)
 		t := time.NewTimer(progressFirst)
 		defer t.Stop()
-		next := fmt.Sprintf("; next update every %gs", progressEvery.Seconds())
 		for {
 			select {
-			case <-stop:
+			case <-quit:
 				return
 			case <-t.C:
 			}
 			select {
-			case <-stop: // apply finished as the timer fired
+			case <-quit: // the phase finished as the timer fired
 				return
 			default:
 			}
-			n, total := prog.Done.Load(), len(p.Ops)
-			fmt.Fprintf(progress, "dolly: done %d of %d operations (%d%%), %d failed, %d skipped, %s elapsed%s\n",
-				n, total, n*100/int64(max(total, 1)), prog.Failed.Load(), prog.Skipped.Load(), time.Since(start).Round(time.Second), next)
-			next = ""
-			t.Reset(progressEvery)
+			fmt.Fprintf(w, "dolly: %s\n", line(time.Since(start).Round(time.Second)))
+			t.Reset(every)
 		}
 	}()
-	res := target.ApplyProgress(ctx, conn, p, log, debug, &prog)
-	close(stop)
-	<-done
-	return res
+	return func() { close(quit); <-done }
+}
+
+// applyWithProgress applies the plan, printing a plain progress line to
+// progress after progressFirst and then every progressEvery while it runs.
+func applyWithProgress(ctx context.Context, conn target.Conn, p *planner.Plan, log, progress io.Writer, debug bool) *target.Result {
+	var prog target.Progress
+	next := fmt.Sprintf("; next update every %gs", progressEvery.Seconds())
+	stop := ticker(progress, progressEvery, func(elapsed time.Duration) string {
+		n, total := prog.Done.Load(), len(p.Ops)
+		s := fmt.Sprintf("done %d of %d operations (%d%%), %d failed, %d skipped, %s elapsed%s",
+			n, total, n*100/int64(max(total, 1)), prog.Failed.Load(), prog.Skipped.Load(), elapsed, next)
+		next = ""
+		return s
+	})
+	defer stop()
+	return target.ApplyProgress(ctx, conn, p, log, debug, &prog)
 }
 
 // readSnapshots reads AD and the target for a real run; tests replace it.
@@ -501,8 +513,15 @@ var readSnapshots = readLive
 // dialWriter opens the writer connection; tests replace it.
 var dialWriter = func(cfg *config.Config) (writerConn, error) { return target.DialWriter(cfg) }
 
-// readLive reads AD and the target for a plan, printing progress to
-// stderr. It is read-only: it takes no lock and writes nothing (a real run
+// dialAD and dialTarget open readLive's connections; tests replace them.
+var (
+	dialAD     = source.DialAD
+	dialTarget = target.Dial
+)
+
+// readLive reads AD and the target for a plan, printing the summary lines
+// to stderr and, during a read phase longer than progressFirst, progress
+// lines to progress (uncaptured in a real run). It is read-only: it takes no lock and writes nothing (a real run
 // takes the lock before calling it).
 //
 // spec: a run that syncs users (and adopt) reads the AD users base and the
@@ -510,23 +529,39 @@ var dialWriter = func(cfg *config.Config) (writerConn, error) { return target.Di
 // are fetched by DN, and the target is asked only about the uids those
 // members need (batched lookups), so a huge or size-limited users_base
 // never has to be read.
-func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stderr io.Writer) (*fixture.Snapshots, error) {
+func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stderr, progress io.Writer) (*fixture.Snapshots, error) {
 	start := time.Now()
 	step := time.Now()
-	progress := func(format string, a ...any) {
+	summary := func(format string, a ...any) {
 		now := time.Now()
 		fmt.Fprintf(stderr, "dolly: "+format+" (%s)\n", append(a, now.Sub(step).Round(time.Millisecond))...)
 		step = now
 	}
 	readUsers := opt.Users || opt.Adopt
 
-	ad, err := source.DialAD(ctx, cfg)
+	ad, err := dialAD(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	defer ad.Close()
-	progress("connected to AD %s as %s", ad.URL, cfg.Source.BindDN)
+	summary("connected to AD %s as %s", ad.URL, cfg.Source.BindDN)
+	p := &ad.Progress
+	stop := ticker(progress, readProgressEvery, func(elapsed time.Duration) string {
+		var parts []string
+		if readUsers {
+			parts = append(parts, fmt.Sprintf("%d users", p.Users.Load()))
+		}
+		parts = append(parts, fmt.Sprintf("%d groups", p.Groups.Load()))
+		if cfg.UPGFrom() == config.UPGFromAD {
+			parts = append(parts, fmt.Sprintf("%d user private groups", p.UPGs.Load()))
+		}
+		if !readUsers {
+			parts = append(parts, fmt.Sprintf("%d members fetched by DN", p.Members.Load()))
+		}
+		return fmt.Sprintf("reading AD: %s so far, %s elapsed", strings.Join(parts, ", "), elapsed)
+	})
 	snap, err := source.Read(ctx, ad, readUsers)
+	stop()
 	if err != nil {
 		return nil, err
 	}
@@ -537,20 +572,24 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 		}
 	}
 	if readUsers {
-		progress("read AD: %d users and %d groups in scope, %d objects fetched by DN, %d unresolved, %d filtered",
+		summary("read AD: %d users and %d groups in scope, %d objects fetched by DN, %d unresolved, %d filtered",
 			snap.Count(model.KindUser), snap.Count(model.KindGroup), fetched, len(snap.Unresolved), len(snap.Filtered))
 	} else {
-		progress("read AD: %d groups in scope (users base not read), %d members fetched by DN, %d unresolved, %d filtered",
+		summary("read AD: %d groups in scope (users base not read), %d members fetched by DN, %d unresolved, %d filtered",
 			snap.Count(model.KindGroup), fetched, len(snap.Unresolved), len(snap.Filtered))
 	}
 
-	tr, err := target.Dial(ctx, cfg)
+	tr, err := dialTarget(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	defer tr.Close()
-	progress("connected to target %s as %s", tr.URL, cfg.Target.BindDN)
+	summary("connected to target %s as %s", tr.URL, cfg.Target.BindDN)
+	stop = ticker(progress, readProgressEvery, func(elapsed time.Duration) string {
+		return fmt.Sprintf("reading target: %d entries so far, %s elapsed", tr.Progress.Entries.Load(), elapsed)
+	})
 	tgt, recs, err := tr.Read(ctx, readUsers)
+	stop()
 	if err != nil {
 		return nil, err
 	}
@@ -558,7 +597,7 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 	if !readUsers {
 		users = "users_base not read"
 	}
-	progress("read target: %d group entries, %s, %d user and %d group ownership records",
+	summary("read target: %d group entries, %s, %d user and %d group ownership records",
 		len(tgt.Groups), users, len(recs.Users), len(recs.Groups))
 
 	// spec: a member is added only if its entry exists on the target, so a
@@ -573,12 +612,16 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 		for i, c := range cands {
 			uids[i] = c.UID
 		}
+		stop = ticker(progress, readProgressEvery, func(elapsed time.Duration) string {
+			return fmt.Sprintf("looking up member uids: %d of %d, %s elapsed", tr.Progress.UIDsDone.Load(), tr.Progress.UIDsTotal.Load(), elapsed)
+		})
 		set, err := tr.LookupUsers(ctx, uids)
+		stop()
 		if err != nil {
 			return nil, err
 		}
 		tgt.ExistingUsers = set
-		progress("looked up %d member uids under %s: %d found", len(uids), cfg.Target.UsersBase, len(set.UIDs))
+		summary("looked up %d member uids under %s: %d found", len(uids), cfg.Target.UsersBase, len(set.UIDs))
 	}
 	fmt.Fprintf(stderr, "dolly: read complete in %s\n", time.Since(start).Round(time.Millisecond))
 	return &fixture.Snapshots{AD: snap, Target: tgt, Records: recs}, nil

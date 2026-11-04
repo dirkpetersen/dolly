@@ -38,15 +38,34 @@ type wizardIO interface {
 }
 
 // newWizardIO returns the terminal reader of dolly config; tests replace it.
-var newWizardIO = func(out io.Writer) wizardIO { return &ttyIO{r: bufio.NewReader(stdin), out: out} }
+var newWizardIO = func(out io.Writer) wizardIO {
+	return &ttyIO{r: bufio.NewReader(stdin), out: out, color: promptColor(out)}
+}
+
+// promptColor reports whether prompts are yellow: out is a terminal and
+// NO_COLOR (https://no-color.org) is unset or empty.
+func promptColor(out io.Writer) bool {
+	f, ok := out.(*os.File)
+	return ok && os.Getenv("NO_COLOR") == "" && isTerminal(f.Fd())
+}
 
 type ttyIO struct {
-	r   *bufio.Reader
-	out io.Writer
+	r     *bufio.Reader
+	out   io.Writer
+	color bool
+}
+
+// prompt writes p, in yellow if enabled; the reset comes before any input
+// (and before echo is turned off), so the color never leaks.
+func (t *ttyIO) prompt(p string) {
+	if t.color {
+		p = "\033[33m" + p + "\033[0m"
+	}
+	fmt.Fprint(t.out, p)
 }
 
 func (t *ttyIO) Line(prompt string) (string, error) {
-	fmt.Fprint(t.out, prompt)
+	t.prompt(prompt)
 	s, err := t.r.ReadString('\n')
 	if err != nil {
 		return "", errAbort
@@ -57,7 +76,7 @@ func (t *ttyIO) Line(prompt string) (string, error) {
 // Password reads a line with echo off. A signal while echo is off restores
 // the terminal before the process exits; nothing has been written then.
 func (t *ttyIO) Password(prompt string) (string, error) {
-	fmt.Fprint(t.out, prompt)
+	t.prompt(prompt)
 	restore, err := echoOff(os.Stdin.Fd())
 	if err != nil {
 		return "", fmt.Errorf("turning off echo: %w", err)
@@ -375,6 +394,7 @@ func mappingFor(rfc2307 bool, uidSrc string) (users, groups *yaml.Node, err erro
 	users, groups = mapValue(m, "users"), mapValue(m, "groups")
 	attrs := mapValue(users, "attributes")
 	mapValue(attrs, "uid").Value = uidSrc
+	mapValue(attrs, "cn").Value = uidSrc
 	mapValue(users, "required").Content[0].Value = uidSrc
 	mapValue(attrs, "homeDirectory").Value = fmt.Sprintf(`{{ or .unixHomeDirectory (printf "/home/%%s" .%s) }}`, uidSrc)
 	if rfc2307 {
@@ -601,14 +621,44 @@ func configWizard(cfgFlag string, out io.Writer) error {
 	}
 	fmt.Fprintln(out, "  rfc2307bis: groupOfNames + posixGroup, members as member and memberUid")
 	fmt.Fprintln(out, "  rfc2307:    posixGroup only, members as memberUid")
-	schema, err := w.ask("Group schema (rfc2307bis or rfc2307)", schemaDef, func(v string) error {
-		if v != "rfc2307bis" && v != "rfc2307" {
-			return errors.New("enter rfc2307bis or rfc2307")
+	// The server's posixGroup decides: STRUCTURAL (nis.schema) is RFC 2307,
+	// AUXILIARY is rfc2307bis; groups of the other schema fail to add.
+	serverSchema := ""
+	switch kind, _ := check.ReadPosixGroupKind(tgtConn); kind {
+	case "STRUCTURAL":
+		serverSchema = "rfc2307"
+		fmt.Fprintln(out, "  server schema: posixGroup is STRUCTURAL (RFC 2307), so the default is rfc2307")
+	case "AUXILIARY":
+		serverSchema = "rfc2307bis"
+		fmt.Fprintln(out, "  server schema: posixGroup is AUXILIARY (rfc2307bis), so the default is rfc2307bis")
+	default:
+		fmt.Fprintln(out, "  could not read the server schema; check which one your server has")
+	}
+	if serverSchema != "" {
+		schemaDef = serverSchema
+	}
+	var schema string
+	for {
+		if schema, err = w.ask("Group schema (rfc2307bis or rfc2307)", schemaDef, func(v string) error {
+			if v != "rfc2307bis" && v != "rfc2307" {
+				return errors.New("enter rfc2307bis or rfc2307")
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
-		return nil
-	})
-	if err != nil {
-		return err
+		if serverSchema == "" || schema == serverSchema {
+			break
+		}
+		kind := map[string]string{"rfc2307": "STRUCTURAL", "rfc2307bis": "AUXILIARY"}[serverSchema]
+		fmt.Fprintf(out, "  ! the server's posixGroup is %s; %s groups will fail to add\n", kind, schema)
+		ok, err := w.yes("Use " + schema + " anyway?")
+		if err != nil {
+			return err
+		}
+		if ok {
+			break
+		}
 	}
 	rfc2307 := schema == "rfc2307"
 	emptyMember := ""
