@@ -24,6 +24,7 @@ const (
 const (
 	UserRecordsRDN  = "ou=users"
 	GroupRecordsRDN = "ou=groups"
+	UPGRecordsRDN   = "ou=upg" // records of the UPG set, apart from the user records keyed by the same objectGUID
 	LockRDN         = "cn=lock"
 	StatusRDN       = "cn=status"
 )
@@ -35,6 +36,7 @@ type RecordKind string
 const (
 	UserRecord  RecordKind = "user"
 	GroupRecord RecordKind = "group"
+	UPGRecord   RecordKind = "upg" // a group of the UPG set
 )
 
 // Record is an ownership record: an organizationalRole entry named
@@ -51,8 +53,11 @@ type Record struct {
 
 // RecordsBase returns the container for records of kind k.
 func RecordsBase(stateBase string, k RecordKind) string {
-	if k == GroupRecord {
+	switch k {
+	case GroupRecord:
 		return GroupRecordsRDN + "," + stateBase
+	case UPGRecord:
+		return UPGRecordsRDN + "," + stateBase
 	}
 	return UserRecordsRDN + "," + stateBase
 }

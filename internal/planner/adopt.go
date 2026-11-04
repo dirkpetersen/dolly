@@ -76,7 +76,11 @@ func (p *planner) planAdopt(ad *model.ADSnapshot) {
 		p.addRecord(&model.Record{Kind: model.UserRecord, GUID: guid, SeeAlso: e.DN}, reason)
 	}
 
-	for _, g := range p.sortedGroups() {
+	groups := p.sortedGroups()
+	for _, guid := range model.SortedKeys(p.userUPGs) {
+		groups = append(groups, p.userUPGs[guid])
+	}
+	for _, g := range groups {
 		if p.groupRecs[g.obj.GUID] != nil {
 			continue
 		}
@@ -89,7 +93,11 @@ func (p *planner) planAdopt(ad *model.ADSnapshot) {
 			continue
 		}
 		var owned []string
-		for _, o := range p.flatten(g.obj, true) {
+		members := p.groupMembers[g.obj.GUID] // a UPG made from a user: the user
+		if p.userUPGs[g.obj.GUID] != g {
+			members = p.flatten(g.obj, true)
+		}
+		for _, o := range members {
 			dn := userDN[o.GUID]
 			if dn == "" {
 				continue // a duplicate-uid loser
@@ -104,7 +112,7 @@ func (p *planner) planAdopt(ad *model.ADSnapshot) {
 		if !p.memberMode {
 			total = len(e.Get(config.AttrMemberUID))
 		}
-		p.addRecord(&model.Record{Kind: model.GroupRecord, GUID: g.obj.GUID, SeeAlso: e.DN, Occupants: owned},
+		p.addRecord(&model.Record{Kind: g.kind, GUID: g.obj.GUID, SeeAlso: e.DN, Occupants: owned},
 			fmt.Sprintf("adopt: target group matches AD group %s; %d of %d members are in the AD group and become Dolly-owned, the rest stay local",
 				g.cn, len(owned), total))
 	}

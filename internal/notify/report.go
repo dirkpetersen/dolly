@@ -195,6 +195,7 @@ func planCounts(p *planner.Plan) string {
 	}
 	add(c.UsersAdded+c.UsersModified+c.UsersRenamed+c.UsersDeleted, "users")
 	add(c.GroupsAdded+c.GroupsModified+c.GroupsRenamed, "groups")
+	add(c.UPGsAdded+c.UPGsModified+c.UPGsRenamed, "user private groups")
 	add(c.MembersAdded+c.MembersRemoved, "memberships")
 	return strings.Join(parts, ", ")
 }

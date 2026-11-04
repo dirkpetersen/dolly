@@ -54,13 +54,13 @@ func EnsureStateBase(ctx context.Context, c Conn, stateBase string) (created boo
 }
 
 // EnsureStateBranch creates state_base if it is missing, and before it any
-// users_base or groups_base that state_base lies inside, so the run lock and
+// users_base, groups_base, or upg_base that state_base lies inside, so the run lock and
 // cn=status can be written. It returns what it created.
 func EnsureStateBranch(ctx context.Context, c Conn, t config.Target) (created []string, err error) {
 	return ensureBases(ctx, c, t, func(dn string) bool { return model.IsUnder(t.StateBase, dn) })
 }
 
-// EnsureBases creates users_base, groups_base, and state_base where
+// EnsureBases creates users_base, groups_base, upg_base (if set), and state_base where
 // missing, parents first (one base may sit inside another). A real run calls
 // it once it holds the lock, so a failure is recorded in cn=status. It
 // returns what it created. Each outermost base's parent must exist. A base
@@ -76,10 +76,10 @@ func ensureBases(ctx context.Context, c Conn, t config.Target, want func(dn stri
 	bases := []struct {
 		name, dn string
 		cn       bool
-	}{{"users_base", t.UsersBase, false}, {"groups_base", t.GroupsBase, false}, {"state_base", t.StateBase, true}}
+	}{{"users_base", t.UsersBase, false}, {"groups_base", t.GroupsBase, false}, {"upg_base", t.UPGBase, false}, {"state_base", t.StateBase, true}}
 	sort.SliceStable(bases, func(i, j int) bool { return model.DNDepth(bases[i].dn) < model.DNDepth(bases[j].dn) })
 	for _, b := range bases {
-		if !want(b.dn) {
+		if b.dn == "" || !want(b.dn) {
 			continue
 		}
 		ok, err := ensureBase(ctx, c, b.name, b.dn, b.cn)

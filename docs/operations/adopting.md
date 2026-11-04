@@ -9,7 +9,7 @@ dolly adopt
 
 ## What it does
 
-A tree written by ad2openldap (or created by hand) has no ownership records under `state_base`. For every AD user and group that matches a target entry by `uid` or `cn`, `dolly adopt`:
+A tree written by ad2openldap (or created by hand) has no ownership records under `state_base`. For every AD user and group that matches a target entry by `uid` or `cn` (also the user private groups, see [User private groups](user-private-groups.md)), `dolly adopt`:
 
 - creates an ownership record for that entry, and
 - for each group, marks the members that are also currently in the AD group as Dolly-owned, and treats every other existing member as local.

@@ -114,7 +114,7 @@ func (p *planner) dropPlaceholder(g *model.Entry) {
 // --- ownership records ---
 
 func (p *planner) recIndex(k model.RecordKind) (map[string]*model.Record, map[string]string) {
-	if k == model.GroupRecord {
+	if k != model.UserRecord {
 		return p.groupRecs, p.groupRecBySee
 	}
 	return p.userRecs, p.userRecBySee

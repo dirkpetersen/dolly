@@ -252,8 +252,8 @@ func runContext(cfg *config.Config) (context.Context, func()) {
 }
 
 // realRun is a real sync or adopt: create state_base if missing, take the
-// run lock, create the other bases if missing, read AD and the target, plan, check the guard, apply, write
-// cn=status, and release the lock.
+// run lock, create the other bases if missing, read AD and the target,
+// plan, check the guard, apply, write cn=status, and release the lock.
 //
 // spec: the lock is taken before reading, so the plan is made from data no
 // other Dolly run changes meanwhile. If another run holds the lock, exit 0
@@ -413,7 +413,7 @@ func checkBasesRead(cfg *config.Config, t *model.TargetSnapshot) error {
 	for _, b := range []struct {
 		name, dn string
 		missing  bool
-	}{{"users_base", cfg.Target.UsersBase, t.MissingUsersBase}, {"groups_base", cfg.Target.GroupsBase, t.MissingGroupsBase}} {
+	}{{"users_base", cfg.Target.UsersBase, t.MissingUsersBase}, {"groups_base", cfg.Target.GroupsBase, t.MissingGroupsBase}, {"upg_base", cfg.Target.UPGBase, t.MissingUPGBase}} {
 		if b.missing {
 			return fmt.Errorf("target %s: base %s %s is missing or not readable by target.bind_dn (%s); nothing was changed", cfg.Target.URL, b.name, b.dn, cfg.Target.BindDN)
 		}

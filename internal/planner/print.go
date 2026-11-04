@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-var sectionOrder = []Section{SectionContainers, SectionUsers, SectionGroups, SectionMemberships, SectionRecords}
+var sectionOrder = []Section{SectionContainers, SectionUsers, SectionGroups, SectionUPGs, SectionMemberships, SectionRecords}
 
 var symbols = map[Kind]string{
 	CreateContainer: "+", AddEntry: "+", AddMember: "+", AddPlaceholder: "+", AddRecord: "+",
@@ -34,12 +34,22 @@ func (p *Plan) Print(w io.Writer) {
 		fmt.Fprintf(w, "AD: %d groups in scope; users base not read, %d members fetched by DN; %d unresolved, %d filtered, and %d non-user members skipped\n",
 			c.ADGroups, c.Followed, c.UnresolvedMembers, c.FilteredMembers, c.SkippedMembers)
 	}
+	switch p.UPG {
+	case "ad":
+		fmt.Fprintf(w, "AD: %d user private groups (source.upg)\n", c.ADUPGs)
+	case "users":
+		fmt.Fprintf(w, "AD: user private groups are made from the synced users (source.upg); a run that syncs users syncs them\n")
+	}
 	users := fmt.Sprintf("%d user entries", c.TargetUsers)
 	if !p.TargetUsersRead {
 		users = "users_base not read"
 	}
-	fmt.Fprintf(w, "Target: %s, %d group entries; Dolly owns %d users and %d memberships\n",
-		users, c.TargetGroups, p.Guard.OwnedUsers, p.Guard.OwnedMemberships)
+	upgs := ""
+	if p.UPG != "" {
+		upgs = fmt.Sprintf(", %d user private group entries", c.TargetUPGs)
+	}
+	fmt.Fprintf(w, "Target: %s, %d group entries%s; Dolly owns %d users and %d memberships\n",
+		users, c.TargetGroups, upgs, p.Guard.OwnedUsers, p.Guard.OwnedMemberships)
 
 	for _, sec := range sectionOrder {
 		var steps []int
@@ -99,6 +109,9 @@ func (p *Plan) Print(w io.Writer) {
 	fmt.Fprintf(w, "  users:       +%d ~%d >%d -%d (disabled %d, re-enabled %d, newly missing %d)\n",
 		c.UsersAdded, c.UsersModified, c.UsersRenamed, c.UsersDeleted, c.UsersDisabled, c.UsersReenabled, c.UsersMissing)
 	fmt.Fprintf(w, "  groups:      +%d ~%d >%d\n", c.GroupsAdded, c.GroupsModified, c.GroupsRenamed)
+	if p.UPG != "" {
+		fmt.Fprintf(w, "  upgs:        +%d ~%d >%d\n", c.UPGsAdded, c.UPGsModified, c.UPGsRenamed)
+	}
 	fmt.Fprintf(w, "  memberships: +%d -%d (%d of them local, removed by a prune; %d values renamed)\n", c.MembersAdded, c.MembersRemoved, p.Guard.LocalRemovals, c.MembersRenamed)
 	fmt.Fprintf(w, "  records:     +%d ~%d -%d\n", c.RecordsAdded, c.RecordsUpdated, c.RecordsDeleted)
 	fmt.Fprintf(w, "  ignored:     %d entries missing required attributes\n", c.IgnoredEntries)

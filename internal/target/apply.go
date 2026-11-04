@@ -446,7 +446,7 @@ func (r *Result) Groups() (created, changed []GroupChange) {
 		op := o.Op
 		switch op.Kind {
 		case planner.AddEntry:
-			if op.Section != planner.SectionGroups {
+			if op.Section != planner.SectionGroups && op.Section != planner.SectionUPGs {
 				continue
 			}
 			n := 0

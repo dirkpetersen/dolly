@@ -14,6 +14,7 @@ import (
 type Fake struct {
 	InScopeUsers  []*model.ADObject
 	InScopeGroups []*model.ADObject
+	UPGs          []*model.ADObject // the UPG search (source.upg, from: ad)
 	Others        []*model.ADObject
 	Filtered      []*model.ADObject
 	Err           error
@@ -31,6 +32,11 @@ func (f *Fake) Groups(context.Context) ([]*model.ADObject, error) {
 	return f.InScopeGroups, f.Err
 }
 
+// UPGGroups implements Source.
+func (f *Fake) UPGGroups(context.Context) ([]*model.ADObject, error) {
+	return f.UPGs, f.Err
+}
+
 // Lookup implements Source. It searches all three lists, like a base-scoped
 // search by DN would.
 func (f *Fake) Lookup(_ context.Context, dns []string) ([]*model.ADObject, []string, error) {
@@ -41,7 +47,7 @@ func (f *Fake) Lookup(_ context.Context, dns []string) ([]*model.ADObject, []str
 	var out []*model.ADObject
 	var filtered []string
 	for _, dn := range dns {
-		for _, list := range [][]*model.ADObject{f.Others, f.InScopeUsers, f.InScopeGroups} {
+		for _, list := range [][]*model.ADObject{f.Others, f.InScopeUsers, f.InScopeGroups, f.UPGs} {
 			for _, o := range list {
 				if model.DNEqual(o.DN, dn) {
 					out = append(out, o)

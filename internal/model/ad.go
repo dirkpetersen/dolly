@@ -27,6 +27,8 @@ type ADObject struct {
 	// InScope is true for objects found by the configured user or group
 	// search, false for objects fetched by DN because a group referenced them.
 	InScope bool `yaml:"-" json:"-"`
+	// UPG is true for groups found by the UPG search (source.upg, from: ad).
+	UPG bool `yaml:"-" json:"-"`
 }
 
 // Get returns the values of an AD attribute (case-insensitive name).

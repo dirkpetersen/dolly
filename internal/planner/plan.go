@@ -33,6 +33,7 @@ const (
 	SectionContainers  Section = "Containers"
 	SectionUsers       Section = "Users"
 	SectionGroups      Section = "Groups"
+	SectionUPGs        Section = "User private groups"
 	SectionMemberships Section = "Memberships"
 	SectionRecords     Section = "Ownership records"
 )
@@ -120,6 +121,8 @@ type Counts struct {
 	UsersAdded, UsersModified, UsersRenamed, UsersDeleted  int
 	UsersDisabled, UsersReenabled, UsersMissing            int
 	GroupsAdded, GroupsModified, GroupsRenamed             int
+	UPGsAdded, UPGsModified, UPGsRenamed                   int // the UPG set
+	ADUPGs, TargetUPGs                                     int // AD groups of the UPG search; target entries under upg_base
 	MembersAdded, MembersRemoved, MembersRenamed           int
 	RecordsAdded, RecordsUpdated, RecordsDeleted           int
 	UnresolvedMembers, SkippedMembers, IgnoredEntries      int
@@ -136,6 +139,8 @@ type Guard struct {
 	UserRemovals       int  // user entries deleted this run
 	OwnedUsers         int  // user records before the run
 	ADUsers, ADGroups  int  // in-scope objects AD returned
+	ADUPGs             int  // groups the UPG search returned
+	UPGFromAD          bool // source.upg.from is ad (ADUPGs is meaningful)
 	UsersRead          bool // the AD users base was read (ADUsers is meaningful)
 	MaxDeleteMin       int
 	MaxDeletePercent   float64
@@ -149,8 +154,9 @@ type Plan struct {
 	// Real is set by a real run before printing, so the guard line says
 	// what this run does rather than what a real run would do.
 	Real     bool
-	Users    bool // users were planned
-	Groups   bool // groups were planned
+	Users    bool   // users were planned
+	Groups   bool   // groups were planned
+	UPG      string // source.upg.from, "" without a UPG set
 	Ops      []Op
 	Warnings []Warning
 	// MissingMembers are the (group, member) pairs skipped because the

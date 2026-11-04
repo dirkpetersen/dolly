@@ -18,6 +18,9 @@ type Source interface {
 	Users(ctx context.Context) ([]*model.ADObject, error)
 	// Groups returns every in-scope group with all its member DNs.
 	Groups(ctx context.Context) ([]*model.ADObject, error)
+	// UPGGroups returns every group of the UPG set (source.upg with
+	// from: ad) with all its member DNs, or nothing without one.
+	UPGGroups(ctx context.Context) ([]*model.ADObject, error)
 	// Lookup fetches objects by DN (group members not found by the
 	// searches). An object must match the users filter (source.users.filter)
 	// or the groups filter (source.groups.filter), exactly like the
@@ -47,10 +50,20 @@ func Read(ctx context.Context, src Source, readUsers bool) (*model.ADSnapshot, e
 			return nil, fmt.Errorf("reading AD users: %w", err)
 		}
 	}
-	groups, err := src.Groups(ctx)
+	// UPGs first: a UPG that the shared groups search also returns (the
+	// UPG base inside the groups base) stays a UPG.
+	upgs, err := src.UPGGroups(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading AD user private groups: %w", err)
+	}
+	for _, o := range upgs {
+		o.UPG = true
+	}
+	shared, err := src.Groups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("reading AD groups: %w", err)
 	}
+	groups := append(upgs, shared...)
 	snap := &model.ADSnapshot{UsersRead: readUsers}
 	byDN := map[string]*model.ADObject{}
 	addObj := func(o *model.ADObject, inScope bool) error {

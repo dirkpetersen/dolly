@@ -50,9 +50,17 @@ func Build(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records,
 			p.checkUserIDs()
 			p.planUsers()
 		}
+		// spec: UPGs made from users are planned in runs that sync users
+		// (they need the AD users); a --groups run leaves them alone.
+		userUPGs := opt.Users && p.cfg.UPGFrom() == config.UPGFromUsers
+		if opt.Groups || userUPGs {
+			p.checkGroupIDs(userUPGs)
+		}
 		if opt.Groups {
-			p.checkGroupIDs()
 			p.planGroups()
+		}
+		if userUPGs {
+			p.planUserUPGs()
 		}
 	}
 	p.finish()
@@ -70,12 +78,34 @@ type adUser struct {
 	gidFromUPG bool
 }
 
-// adGroup is a synced AD group, mapped to its target form.
+// adGroup is a synced group, mapped to its target form: an AD group of the
+// shared set or the UPG set, or a UPG made from a user (source.upg.from:
+// users; obj is then the user, and its GUID keys the group's record).
 type adGroup struct {
 	obj   *model.ADObject
 	attrs map[string][]string
 	cn    string
 	dn    string
+	kind  model.RecordKind // GroupRecord (shared set) or UPGRecord (UPG set)
+	// names are the attributes Dolly manages on the entry: the group
+	// mapping's, or for a UPG made from a user only its RDN and gidNumber.
+	names []string
+}
+
+// base is the target container of a group set.
+func (p *planner) base(k model.RecordKind) string {
+	if k == model.UPGRecord {
+		return p.cfg.Target.UPGBase
+	}
+	return p.cfg.Target.GroupsBase
+}
+
+// section is where a group set's entry operations print.
+func section(k model.RecordKind) Section {
+	if k == model.UPGRecord {
+		return SectionUPGs
+	}
+	return SectionGroups
 }
 
 // member is a desired group member.
@@ -102,7 +132,8 @@ type planner struct {
 	validUsers   map[string]*adUser         // GUID -> users with all required attrs (before dedup)
 	members      map[string]*adUser         // GUID -> users that can be group members (dedup winners)
 	users        map[string]*adUser         // GUID -> managed user entries (dedup winners with all required attrs)
-	groups       map[string]*adGroup        // GUID -> synced in-scope groups (dedup winners)
+	groups       map[string]*adGroup        // GUID -> synced in-scope AD groups of both sets (dedup winners)
+	userUPGs     map[string]*adGroup        // user GUID -> UPG made from the user (source.upg.from: users)
 	groupMembers map[string][]*model.ADObject
 	ignoredWhy   map[string]string // GUID -> why an object is not managed
 	unresolved   map[string]bool
@@ -129,7 +160,7 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 	p := &planner{
 		cfg:          cfg,
 		opt:          opt,
-		plan:         &Plan{Users: opt.Users || opt.Adopt, Groups: opt.Groups || opt.Adopt},
+		plan:         &Plan{Users: opt.Users || opt.Adopt, Groups: opt.Groups || opt.Adopt, UPG: cfg.UPGFrom()},
 		userVals:     map[string]config.Value{},
 		groupVals:    map[string]config.Value{},
 		memberMode:   cfg.Mapping.Groups.HasMember(),
@@ -141,6 +172,7 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		members:      map[string]*adUser{},
 		users:        map[string]*adUser{},
 		groups:       map[string]*adGroup{},
+		userUPGs:     map[string]*adGroup{},
 		groupMembers: map[string][]*model.ADObject{},
 		ignoredWhy:   map[string]string{},
 		unresolved:   map[string]bool{},
@@ -216,7 +248,8 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		p.plan.Guard.OwnedMemberships += len(r.Occupants)
 	}
 	p.plan.Counts.TargetUsers = len(tgt.Users)
-	p.plan.Counts.TargetGroups = len(tgt.Groups)
+	p.plan.Counts.TargetGroups = len(tgt.Groups) - tgt.UPGs
+	p.plan.Counts.TargetUPGs = tgt.UPGs
 	p.plan.TargetUsersRead = tgt.UsersRead
 	p.plan.ADUsersRead = ad.UsersRead
 	return p, nil
@@ -241,6 +274,12 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 	}
 	p.plan.Counts.ADUsers = ad.Count(model.KindUser)
 	p.plan.Counts.ADGroups = ad.Count(model.KindGroup)
+	for _, o := range objs {
+		if o.UPG {
+			p.plan.Counts.ADGroups--
+			p.plan.Counts.ADUPGs++
+		}
+	}
 
 	if p.cfg.Mapping.Users.GIDFromUPG != nil {
 		p.indexUPGs(objs)
@@ -304,7 +343,11 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 			p.ignore(o, p.ignoredWhy[o.GUID])
 			continue
 		}
-		g, err := p.mapGroup(o)
+		kind := model.GroupRecord
+		if o.UPG {
+			kind = model.UPGRecord
+		}
+		g, err := p.mapGroup(o, kind)
 		if err != nil {
 			p.ignoredWhy[o.GUID] = err.Error()
 			p.warn(WarnInvalid, o.DN, err.Error())
@@ -317,8 +360,9 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 		}
 		cands = append(cands, g)
 	}
+	// cn is unique per set: each set has its own target container.
 	for _, g := range dedup(cands, func(g *adGroup) (string, string, string, int) {
-		return g.cn, g.obj.GUID, g.dn, p.rank(p.groupRecs, p.groupRecBySee, g.obj.GUID, g.dn, true)
+		return string(g.kind) + "\x00" + g.cn, g.obj.GUID, g.dn, p.rank(p.groupRecs, p.groupRecBySee, g.obj.GUID, g.dn, true)
 	}, func(loser, winner *adGroup) {
 		p.ignoredWhy[loser.obj.GUID] = "duplicate cn " + loser.cn
 		p.warn(WarnDuplicate, loser.obj.DN, fmt.Sprintf("cn %q is also used by %s, which wins", loser.cn, winner.obj.DN))
@@ -357,6 +401,11 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 		if p.validUsers[u.obj.GUID] != nil {
 			p.users[u.obj.GUID] = u
 		}
+	}
+	// Only runs that plan user UPGs make them, so a --groups run never
+	// lists their warnings.
+	if p.cfg.UPGFrom() == config.UPGFromUsers && (p.opt.Users || p.opt.Adopt) {
+		p.makeUserUPGs()
 	}
 	p.plan.Counts.UnresolvedMembers = len(p.unresolved)
 	p.plan.Counts.FilteredMembers = len(p.filteredSeen)
@@ -452,6 +501,12 @@ func (p *planner) flatten(g *model.ADObject, loose bool) []*model.ADObject {
 					seen[o.GUID] = true
 					out = append(out, o)
 				}
+			case o.Kind == model.KindGroup && o.UPG && !g.UPG:
+				// spec: an AD UPG is never flattened into a shared group;
+				// it counts as a skipped non-user member.
+				if !loose {
+					p.skipped[k] = true
+				}
 			case o.Kind == model.KindGroup:
 				if !p.cfg.Mapping.Groups.FlattenNested || visited[k] {
 					continue
@@ -527,18 +582,17 @@ type upgGroup struct {
 }
 
 // indexUPGs indexes the in-scope AD groups that pass the group mapping
-// (required attributes, a gidNumber) by lowercased name, in DN order.
-//
-// shortcut: the shared groups set is the only one; when a UPG set exists,
-// index that one instead.
+// (required attributes, a gidNumber) by lowercased name, in DN order: the
+// UPG set with source.upg.from: ad, otherwise the shared set.
 func (p *planner) indexUPGs(objs []*model.ADObject) {
 	p.upgByName, p.upgWarned = map[string][]upgGroup{}, map[string]bool{}
+	fromAD := p.cfg.UPGFrom() == config.UPGFromAD
 	for _, o := range objs {
-		if o.Kind != model.KindGroup || !o.InScope || len(o.Missing(p.cfg.Mapping.Groups.Required)) > 0 {
+		if o.Kind != model.KindGroup || !o.InScope || o.UPG != fromAD || len(o.Missing(p.cfg.Mapping.Groups.Required)) > 0 {
 			continue
 		}
 		name := first(o.Get("name"))
-		g, err := p.mapGroup(o)
+		g, err := p.mapGroup(o, model.GroupRecord)
 		if name == "" || err != nil {
 			continue
 		}
@@ -645,7 +699,7 @@ func (p *planner) mapUser(o *model.ADObject) (*adUser, error) {
 	return &adUser{obj: o, attrs: attrs, uid: rdn, dn: model.BuildDN(p.cfg.Mapping.Users.RDN, rdn, p.cfg.Target.UsersBase), disabled: o.Disabled()}, nil
 }
 
-func (p *planner) mapGroup(o *model.ADObject) (*adGroup, error) {
+func (p *planner) mapGroup(o *model.ADObject, kind model.RecordKind) (*adGroup, error) {
 	attrs, err := p.mapAttrs(o, p.groupVals, p.groupAttrs)
 	if err != nil {
 		return nil, err
@@ -654,7 +708,30 @@ func (p *planner) mapGroup(o *model.ADObject) (*adGroup, error) {
 	if cn == "" {
 		return nil, fmt.Errorf("mapped %s is empty", p.cfg.Mapping.Groups.RDN)
 	}
-	return &adGroup{obj: o, attrs: attrs, cn: cn, dn: model.BuildDN(p.cfg.Mapping.Groups.RDN, cn, p.cfg.Target.GroupsBase)}, nil
+	return &adGroup{obj: o, attrs: attrs, cn: cn, dn: model.BuildDN(p.cfg.Mapping.Groups.RDN, cn, p.base(kind)), kind: kind, names: p.groupAttrs}, nil
+}
+
+// makeUserUPGs makes the UPG of every managed user (source.upg.from:
+// users): cn (the group RDN) = the uid, gidNumber = the user's gidNumber
+// (after gid_from_upg), and the user as its only member. The group is keyed
+// by the user's objectGUID, so a uid rename renames the group.
+func (p *planner) makeUserUPGs() {
+	rdn, from := p.cfg.Mapping.Groups.RDN, p.cfg.Source.UPG.GIDAttr()
+	for _, guid := range model.SortedKeys(p.users) {
+		u := p.users[guid]
+		gid := attrFold(u.attrs, from)
+		if why := badIDs(map[string][]string{from: gid}, from); why != "" || len(gid) == 0 {
+			if why == "" {
+				why = from + " is missing"
+			}
+			p.warn(WarnInvalid, u.obj.DN, "no user private group: "+why)
+			continue
+		}
+		obj := &model.ADObject{GUID: guid, DN: u.obj.DN, Kind: model.KindGroup, InScope: true}
+		p.userUPGs[guid] = &adGroup{obj: obj, cn: u.uid, dn: model.BuildDN(rdn, u.uid, p.cfg.Target.UPGBase), kind: model.UPGRecord,
+			attrs: map[string][]string{rdn: {u.uid}, "gidNumber": gid}, names: []string{rdn, "gidNumber"}}
+		p.groupMembers[guid] = []*model.ADObject{u.obj}
+	}
 }
 
 // mapAttrs applies the attribute mapping. Plain names copy all values;
@@ -719,6 +796,9 @@ func (p *planner) containers(t *model.TargetSnapshot) error {
 		missing  bool
 	}
 	bases := []base{{"users_base", tb.UsersBase, t.MissingUsersBase}, {"groups_base", tb.GroupsBase, t.MissingGroupsBase}, {"state_base", tb.StateBase, !t.HasStateBase}}
+	if tb.UPGBase != "" {
+		bases = append(bases, base{"upg_base", tb.UPGBase, t.MissingUPGBase})
+	}
 	sort.SliceStable(bases, func(i, j int) bool { return model.DNDepth(bases[i].dn) < model.DNDepth(bases[j].dn) })
 	for _, b := range bases {
 		if !b.missing {
@@ -739,12 +819,16 @@ func (p *planner) containers(t *model.TargetSnapshot) error {
 	if !t.HasGroupRecords {
 		add("record container", model.RecordsBase(sb, model.GroupRecord), false, "Dolly's state container is missing")
 	}
+	if tb.UPGBase != "" && !t.HasUPGRecords {
+		add("record container", model.RecordsBase(sb, model.UPGRecord), false, "Dolly's state container is missing")
+	}
 	return nil
 }
 
 func (p *planner) finish() {
 	g := &p.plan.Guard
 	g.ADUsers, g.ADGroups = p.plan.Counts.ADUsers, p.plan.Counts.ADGroups
+	g.ADUPGs, g.UPGFromAD = p.plan.Counts.ADUPGs, p.cfg.UPGFrom() == config.UPGFromAD
 	g.MembershipRemovals = len(p.removedPairs)
 	g.LocalRemovals = len(p.localRemovedPairs)
 	g.MaxDeleteMin = p.cfg.Sync.MaxDeleteMin
@@ -798,6 +882,9 @@ func (g *Guard) evaluate() {
 	}
 	if g.ADGroups == 0 {
 		g.Reasons = append(g.Reasons, "AD returned no groups")
+	}
+	if g.UPGFromAD && g.ADUPGs == 0 {
+		g.Reasons = append(g.Reasons, "AD returned no user private groups")
 	}
 	g.Tripped = len(g.Reasons) > 0
 }
@@ -856,13 +943,24 @@ func (p *planner) checkUserIDs() {
 	}
 }
 
-// checkGroupIDs is checkUserIDs for group gidNumbers.
-func (p *planner) checkGroupIDs() {
+// checkGroupIDs is checkUserIDs for group gidNumbers, across both sets;
+// with userUPGs it includes the UPGs made from users.
+func (p *planner) checkGroupIDs(userUPGs bool) {
 	nums := map[string][]string{}
 	own := map[string]bool{}
-	for _, g := range p.sortedGroups() {
+	groups := p.sortedGroups()
+	if userUPGs {
+		for _, guid := range model.SortedKeys(p.userUPGs) {
+			groups = append(groups, p.userUPGs[guid])
+		}
+	}
+	for _, g := range groups {
+		name := g.cn
+		if g.kind == model.UPGRecord {
+			name = "user private group " + g.cn
+		}
 		if n := first(g.attrs["gidNumber"]); n != "" {
-			nums[n] = append(nums[n], g.cn)
+			nums[n] = append(nums[n], name)
 		}
 		own[model.MustDNKey(g.dn)] = true
 	}
@@ -904,19 +1002,27 @@ func (p *planner) sortedGroups() []*adGroup {
 	for _, g := range p.groups {
 		out = append(out, g)
 	}
+	sortGroups(out)
+	return out
+}
+
+// sortGroups orders groups by set (shared first), cn, then GUID.
+func sortGroups(out []*adGroup) {
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].kind != out[j].kind {
+			return out[i].kind == model.GroupRecord
+		}
 		a, b := strings.ToLower(out[i].cn), strings.ToLower(out[j].cn)
 		if a != b {
 			return a < b
 		}
 		return out[i].obj.GUID < out[j].obj.GUID
 	})
-	return out
 }
 
 // entryIndex returns the working entries and seeAlso index for a record kind.
 func (p *planner) entryIndex(k model.RecordKind) (map[string]*model.Entry, map[string]string) {
-	if k == model.GroupRecord {
+	if k != model.UserRecord {
 		return p.groupEntries, p.groupRecBySee
 	}
 	return p.userEntries, p.userRecBySee

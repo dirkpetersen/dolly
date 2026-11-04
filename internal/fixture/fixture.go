@@ -8,10 +8,11 @@
 //	ad:
 //	  users:  [ {guid, dn, attrs: {uid: [jdoe], ...}, userAccountControl} ]
 //	  groups: [ {guid, dn, attrs: {name: [...], gidNumber: [...]}, members: [dn, ...]} ]
+//	  upgs:   [ {guid, dn, attrs, members} ]  # the UPG search (source.upg, from: ad)
 //	  others: [ {guid, dn, kind: user|group|other, attrs, members} ]  # out of scope, found by DN only
 //	  filtered: [ {guid, dn} ]     # in AD, but matching neither search filter
 //	target:
-//	  entries: [ {dn, attrs} ]     # everything under users_base, groups_base, and state_base
+//	  entries: [ {dn, attrs} ]     # everything under users_base, groups_base, upg_base, and state_base
 package fixture
 
 import (
@@ -34,6 +35,7 @@ type File struct {
 	AD  struct {
 		Users    []*model.ADObject `yaml:"users"`
 		Groups   []*model.ADObject `yaml:"groups"`
+		UPGs     []*model.ADObject `yaml:"upgs"`
 		Others   []*model.ADObject `yaml:"others"`
 		Filtered []*model.ADObject `yaml:"filtered"`
 	} `yaml:"ad"`
@@ -69,7 +71,7 @@ func Load(path string, cfg *config.Config, readUsers bool) (*Snapshots, error) {
 	for _, list := range []struct {
 		objs []*model.ADObject
 		kind model.Kind
-	}{{f.AD.Users, model.KindUser}, {f.AD.Groups, model.KindGroup}, {f.AD.Others, model.KindOther}, {f.AD.Filtered, model.KindOther}} {
+	}{{f.AD.Users, model.KindUser}, {f.AD.Groups, model.KindGroup}, {f.AD.UPGs, model.KindGroup}, {f.AD.Others, model.KindOther}, {f.AD.Filtered, model.KindOther}} {
 		for _, o := range list.objs {
 			g, err := model.ParseGUID(o.GUID)
 			if err != nil {
@@ -81,13 +83,13 @@ func Load(path string, cfg *config.Config, readUsers bool) (*Snapshots, error) {
 			}
 		}
 	}
-	fake := &source.Fake{InScopeUsers: f.AD.Users, InScopeGroups: f.AD.Groups, Others: f.AD.Others, Filtered: f.AD.Filtered}
+	fake := &source.Fake{InScopeUsers: f.AD.Users, InScopeGroups: f.AD.Groups, UPGs: f.AD.UPGs, Others: f.AD.Others, Filtered: f.AD.Filtered}
 	ad, err := source.Read(context.Background(), fake, readUsers)
 	if err != nil {
 		return nil, err
 	}
 	tgt, recs, err := model.Classify(f.Target.Entries, model.Bases{
-		Users: cfg.Target.UsersBase, Groups: cfg.Target.GroupsBase, State: cfg.Target.StateBase,
+		Users: cfg.Target.UsersBase, Groups: cfg.Target.GroupsBase, State: cfg.Target.StateBase, UPG: cfg.Target.UPGBase,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fixture %s: %w", path, err)

@@ -124,6 +124,7 @@ func containers() []*model.Entry {
 
 type world struct {
 	ad     []*model.ADObject
+	upgs   []*model.ADObject // the UPG search (source.upg, from: ad)
 	target []*model.Entry
 }
 
@@ -142,12 +143,18 @@ func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
 			fake.InScopeUsers = append(fake.InScopeUsers, o)
 		}
 	}
+	fake.UPGs = w.upgs
 	snap, err := source.Read(context.Background(), fake, opt.Users || opt.Adopt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	entries := append(containers(), w.target...)
-	tgt, recs, err := model.Classify(entries, model.Bases{Users: c.Target.UsersBase, Groups: c.Target.GroupsBase, State: c.Target.StateBase})
+	if c.Target.UPGBase != "" {
+		for _, dn := range []string{c.Target.UPGBase, "ou=upg," + state} {
+			entries = append(entries, &model.Entry{DN: dn, Attrs: map[string][]string{"objectClass": {"organizationalUnit"}}})
+		}
+	}
+	tgt, recs, err := model.Classify(entries, model.Bases{Users: c.Target.UsersBase, Groups: c.Target.GroupsBase, State: c.Target.StateBase, UPG: c.Target.UPGBase})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,12 +171,16 @@ func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
 
 var both = Options{Users: true, Groups: true}
 
-// opStr renders an op compactly for comparisons. Record DNs become rec:<n>.
+// opStr renders an op compactly for comparisons. Record DNs become rec:<n>
+// (upgrec:<n> for the UPG set's records).
 func opStr(op Op) string {
 	dn := op.DN
 	if strings.HasSuffix(dn, ","+state) && strings.HasPrefix(dn, "cn=0000") {
 		n, _ := strconv.ParseInt(strings.TrimLeft(strings.SplitN(strings.TrimPrefix(dn, "cn="), ",", 2)[0][24:], "0"), 16, 64)
 		dn = rec(int(n))
+		if strings.HasSuffix(op.DN, ",ou=upg,"+state) {
+			dn = "upg" + dn
+		}
 	}
 	switch op.Kind {
 	case AddEntry, AddRecord, CreateContainer:

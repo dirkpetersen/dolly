@@ -232,11 +232,16 @@ func checkAD(ctx context.Context, p *printer, cfg *config.Config, o Options) {
 		return
 	}
 	defer conn.Close()
-	for _, s := range []struct {
+	type search struct {
 		name   string
 		search config.Search
 		users  bool
-	}{{"users base", cfg.Source.Users, true}, {"groups base", cfg.Source.Groups, false}} {
+	}
+	searches := []search{{"users base", cfg.Source.Users, true}, {"groups base", cfg.Source.Groups, false}}
+	if u := cfg.Source.UPG; cfg.UPGFrom() == config.UPGFromAD {
+		searches = append(searches, search{"user private groups base (source.upg)", config.Search{Base: u.Base, Filter: u.Filter}, false})
+	}
+	for _, s := range searches {
 		req := ldap.NewSearchRequest(s.search.Base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, s.search.Filter, []string{"objectGUID"},
 			[]ldap.Control{ldap.NewControlPaging(1)})
 		res, err := conn.Search(req)
@@ -333,21 +338,28 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 	}
 	advice := fmt.Sprintf("bind as the rootdn, or raise the limit for Dolly's DN on the database entry: olcLimits: dn.exact=%q size=unlimited time=unlimited (README \"Permissions\")", t.BindDN)
 
-	// groups_base: read in full by every run.
-	switch ok, err := exists(t.GroupsBase); {
-	case err != nil:
-		p.fail("groups_base %s: %v", t.GroupsBase, err)
-	case !ok:
-		missingBase("groups_base", t.GroupsBase, false)
-	default:
-		switch n, limited, err := sizeCheck(t.GroupsBase); {
+	// groups_base and upg_base (the UPG set): read in full by every run.
+	groupBases := [][2]string{{"groups_base", t.GroupsBase}}
+	if t.UPGBase != "" {
+		groupBases = append(groupBases, [2]string{"upg_base", t.UPGBase})
+	}
+	for _, b := range groupBases {
+		name, dn := b[0], b[1]
+		switch ok, err := exists(dn); {
 		case err != nil:
-			p.fail("groups_base %s: reading it: %v", t.GroupsBase, err)
-		case limited:
-			p.fail("groups_base %s: the server truncated a full read after %d entries (sizeLimitExceeded); every run would abort", t.GroupsBase, n)
-			p.note("%s", advice)
+			p.fail("%s %s: %v", name, dn, err)
+		case !ok:
+			missingBase(name, dn, false)
 		default:
-			p.ok("groups_base %s exists; all %d entries readable in one search", t.GroupsBase, n)
+			switch n, limited, err := sizeCheck(dn); {
+			case err != nil:
+				p.fail("%s %s: reading it: %v", name, dn, err)
+			case limited:
+				p.fail("%s %s: the server truncated a full read after %d entries (sizeLimitExceeded); every run would abort", name, dn, n)
+				p.note("%s", advice)
+			default:
+				p.ok("%s %s exists; all %d entries readable in one search", name, dn, n)
+			}
 		}
 	}
 
@@ -427,10 +439,11 @@ func checkLock(p *printer, conn Conn, cfg *config.Config) {
 	}
 }
 
-// isBaseDN reports whether dn is users_base or groups_base, which a real
-// run creates before anything inside it.
+// isBaseDN reports whether dn is users_base, groups_base, or upg_base,
+// which a real run creates before anything inside it.
 func isBaseDN(cfg *config.Config, dn string) bool {
-	return model.DNEqual(dn, cfg.Target.UsersBase) || model.DNEqual(dn, cfg.Target.GroupsBase)
+	return model.DNEqual(dn, cfg.Target.UsersBase) || model.DNEqual(dn, cfg.Target.GroupsBase) ||
+		(cfg.Target.UPGBase != "" && model.DNEqual(dn, cfg.Target.UPGBase))
 }
 
 func parentDN(dn string) string {

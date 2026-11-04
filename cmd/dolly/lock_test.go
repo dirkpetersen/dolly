@@ -17,6 +17,7 @@ import (
 	"github.com/dirkpetersen/dolly/internal/model"
 	"github.com/dirkpetersen/dolly/internal/planner"
 	"github.com/dirkpetersen/dolly/internal/smtpfake"
+	"github.com/dirkpetersen/dolly/internal/source"
 )
 
 // The template's bases: state_base ou=dolly,dc=local.
@@ -209,6 +210,30 @@ func TestRealRun(t *testing.T) {
 			t.Errorf("status:\n%s", st)
 		}
 	})
+	t.Run("hidden upg_base", func(t *testing.T) {
+		dir := ldapfake.New()
+		dir.Put("ou=upg,dc=local", map[string][]string{"objectClass": {"organizationalUnit"}, "ou": {"upg"}}, time.Now())
+		dir.Fail = func(op, dn string, _ any) error {
+			if op == "search" && model.DNEqual(dn, "ou=upg,dc=local") {
+				return ldapfake.Error(ldap.LDAPResultNoSuchObject, "hidden")
+			}
+			return nil
+		}
+		withFake(t, dir, "", false)
+		old := readSnapshots
+		readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, w io.Writer) (*fixture.Snapshots, error) {
+			s, err := fixture.Load("testdata/fixture.yaml", cfg, true)
+			if err == nil {
+				s.Target.MissingUPGBase = true
+			}
+			return s, err
+		}
+		t.Cleanup(func() { readSnapshots = old })
+		code, out, errs := runCLI("sync", "--config", upgConfig(t))
+		if code != 1 || !strings.Contains(errs, "base upg_base ou=upg,dc=local is missing or not readable by target.bind_dn") || strings.Contains(out, "Result:") {
+			t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
+		}
+	})
 	// A base that can't be created is a failure recorded in cn=status (and
 	// mailed), with the lock released.
 	t.Run("base creation fails", func(t *testing.T) {
@@ -265,4 +290,77 @@ func TestRealRun(t *testing.T) {
 			t.Errorf("status after --force:\n%s", st)
 		}
 	})
+}
+
+// upgConfig is a copy of the template with a UPG set made from users.
+func upgConfig(t *testing.T) string {
+	t.Helper()
+	path := templateCopy(t)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.Replace(string(data), "  page_size: 500\n", "  upg:\n    from: users\n  page_size: 500\n", 1)
+	s = strings.Replace(s, "  state_base: ou=dolly,dc=local", "  upg_base: ou=upg,dc=local\n  state_base: ou=dolly,dc=local", 1)
+	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// A real run with a UPG set made from users: EnsureBases creates upg_base
+// and the plan ou=upg, the user and its UPG are added, and a second run
+// (reading the target back from the fake) changes nothing.
+func TestRealRunUPGFromUsers(t *testing.T) {
+	dir := ldapfake.New()
+	withFake(t, dir, "", false)
+	u := &model.ADObject{GUID: "00000000-0000-0000-0000-000000000001", DN: "CN=a,OU=People,DC=example,DC=edu", Kind: model.KindUser, InScope: true,
+		UserAccountControl: 512, Attrs: map[string][]string{"uid": {"a"}, "uidNumber": {"1001"}, "gidNumber": {"1001"}}}
+	old := readSnapshots
+	readSnapshots = func(ctx context.Context, cfg *config.Config, opt planner.Options, _ io.Writer) (*fixture.Snapshots, error) {
+		g := &model.ADObject{GUID: "00000000-0000-0000-0000-0000000000a1", DN: "CN=lab,OU=Groups,DC=example,DC=edu", Kind: model.KindGroup, InScope: true,
+			Attrs: map[string][]string{"name": {"lab"}, "gidNumber": {"5001"}}, Members: []string{u.DN}}
+		ad, err := source.Read(ctx, &source.Fake{InScopeUsers: []*model.ADObject{u}, InScopeGroups: []*model.ADObject{g}}, true)
+		if err != nil {
+			return nil, err
+		}
+		var entries []*model.Entry
+		for _, base := range []string{cfg.Target.UsersBase, cfg.Target.GroupsBase, cfg.Target.UPGBase, cfg.Target.StateBase} {
+			res, err := dir.Search(ldap.NewSearchRequest(base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, "(objectClass=*)", nil, nil))
+			if err != nil {
+				return nil, err
+			}
+			for _, e := range res.Entries {
+				me := &model.Entry{DN: e.DN, Attrs: map[string][]string{}}
+				for _, a := range e.Attributes {
+					me.Attrs[a.Name] = a.Values
+				}
+				entries = append(entries, me)
+			}
+		}
+		tgt, recs, err := model.Classify(entries, model.Bases{Users: cfg.Target.UsersBase, Groups: cfg.Target.GroupsBase, State: cfg.Target.StateBase, UPG: cfg.Target.UPGBase})
+		if err != nil {
+			return nil, err
+		}
+		tgt.UsersRead = true
+		return &fixture.Snapshots{AD: ad, Target: tgt, Records: recs}, nil
+	}
+	t.Cleanup(func() { readSnapshots = old })
+	cfgPath := upgConfig(t)
+	code, out, errs := runCLI("sync", "--config", cfgPath)
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
+	}
+	for _, dn := range []string{"ou=upg,dc=local", "ou=upg,ou=dolly,dc=local", "cn=a,ou=upg,dc=local", "cn=" + u.GUID + ",ou=upg,ou=dolly,dc=local"} {
+		if !dir.Has(dn) {
+			t.Errorf("%s not created: %v", dn, dir.DNs())
+		}
+	}
+	if !strings.Contains(errs, "created upg_base ou=upg,dc=local") {
+		t.Errorf("stderr:\n%s", errs)
+	}
+	code, out, errs = runCLI("sync", "--config", cfgPath)
+	if code != 0 || !strings.Contains(out, "No changes.") {
+		t.Errorf("second run: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
+	}
 }

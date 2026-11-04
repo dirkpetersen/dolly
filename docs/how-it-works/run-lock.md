@@ -4,7 +4,7 @@ Dolly has no local lock file. The run lock lives entirely in the target LDAP, so
 
 ## Taking the lock
 
-Before reading or writing anything else, Dolly creates `state_base` itself if it's missing (just that entry — the ownership-record containers come with the plan), then creates `cn=lock,<state_base>` with a plain LDAP add. The add is atomic at the server, so only one host can ever succeed in creating it. The entry is an `organizationalRole` recording the host, PID, start time, and command as `description` values.
+Before reading or writing anything else, Dolly creates `state_base` itself if it's missing, and any base that `state_base` lies inside (just those entries — the ownership-record containers come with the plan, and the other bases are created right after the lock), then creates `cn=lock,<state_base>` with a plain LDAP add. The add is atomic at the server, so only one host can ever succeed in creating it. The entry is an `organizationalRole` recording the host, PID, start time, and command as `description` values.
 
 `dolly sync` and `dolly adopt` take the lock; `--dry-run` never does — it only reads.
 

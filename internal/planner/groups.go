@@ -14,14 +14,72 @@ func (p *planner) planGroups() {
 	// sequence; its member operations need that sequence, and each
 	// membership is a sequence of its own (see deps.go).
 	for _, g := range p.sortedGroups() {
-		p.in(func() { p.syncGroup(g) }, p.groupSeq(g.obj.GUID))
+		p.in(func() { p.syncGroup(g) }, p.groupSeq(g.kind, g.obj.GUID))
 	}
 	// Groups are never deleted. A group gone from AD loses its Dolly-owned
-	// members and its record; the entry and its local members stay.
+	// members and its record; the entry and its local members stay. UPGs
+	// made from users are the users phase's (planUserUPGs): a --groups run
+	// never treats them as gone.
+	// Without a UPG set, UPG records are left alone: removing source.upg
+	// must not delete them all in one run.
+	from, orphans := p.cfg.UPGFrom(), 0
 	for _, guid := range model.SortedKeys(p.groupRecs) {
-		if rec := p.groupRecs[guid]; rec != nil && p.groups[guid] == nil {
-			p.in(func() { p.goneGroup(rec) }, p.groupSeq(guid))
+		rec := p.groupRecs[guid]
+		switch {
+		case rec == nil || p.groups[guid] != nil:
+		case rec.Kind == model.UPGRecord && from == "":
+			orphans++
+		case rec.Kind == model.UPGRecord && from == config.UPGFromUsers:
+		default:
+			p.in(func() { p.goneGroup(rec) }, p.groupSeq(rec.Kind, guid))
 		}
+	}
+	if orphans > 0 {
+		p.warn(WarnInvalid, model.RecordsBase(p.cfg.Target.StateBase, model.UPGRecord),
+			fmt.Sprintf("%d user private group records exist under ou=upg but source.upg is not set; they are left alone", orphans))
+	}
+}
+
+// planUserUPGs syncs the UPGs made from users (source.upg.from: users), in
+// runs that sync users: each managed user's group, and the groups of users
+// no longer managed, which lose their owned member (the group stays). Their
+// record stays while the user's own record does, so a user that comes back
+// gets its member back; once the user's record is gone (pruned), it goes too.
+func (p *planner) planUserUPGs() {
+	gs := make([]*adGroup, 0, len(p.userUPGs))
+	for _, g := range p.userUPGs {
+		gs = append(gs, g)
+	}
+	sortGroups(gs)
+	// A UPG also needs its user's sequence: after a failed user rename the
+	// UPG rename waits for the next run, like the user's own later changes.
+	for _, g := range gs {
+		seq := p.groupSeq(g.kind, g.obj.GUID)
+		p.scoped(scope{needs: []string{seq, p.userSeq(g.obj.GUID)}, provides: []string{seq}}, func() { p.syncGroup(g) })
+	}
+	for _, guid := range model.SortedKeys(p.groupRecs) {
+		rec := p.groupRecs[guid]
+		// A user still synced but without a UPG this run (its gid_number
+		// value turned invalid) keeps its UPG as it is, unless disabled.
+		u := p.users[guid]
+		if rec == nil || rec.Kind != model.UPGRecord || p.userUPGs[guid] != nil || (u != nil && !u.disabled) {
+			continue
+		}
+		if p.userRecs[guid] == nil {
+			p.in(func() { p.goneGroup(rec) }, p.groupSeq(rec.Kind, guid))
+			continue
+		}
+		why := "user is no longer synced (" + p.goneWhy(guid) + ")"
+		if u != nil {
+			why = "user is disabled"
+		}
+		p.in(func() {
+			if cur := p.findManaged(rec); cur != nil {
+				for _, o := range append([]string(nil), rec.Occupants...) {
+					p.removeMembership(cur, rec, o, model.RDNValue(o), false, false, why+"; its private group stays")
+				}
+			}
+		}, p.groupSeq(rec.Kind, guid))
 	}
 }
 
@@ -150,13 +208,26 @@ func (p *planner) syncGroup(g *adGroup) {
 			return
 		}
 		want, _ := p.desired(g)
-		p.createGroup(g, nil, want, "new AD group")
+		reason := "new AD group"
+		if p.userUPGs[guid] == g {
+			reason = "new user private group of AD user " + g.cn
+		}
+		p.createGroup(g, nil, want, reason)
 		return
 	}
 
+	if rec.Kind != g.kind {
+		p.conflict(g.dn, fmt.Sprintf("group %s moved between the shared and UPG sets; delete its record %s and move the entry to %s (or delete the old entry), then run dolly adopt",
+			g.obj.DN, rec.DN(p.cfg.Target.StateBase), p.base(g.kind)))
+		return
+	}
 	cur := p.findManaged(rec)
 	if cur != nil && model.ParentKey(cur.DN) != model.ParentKey(g.dn) {
-		p.conflict(cur.DN, "Dolly-owned group is not directly under groups_base "+p.cfg.Target.GroupsBase+"; skipped")
+		where := "groups_base " + p.cfg.Target.GroupsBase
+		if g.kind == model.UPGRecord {
+			where = "upg_base " + p.cfg.Target.UPGBase
+		}
+		p.conflict(cur.DN, "Dolly-owned group is not directly under "+where+"; skipped")
 		return
 	}
 	if other := p.groupEntries[key]; other != nil && other != cur {
@@ -179,8 +250,8 @@ func (p *planner) syncGroup(g *adGroup) {
 			if model.DNEqual(cur.DN, g.dn) {
 				why = "name case changed in AD"
 			}
-			p.modRDN(SectionGroups, p.groupEntries, cur, g.dn, why)
-			p.plan.Counts.GroupsRenamed++
+			p.modRDN(section(g.kind), p.groupEntries, cur, g.dn, why)
+			p.count(g, &p.plan.Counts.GroupsRenamed, &p.plan.Counts.UPGsRenamed)
 		}
 		p.updateRecord(rec, "rename complete", func(r *model.Record) { r.DelNote(model.NoteRenamingFrom) })
 	}
@@ -231,7 +302,7 @@ func (p *planner) createGroup(g *adGroup, rec *model.Record, want []member, reas
 func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, reason string) {
 	e := &model.Entry{DN: g.dn, Attrs: map[string][]string{}}
 	e.Set("objectClass", p.cfg.Mapping.Groups.ObjectClasses)
-	for _, name := range p.groupAttrs {
+	for _, name := range g.names {
 		e.Set(name, g.attrs[name])
 	}
 	var dns, uids []string
@@ -247,7 +318,7 @@ func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, r
 		e.Set(config.AttrMemberUID, uids)
 	}
 	if rec == nil {
-		rec = &model.Record{Kind: model.GroupRecord, GUID: g.obj.GUID, SeeAlso: g.dn, Occupants: dns}
+		rec = &model.Record{Kind: g.kind, GUID: g.obj.GUID, SeeAlso: g.dn, Occupants: dns}
 		p.addRecord(rec, fmt.Sprintf("record ownership of %s and its %d members before creating it", g.dn, len(dns)))
 	} else {
 		for _, m := range want {
@@ -256,8 +327,8 @@ func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, r
 			}
 		}
 	}
-	p.addEntry(SectionGroups, p.groupEntries, e, fmt.Sprintf("%s with %d members", reason, len(dns)))
-	p.plan.Counts.GroupsAdded++
+	p.addEntry(section(g.kind), p.groupEntries, e, fmt.Sprintf("%s with %d members", reason, len(dns)))
+	p.count(g, &p.plan.Counts.GroupsAdded, &p.plan.Counts.UPGsAdded)
 	for _, m := range want {
 		p.countAdd(g.dn, m.dn)
 	}
@@ -272,7 +343,7 @@ func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, r
 func (p *planner) updateGroupAttrs(g *adGroup, cur *model.Entry) {
 	var changes []Change
 	var names []string
-	for _, name := range p.groupAttrs {
+	for _, name := range g.names {
 		want, have := g.attrs[name], cur.Get(name)
 		if sameValues(want, have) {
 			continue
@@ -284,8 +355,12 @@ func (p *planner) updateGroupAttrs(g *adGroup, cur *model.Entry) {
 		}
 	}
 	if len(changes) > 0 {
-		p.modifyEntry(SectionGroups, cur, changes, "changed in AD: "+strings.Join(names, ", "))
-		p.plan.Counts.GroupsModified++
+		why := "changed in AD: "
+		if p.userUPGs[g.obj.GUID] == g {
+			why = "the user changed in AD: "
+		}
+		p.modifyEntry(section(g.kind), cur, changes, why+strings.Join(names, ", "))
+		p.count(g, &p.plan.Counts.GroupsModified, &p.plan.Counts.UPGsModified)
 	}
 }
 
@@ -376,12 +451,24 @@ func (p *planner) leftWhy(dn string) string {
 // Dolly-owned members, then the record. The group entry stays.
 func (p *planner) goneGroup(rec *model.Record) {
 	why := p.goneWhy(rec.GUID)
+	if rec.Kind == model.UPGRecord && p.cfg.UPGFrom() == config.UPGFromUsers {
+		why = "user record gone: " + why
+	}
 	if cur := p.findManaged(rec); cur != nil {
 		for _, o := range append([]string(nil), rec.Occupants...) {
 			p.removeMembership(cur, rec, o, model.RDNValue(o), false, true, "group gone from AD ("+why+")")
 		}
 	}
 	p.deleteRecord(rec, "group gone from AD ("+why+"); the group entry and its local members stay")
+}
+
+// count increments the shared-set or the UPG-set counter for g.
+func (p *planner) count(g *adGroup, shared, upg *int) {
+	if g.kind == model.UPGRecord {
+		*upg++
+	} else {
+		*shared++
+	}
 }
 
 func (p *planner) countAdd(group, user string) {

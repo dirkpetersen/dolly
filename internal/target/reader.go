@@ -1,5 +1,5 @@
 // Package target reads and writes the target LDAP server. This file is the
-// read-only part: the snapshot of groups_base, users_base, and Dolly's
+// read-only part: the snapshot of groups_base, upg_base, users_base, and Dolly's
 // records under state_base, and targeted uid lookups for groups-only runs.
 // It takes no lock and writes nothing. The writer (apply.go, lock.go,
 // status.go) works through the Conn interface.
@@ -92,6 +92,12 @@ func readSnapshot(cfg *config.Config, url string, readUsers bool, read subtreeFu
 	if err != nil {
 		return nil, nil, err
 	}
+	var upgs []*model.Entry
+	if t.UPGBase != "" {
+		if upgs, err = read(t.UPGBase, "upg_base", groupAttrs); err != nil {
+			return nil, nil, err
+		}
+	}
 	var users []*model.Entry
 	if readUsers {
 		userAttrs := append([]string{"objectClass", "uid"}, model.SortedKeys(cfg.Mapping.Users.Attributes)...)
@@ -104,12 +110,13 @@ func readSnapshot(cfg *config.Config, url string, readUsers bool, read subtreeFu
 	if err != nil {
 		return nil, nil, err
 	}
-	snap, recs, err := model.Classify(combine(t.StateBase, groups, users, state), model.Bases{Users: t.UsersBase, Groups: t.GroupsBase, State: t.StateBase})
+	snap, recs, err := model.Classify(combine(t.StateBase, append(groups, upgs...), users, state), model.Bases{Users: t.UsersBase, Groups: t.GroupsBase, State: t.StateBase, UPG: t.UPGBase})
 	if err != nil {
 		return nil, nil, fmt.Errorf("target %s: %w", url, err)
 	}
 	snap.UsersRead = readUsers
 	snap.MissingGroupsBase = groups == nil
+	snap.MissingUPGBase = t.UPGBase != "" && upgs == nil
 	snap.MissingUsersBase = readUsers && users == nil
 	return snap, recs, nil
 }

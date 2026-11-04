@@ -73,8 +73,8 @@ func (p *planner) userSeq(guid string) string {
 	return seqKey((&model.Record{Kind: model.UserRecord, GUID: guid}).DN(p.cfg.Target.StateBase))
 }
 
-func (p *planner) groupSeq(guid string) string {
-	return seqKey((&model.Record{Kind: model.GroupRecord, GUID: guid}).DN(p.cfg.Target.StateBase))
+func (p *planner) groupSeq(kind model.RecordKind, guid string) string {
+	return seqKey((&model.Record{Kind: kind, GUID: guid}).DN(p.cfg.Target.StateBase))
 }
 
 // deps fills in op's Needs and Provides: the active scopes plus the keys

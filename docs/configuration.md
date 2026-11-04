@@ -42,6 +42,11 @@ source:
   groups:
     base: OU=Groups,DC=example,DC=edu
     filter: (objectClass=group)
+  # upg:                              # optional second group set: user private groups, see "User private groups"
+  #   from: ad                        # ad: AD groups under base that match filter; users: one group per synced user
+  #   base: OU=UPG,DC=example,DC=edu  # from: ad only
+  #   filter: (&(objectClass=group)(cn=u-*))   # from: ad only
+  #   gid_number: gidNumber           # from: users only: the mapped user attribute that gives the group's gidNumber
   page_size: 500
 
 target:
@@ -55,6 +60,7 @@ target:
   users_base: ou=people,dc=local      # users_base and groups_base are created (ou= only) if missing
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
+  # upg_base: ou=upg,dc=local         # with source.upg: where the user private groups go (created if missing, ou= only)
   empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
 # mapping and sync: leave a section (or mapping.users / mapping.groups) out to
@@ -179,6 +185,7 @@ Dolly validates `dolly.yaml` before connecting to anything:
 - Listing `member` in `mapping.groups.membership` requires `target.empty_group_member` to be set.
 - `target.users_base` and `target.groups_base` must differ, since Dolly tells users from groups by their container.
 - `state_base` may live inside `groups_base` or `users_base` (for example `ou=dolly,ou=group,dc=local`), and Dolly ignores that subtree when it reads users and groups. It must not equal either base, and neither base may live inside `state_base`.
+- `source.upg` and `target.upg_base` are set together or not at all. `upg_base` must differ from the other three bases, must not lie inside any of them, and must not contain `users_base` or `groups_base`. With `from: ad`, `base` and `filter` are required and `gid_number` is not allowed. With `from: users`, `base` and `filter` are not allowed, and `gid_number` must be a key of `mapping.users.attributes`. See [User private groups](operations/user-private-groups.md).
 
 ## `source`
 
@@ -196,6 +203,9 @@ Connection and search settings for Active Directory. Dolly only ever reads from 
 | `users.filter` | `(&(objectClass=user)(objectCategory=person))` | LDAP filter selecting in-scope users. It also applies to users fetched by DN as group members. See [Excluding entries](#excluding-entries-with-filters). |
 | `groups.base` | `OU=Groups,DC=example,DC=edu` | Search base for groups. |
 | `groups.filter` | `(objectClass=group)` | LDAP filter selecting in-scope groups. It also applies to nested groups fetched by DN. |
+| `upg.from` | `ad` or `users` (optional) | Turns on the user private group set. See [User private groups](operations/user-private-groups.md). |
+| `upg.base`, `upg.filter` | `OU=UPG,DC=example,DC=edu`, `(objectClass=group)` | With `from: ad`: the search for the AD user private groups. |
+| `upg.gid_number` | `gidNumber` | With `from: users`: the mapped user attribute that gives each group's `gidNumber` (for example `uidNumber`). |
 | `page_size` | `500` | Page size for paged AD searches. Large `member` attributes are also fetched with ranged retrieval regardless of this setting. |
 
 ## `target`
@@ -214,6 +224,7 @@ Connection settings and base DNs for the target LDAP server. Dolly reads and wri
 | `users_base` | `ou=people,dc=local` | Where user entries live. A real run creates it if it is missing, but only with an `ou=` RDN, and its parent must exist. See [Ownership](how-it-works/ownership.md). |
 | `groups_base` | `ou=group,dc=local` | Where group entries live. A real run creates it if it is missing, with the same rules as `users_base`. |
 | `state_base` | `ou=dolly,dc=local` | Where Dolly's ownership records, run lock, and status entry live. Dolly creates this container and its children if missing. See [Ownership](how-it-works/ownership.md). |
+| `upg_base` | `ou=upg,dc=local` (optional) | With `source.upg`: where the user private groups live. Created if missing, with the same rules as `users_base`. |
 | `empty_group_member` | `cn=empty,dc=local` | Placeholder member DN used so a `groupOfNames` group never has zero members. Only used when `member` is in `mapping.groups.membership`; unused with `memberUid` only. See [Group schema](#group-schema-rfc2307bis-or-rfc-2307). |
 
 ## `mapping`

@@ -18,6 +18,11 @@ source:
   groups:
     base: OU=Groups,DC=example,DC=edu
     filter: (objectClass=group)
+  # upg:                              # optional second group set: user private groups, see "User private groups"
+  #   from: ad                        # ad: AD groups under base that match filter; users: one group per synced user
+  #   base: OU=UPG,DC=example,DC=edu  # from: ad only
+  #   filter: (&(objectClass=group)(cn=u-*))   # from: ad only
+  #   gid_number: gidNumber           # from: users only: the mapped user attribute that gives the group's gidNumber
   page_size: 500
 
 target:
@@ -31,6 +36,7 @@ target:
   users_base: ou=people,dc=local      # users_base and groups_base are created (ou= only) if missing
   groups_base: ou=group,dc=local
   state_base: ou=dolly,dc=local       # Dolly's ownership records and run lock, see "Ownership records"
+  # upg_base: ou=upg,dc=local         # with source.upg: where the user private groups go (created if missing, ou= only)
   empty_group_member: cn=empty,dc=local   # placeholder for groupOfNames groups that would otherwise be empty; unused with memberUid only
 
 # mapping and sync: leave a section (or mapping.users / mapping.groups) out to

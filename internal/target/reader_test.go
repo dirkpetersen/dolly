@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 
+	"github.com/dirkpetersen/dolly/internal/config"
 	"github.com/dirkpetersen/dolly/internal/ldapfake"
 	"github.com/dirkpetersen/dolly/internal/model"
 	"github.com/dirkpetersen/dolly/internal/planner"
@@ -232,8 +233,13 @@ func TestEnsureBasesStateInsideGroups(t *testing.T) {
 	cfg := templateConfig(t)
 	cfg.Target.StateBase = "ou=dolly," + groups
 	dir := ldapfake.New()
-	created, err := EnsureBases(context.Background(), dir, cfg.Target)
-	if err != nil || strings.Join(created, ",") != "users_base "+people+",groups_base "+groups+",state_base "+cfg.Target.StateBase {
+	// Before the lock: state_base and the base it lies inside, not users_base.
+	created, err := EnsureStateBranch(context.Background(), dir, cfg.Target)
+	if err != nil || strings.Join(created, ",") != "groups_base "+groups+",state_base "+cfg.Target.StateBase || dir.Has(people) {
+		t.Fatalf("state branch: created %v, %v", created, err)
+	}
+	created, err = EnsureBases(context.Background(), dir, cfg.Target)
+	if err != nil || strings.Join(created, ",") != "users_base "+people {
 		t.Fatalf("created %v, %v", created, err)
 	}
 	if created, err := EnsureBases(context.Background(), dir, cfg.Target); err != nil || len(created) != 0 {
@@ -270,5 +276,50 @@ func TestHiddenBase(t *testing.T) {
 	tgt, _, err := readSnapshot(cfg, "fake", true, hidden)
 	if err != nil || !tgt.MissingGroupsBase || tgt.MissingUsersBase {
 		t.Errorf("snapshot %+v, %v", tgt, err)
+	}
+}
+
+// The UPG set end to end: a missing upg_base and ou=upg are planned and
+// created, the UPG made from the user is added, and the next plan is empty
+// (the reader puts upg_base entries and ou=upg records back in the snapshot).
+func TestUPGSetEndToEnd(t *testing.T) {
+	cfg := templateConfig(t)
+	cfg.Source.UPG = &config.UPGSource{From: config.UPGFromUsers}
+	cfg.Target.UPGBase = "ou=private,dc=local"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	dir := ldapfake.New()
+	u := &model.ADObject{GUID: "00000000-0000-0000-0000-000000000001", DN: "CN=a,OU=People,DC=example,DC=edu", Kind: model.KindUser, InScope: true,
+		UserAccountControl: 512, Attrs: map[string][]string{"uid": {"a"}, "uidNumber": {"1001"}, "gidNumber": {"1001"}}}
+	ad, err := source.Read(context.Background(), &source.Fake{InScopeUsers: []*model.ADObject{u}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := func() *planner.Plan {
+		t.Helper()
+		tgt, recs, err := readSnapshot(cfg, "fake", true, fakeSubtree(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := planner.Build(ad, tgt, recs, cfg, planner.Options{Users: true, Now: time.Now()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	var log bytes.Buffer
+	if res := Apply(context.Background(), dir, plan(), &log, true); !res.OK() {
+		t.Fatalf("apply: %s", log.String())
+	}
+	for _, dn := range []string{"ou=private,dc=local", "cn=a,ou=private,dc=local", "ou=upg," + state, "cn=" + u.GUID + ",ou=upg," + state} {
+		if !dir.Has(dn) {
+			t.Errorf("%s not created: %v", dn, dir.DNs())
+		}
+	}
+	if q := plan(); !q.Empty() {
+		var out bytes.Buffer
+		q.Print(&out)
+		t.Errorf("not converged:\n%s", out.String())
 	}
 }

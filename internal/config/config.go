@@ -53,7 +53,45 @@ type Source struct {
 	BindPasswordFile string   `yaml:"bind_password_file"`
 	Users            Search   `yaml:"users"`
 	Groups           Search   `yaml:"groups"`
-	PageSize         int      `yaml:"page_size"`
+	// UPG, if set, is the second group set: user private groups,
+	// replicated to target.upg_base (see README "User private groups").
+	UPG      *UPGSource `yaml:"upg"`
+	PageSize int        `yaml:"page_size"`
+}
+
+// UPGSource configures the user private group set.
+type UPGSource struct {
+	// From is UPGFromAD (AD groups under Base matching Filter) or
+	// UPGFromUsers (one group per synced user, made by Dolly).
+	From   string `yaml:"from"`
+	Base   string `yaml:"base"`
+	Filter string `yaml:"filter"`
+	// GIDNumber (from: users) names the mapped user attribute that gives
+	// the group's gidNumber; empty means gidNumber.
+	GIDNumber string `yaml:"gid_number"`
+}
+
+// GIDAttr returns the user attribute a UPG made from a user takes its
+// gidNumber from.
+func (u *UPGSource) GIDAttr() string {
+	if u.GIDNumber == "" {
+		return "gidNumber"
+	}
+	return u.GIDNumber
+}
+
+// source.upg.from values.
+const (
+	UPGFromAD    = "ad"
+	UPGFromUsers = "users"
+)
+
+// UPGFrom returns source.upg.from, or "" without a UPG set.
+func (c *Config) UPGFrom() string {
+	if c.Source.UPG == nil {
+		return ""
+	}
+	return c.Source.UPG.From
 }
 
 // Search is a search base and filter.
@@ -74,6 +112,7 @@ type Target struct {
 	UsersBase        string   `yaml:"users_base"`
 	GroupsBase       string   `yaml:"groups_base"`
 	StateBase        string   `yaml:"state_base"`
+	UPGBase          string   `yaml:"upg_base"`
 	EmptyGroupMember string   `yaml:"empty_group_member"`
 }
 
@@ -538,6 +577,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	c.checkStateBase(add)
+	c.checkUPG(add)
 	checkDN("target.empty_group_member", c.Target.EmptyGroupMember, false, add)
 
 	c.validateMapping(add)
@@ -797,6 +837,67 @@ func checkTLS(side, caFile string, pins []string, add func(string, ...any)) {
 	for i, p := range pins {
 		if _, err := ldapconn.ParseFingerprint(p); err != nil {
 			add("%s.tls_fingerprint[%d]: %v", side, i, err)
+		}
+	}
+}
+
+// checkUPG checks the optional UPG set: source.upg and target.upg_base
+// come together, and upg_base is a base of its own.
+func (c *Config) checkUPG(add func(string, ...any)) {
+	u, t := c.Source.UPG, c.Target
+	switch {
+	case u == nil && t.UPGBase == "":
+		return
+	case u == nil:
+		add("target.upg_base: set, but source.upg is missing; set both or neither")
+		return
+	}
+	switch u.From {
+	case UPGFromAD:
+		checkDN("source.upg.base", u.Base, true, add)
+		if u.Filter == "" {
+			add("source.upg.filter: required with from: ad")
+		} else if _, err := ldap.CompileFilter(u.Filter); err != nil {
+			add("source.upg.filter: %v", err)
+		}
+	case UPGFromUsers:
+		if u.Base != "" || u.Filter != "" {
+			add("source.upg.base and source.upg.filter: not used with from: users (the groups are made from the synced users); remove them")
+		}
+		found := false
+		for k := range c.Mapping.Users.Attributes {
+			found = found || strings.EqualFold(k, u.GIDAttr())
+		}
+		if !found {
+			add("source.upg.gid_number: %q is not an attribute in mapping.users.attributes", u.GIDAttr())
+		}
+	default:
+		add("source.upg.from: must be %s or %s, got %q", UPGFromAD, UPGFromUsers, u.From)
+	}
+	if u.From == UPGFromAD && u.GIDNumber != "" {
+		add("source.upg.gid_number: only used with from: users (with from: ad the group mapping gives gidNumber); remove it")
+	}
+	checkDN("target.upg_base", t.UPGBase, true, add)
+	ub, err := ldap.ParseDN(t.UPGBase)
+	if err != nil || t.UPGBase == "" {
+		return
+	}
+	// spec: upg_base differs from every other base, and neither it nor
+	// users_base or groups_base lies inside another (state_base may still
+	// lie inside any of them).
+	for _, b := range []struct{ name, dn string }{{"users_base", t.UsersBase}, {"groups_base", t.GroupsBase}, {"state_base", t.StateBase}} {
+		d, err := ldap.ParseDN(b.dn)
+		if err != nil || b.dn == "" {
+			continue
+		}
+		switch {
+		case d.EqualFold(ub):
+			add("target.upg_base and target.%s must differ", b.name)
+		case b.name == "state_base" && d.AncestorOfFold(ub):
+			add("target.upg_base must not be inside target.state_base")
+		case b.name == "state_base":
+		case d.AncestorOfFold(ub), ub.AncestorOfFold(d):
+			add("target.upg_base and target.%s must not be inside each other", b.name)
 		}
 	}
 }

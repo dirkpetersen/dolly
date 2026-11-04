@@ -14,10 +14,14 @@ type TargetSnapshot struct {
 	Groups []*Entry
 	// HasStateBase and friends report which of Dolly's containers exist.
 	HasStateBase, HasUserRecords, HasGroupRecords bool
+	// HasUPGRecords: the UPG record container (ou=upg) exists.
+	HasUPGRecords bool
+	// UPGs counts the Groups entries under upg_base (the UPG set).
+	UPGs int
 	// MissingUsersBase and MissingGroupsBase report a base the read found
 	// missing (a real run creates them before reading, so only a dry run
 	// sees them; the plan shows their creation).
-	MissingUsersBase, MissingGroupsBase bool
+	MissingUsersBase, MissingGroupsBase, MissingUPGBase bool
 	// UsersRead is true when Users holds every entry under users_base. A
 	// groups-only run doesn't read users_base (it may be large and
 	// size-limited); it looks up the uids it needs instead (ExistingUsers).
@@ -60,15 +64,17 @@ func (s *UserSet) HasDN(dn string) bool {
 	return err == nil && s.DNs[k]
 }
 
-// Records are the ownership records read from state_base.
+// Records are the ownership records read from state_base. Groups holds
+// the records of both group sets (Kind GroupRecord or UPGRecord).
 type Records struct {
 	Users  []*Record
 	Groups []*Record
 }
 
-// Bases names the target containers used to classify entries.
+// Bases names the target containers used to classify entries. UPG is
+// upg_base, or "" without a UPG set.
 type Bases struct {
-	Users, Groups, State string
+	Users, Groups, State, UPG string
 }
 
 // Classify sorts raw target entries into users, groups, and ownership
@@ -83,6 +89,11 @@ func Classify(entries []*Entry, b Bases) (*TargetSnapshot, *Records, error) {
 	usersKey, groupsKey, stateKey := MustDNKey(b.Users), MustDNKey(b.Groups), MustDNKey(b.State)
 	userRecs := MustDNKey(RecordsBase(b.State, UserRecord))
 	groupRecs := MustDNKey(RecordsBase(b.State, GroupRecord))
+	upgRecs := MustDNKey(RecordsBase(b.State, UPGRecord))
+	upgKey := "\x00" // matches no entry without a UPG set
+	if b.UPG != "" {
+		upgKey = MustDNKey(b.UPG)
+	}
 	// Check for duplicates first, so a stripped copy is reported as a
 	// duplicate rather than as a malformed record.
 	seen := make(map[string]bool, len(entries))
@@ -108,7 +119,10 @@ func Classify(entries []*Entry, b Bases) (*TargetSnapshot, *Records, error) {
 		case groupRecs:
 			t.HasGroupRecords = true
 			continue
-		case usersKey, groupsKey:
+		case upgRecs:
+			t.HasUPGRecords = true
+			continue
+		case usersKey, groupsKey, upgKey:
 			continue
 		}
 		parent := ParentKey(e.DN)
@@ -127,6 +141,13 @@ func Classify(entries []*Entry, b Bases) (*TargetSnapshot, *Records, error) {
 			}
 			r.Groups = append(r.Groups, rec)
 			continue
+		case parent == upgRecs:
+			rec, err := RecordFromEntry(e, UPGRecord)
+			if err != nil {
+				return nil, nil, err
+			}
+			r.Groups = append(r.Groups, rec)
+			continue
 		case IsUnder(e.DN, b.State):
 			continue // cn=lock, cn=status, anything else Dolly doesn't plan with
 		}
@@ -135,6 +156,10 @@ func Classify(entries []*Entry, b Bases) (*TargetSnapshot, *Records, error) {
 		}
 		if IsUnder(e.DN, b.Groups) {
 			t.Groups = append(t.Groups, e)
+		}
+		if b.UPG != "" && IsUnder(e.DN, b.UPG) {
+			t.Groups = append(t.Groups, e)
+			t.UPGs++
 		}
 	}
 	return t, r, nil

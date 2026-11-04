@@ -48,7 +48,7 @@ If neither gives a value, the user has no usable `gidNumber`. See [No group exis
 
 ## Which groups are searched
 
-The UPG groups are the AD groups that Dolly already reads:
+With `source.upg.from: ad` (see [User private groups](user-private-groups.md)), the UPG groups are the groups of that search, and the shared groups are not used. Otherwise, the UPG groups are the AD groups that Dolly already reads:
 
 - they are in scope: under `source.groups.base` and matching `source.groups.filter`
 - the group mapping accepts them: they have every attribute in `mapping.groups.required`, and a mapped `gidNumber`

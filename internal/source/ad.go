@@ -116,6 +116,16 @@ func (a *AD) Groups(ctx context.Context) ([]*model.ADObject, error) {
 	return a.search(ctx, a.cfg.Source.Groups, a.groupAttrs)
 }
 
+// UPGGroups implements Source: a paged subtree search of source.upg (with
+// from: ad), with members fetched like Groups.
+func (a *AD) UPGGroups(ctx context.Context) ([]*model.ADObject, error) {
+	if a.cfg.UPGFrom() != config.UPGFromAD {
+		return nil, nil
+	}
+	u := a.cfg.Source.UPG
+	return a.search(ctx, config.Search{Base: u.Base, Filter: u.Filter}, a.groupAttrs)
+}
+
 func (a *AD) search(ctx context.Context, s config.Search, attrs []string) ([]*model.ADObject, error) {
 	req := ldap.NewSearchRequest(s.Base, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, s.Filter, attrs, nil)
 	entries, err := ldapconn.SearchPaged(ctx, a.conn, req, a.cfg.Source.PageSize)
