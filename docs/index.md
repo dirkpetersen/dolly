@@ -14,11 +14,11 @@ It is deliberately simple. Dolly is not a bidirectional sync engine, an identity
 You need no Go and no root.
 
 ```bash
-# 1. Download the binary for this machine (Linux or macOS, amd64 or arm64)
-curl -fsSL "https://github.com/dirkpetersen/dolly/releases/latest/download/dolly_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar -xz dolly
+# 1. Download the binary for this machine (Linux or macOS, amd64 or arm64) to ~/.local/bin
+mkdir -p ~/.local/bin && curl -fsSL "https://github.com/dirkpetersen/dolly/releases/latest/download/dolly_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar -xz -C ~/.local/bin dolly && hash -r
 
-# 2. Install it: binary to ~/.local/bin, config from the template, systemd --user units
-./dolly install
+# 2. Install it: config from the template, systemd --user units
+~/.local/bin/dolly install
 
 # 3. Set up servers, certificates, bind accounts and OUs interactively
 ~/.local/bin/dolly config
