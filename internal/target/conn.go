@@ -53,20 +53,35 @@ func EnsureStateBase(ctx context.Context, c Conn, stateBase string) (created boo
 	return ensureBase(ctx, c, "state_base", stateBase, true)
 }
 
+// EnsureStateBranch creates state_base if it is missing, and before it any
+// users_base or groups_base that state_base lies inside, so the run lock and
+// cn=status can be written. It returns what it created.
+func EnsureStateBranch(ctx context.Context, c Conn, t config.Target) (created []string, err error) {
+	return ensureBases(ctx, c, t, func(dn string) bool { return model.IsUnder(t.StateBase, dn) })
+}
+
 // EnsureBases creates users_base, groups_base, and state_base where
-// missing, parents first (one base may sit inside another), before the run
-// lock is taken. It returns what it created. Each outermost base's parent
-// must exist. A base that exists but that the bind DN can't see (OpenLDAP
-// answers noSuchObject without a disclose ACL) can't be added either
-// (entryAlreadyExists); that is not an error here, but the read then finds
-// it missing and the real run aborts (cmd/dolly checkBasesRead).
+// missing, parents first (one base may sit inside another). A real run calls
+// it once it holds the lock, so a failure is recorded in cn=status. It
+// returns what it created. Each outermost base's parent must exist. A base
+// that exists but that the bind DN can't see (OpenLDAP answers noSuchObject
+// without a disclose ACL) can't be added either (entryAlreadyExists); that
+// is not an error here, but the read then finds it missing and the real run
+// aborts (cmd/dolly checkBasesRead).
 func EnsureBases(ctx context.Context, c Conn, t config.Target) (created []string, err error) {
+	return ensureBases(ctx, c, t, func(string) bool { return true })
+}
+
+func ensureBases(ctx context.Context, c Conn, t config.Target, want func(dn string) bool) (created []string, err error) {
 	bases := []struct {
 		name, dn string
 		cn       bool
 	}{{"users_base", t.UsersBase, false}, {"groups_base", t.GroupsBase, false}, {"state_base", t.StateBase, true}}
 	sort.SliceStable(bases, func(i, j int) bool { return model.DNDepth(bases[i].dn) < model.DNDepth(bases[j].dn) })
 	for _, b := range bases {
+		if !want(b.dn) {
+			continue
+		}
 		ok, err := ensureBase(ctx, c, b.name, b.dn, b.cn)
 		if err != nil {
 			return created, err

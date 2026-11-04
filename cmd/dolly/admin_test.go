@@ -204,12 +204,12 @@ func TestCheck(t *testing.T) {
 		"✓ groups_base ou=group,dc=local exists; all 1 entries readable",
 		"✓ users_base ou=people,dc=local: readable (uid lookup found uid=",
 		"✓ users_base ou=people,dc=local: all 3 entries readable in one search",
-		"✓ state_base ou=dolly,dc=local does not exist (or target.bind_dn cannot see it); the first real run creates it under dc=local",
+		"! state_base ou=dolly,dc=local does not exist, or target.bind_dn cannot see it; the first real run creates it under dc=local, or aborts if it is hidden",
 		"✓ connected to 127.0.0.1:",
 		"✓ STARTTLS (certificate verified for 127.0.0.1)",
 		"✓ SMTP: no authentication (username empty)",
 		"- no mail sent (use --send-test-mail",
-		"All 15 checks passed, with 1 warning.",
+		"All 14 checks passed, with 2 warnings.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
@@ -306,8 +306,8 @@ func TestCheck(t *testing.T) {
 		tgt.Put("dc=local", map[string][]string{"objectClass": {"domain"}}, time.Now())
 		withCheckDial(t, map[string]*ldapfake.Dir{"ldaps://dc01.example.edu:636": adFake(), "ldap://ldap.example.edu:389": tgt})
 		code, out, _ := runCLI("check", "--config", testConfig(t, nil))
-		if code != 0 || !strings.Contains(out, "✓ groups_base ou=group,dc=local does not exist (or target.bind_dn cannot see it); the first real run creates it under dc=local") ||
-			!strings.Contains(out, "✓ users_base ou=people,dc=local does not exist (or target.bind_dn cannot see it); the first real run creates it") {
+		if code != 0 || !strings.Contains(out, "! groups_base ou=group,dc=local does not exist, or target.bind_dn cannot see it; the first real run creates it under dc=local, or aborts if it is hidden") ||
+			!strings.Contains(out, "! users_base ou=people,dc=local does not exist, or target.bind_dn cannot see it; the first real run creates it") {
 			t.Errorf("exit %d\n%s", code, out)
 		}
 		// No parent: a failure.

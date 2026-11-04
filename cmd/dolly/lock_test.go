@@ -16,6 +16,7 @@ import (
 	"github.com/dirkpetersen/dolly/internal/ldapfake"
 	"github.com/dirkpetersen/dolly/internal/model"
 	"github.com/dirkpetersen/dolly/internal/planner"
+	"github.com/dirkpetersen/dolly/internal/smtpfake"
 )
 
 // The template's bases: state_base ou=dolly,dc=local.
@@ -89,10 +90,7 @@ func TestUnlock(t *testing.T) {
 func TestRealRunLockHeld(t *testing.T) {
 	template := templateCopy(t)
 	for _, cmd := range []string{"sync", "adopt"} {
-		dir := fakeWithLock(time.Minute)
-		for _, b := range []string{"ou=people,dc=local", "ou=group,dc=local"} {
-			dir.Put(b, map[string][]string{"objectClass": {"organizationalUnit"}}, time.Now())
-		}
+		dir := fakeWithLock(time.Minute) // no users_base or groups_base: a held lock creates neither
 		withFake(t, dir, "", false)
 		code, out, errs := runCLI(cmd, "--config", template)
 		if code != 0 || out != "" || !strings.Contains(errs, "another run holds the lock (host=other") || strings.Count(errs, "\n") != 1 {
@@ -145,14 +143,14 @@ func TestRealRun(t *testing.T) {
 		if st := statusNotes(dir); !strings.Contains(st, "last-success=") || strings.Contains(st, "failure") {
 			t.Errorf("status:\n%s", st)
 		}
-		// The bases (parents first, here all under dc=local) and then the lock.
+		// state_base, the lock, then the other bases.
 		var writes []string
 		for _, c := range dir.Calls {
 			if !strings.HasPrefix(c, "search ") {
 				writes = append(writes, c)
 			}
 		}
-		if want := "add ou=people,dc=local,add ou=group,dc=local,add ou=dolly,dc=local,add " + lockDN; len(writes) < 4 || strings.Join(writes[:4], ",") != want {
+		if want := "add ou=dolly,dc=local,add " + lockDN + ",add ou=people,dc=local,add ou=group,dc=local"; len(writes) < 4 || strings.Join(writes[:4], ",") != want {
 			t.Errorf("bases and lock must come first: %v", writes)
 		}
 	})
@@ -209,6 +207,33 @@ func TestRealRun(t *testing.T) {
 		}
 		if st := statusNotes(dir); !strings.Contains(st, "failure=target ") {
 			t.Errorf("status:\n%s", st)
+		}
+	})
+	// A base that can't be created is a failure recorded in cn=status (and
+	// mailed), with the lock released.
+	t.Run("base creation fails", func(t *testing.T) {
+		dir := ldapfake.New()
+		dir.Fail = func(op, dn string, _ any) error {
+			if op == "add" && dn == "ou=group,dc=local" {
+				return ldapfake.Error(ldap.LDAPResultInsufficientAccessRights, "no write access")
+			}
+			return nil
+		}
+		s := smtpfake.Start(t, smtpfake.Options{StartTLS: true})
+		withSMTPRoots(t, s)
+		withFake(t, dir, "", false)
+		withSnapshots(t, "testdata/fixture.yaml")
+		code, out, errs := runCLI("sync", "--config", testConfig(t, s))
+		if msgs := s.Messages(); len(msgs) != 1 {
+			t.Errorf("%d mails, want 1 failure mail", len(msgs))
+		} else if subj, _ := mailBody(t, msgs[0]); !strings.Contains(subj, "FAILED: target ldap://ldap.example.edu:389: creating groups_base") {
+			t.Errorf("subject %q", subj)
+		}
+		if code != 1 || !strings.Contains(errs, "creating groups_base ou=group,dc=local") || strings.Contains(out, "Result:") {
+			t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
+		}
+		if st := statusNotes(dir); !strings.Contains(st, "failure=target ldap://ldap.example.edu:389: creating groups_base ou=group,dc=local") || dir.Has(lockDN) {
+			t.Errorf("status:\n%s\nlock left: %v", st, dir.Has(lockDN))
 		}
 	})
 	t.Run("guard", func(t *testing.T) {

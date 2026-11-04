@@ -327,7 +327,8 @@ func checkTarget(ctx context.Context, p *printer, cfg *config.Config, o Options)
 		case !pok && !isBaseDN(cfg, parent):
 			p.fail("%s %s does not exist, and neither does its parent %s", name, dn, parent)
 		default:
-			p.ok("%s %s does not exist (or target.bind_dn cannot see it); the first real run creates it under %s (needs write access there; not tested, check never writes)", name, dn, parent)
+			// A warning: noSuchObject may also mean a base the bind DN can't see.
+			p.warn("%s %s does not exist, or target.bind_dn cannot see it; the first real run creates it under %s, or aborts if it is hidden (creating needs write access there; not tested, check never writes)", name, dn, parent)
 		}
 	}
 	advice := fmt.Sprintf("bind as the rootdn, or raise the limit for Dolly's DN on the database entry: olcLimits: dn.exact=%q size=unlimited time=unlimited (README \"Permissions\")", t.BindDN)

@@ -251,8 +251,8 @@ func runContext(cfg *config.Config) (context.Context, func()) {
 	return ctx, func() { cancel(); stop() }
 }
 
-// realRun is a real sync or adopt: create the bases if missing, take the
-// run lock, read AD and the target, plan, check the guard, apply, write
+// realRun is a real sync or adopt: create state_base if missing, take the
+// run lock, create the other bases if missing, read AD and the target, plan, check the guard, apply, write
 // cn=status, and release the lock.
 //
 // spec: the lock is taken before reading, so the plan is made from data no
@@ -276,7 +276,10 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		return exitError
 	}
 	defer conn.Close()
-	created, err := target.EnsureBases(ctx, conn, cfg.Target)
+	// state_base first (and a base it lies inside): without it there is no
+	// lock and nowhere to record a failure. The other bases come after the
+	// lock, so their failures are recorded and mailed.
+	created, err := target.EnsureStateBranch(ctx, conn, cfg.Target)
 	for _, c := range created {
 		fmt.Fprintf(stderr, "dolly: created %s\n", c)
 	}
@@ -352,6 +355,14 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		}
 	}()
 
+	created, err = target.EnsureBases(ctx, conn, cfg.Target)
+	for _, c := range created {
+		fmt.Fprintf(stderr, "dolly: created %s\n", c)
+	}
+	if err != nil {
+		return fail(fmt.Errorf("target %s: %w", cfg.Target.URL, err))
+	}
+
 	opt.Now = time.Now()
 	snaps, err := readSnapshots(ctx, cfg, opt, stderr)
 	if err == nil {
@@ -392,7 +403,7 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 }
 
 // checkBasesRead fails a real run whose read found a base missing, although
-// the run created the missing bases before the lock.
+// the run created the missing bases after taking the lock.
 //
 // spec: a base the bind DN can't see reads as empty (OpenLDAP answers
 // noSuchObject), and planning from that would claim every AD member of
