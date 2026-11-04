@@ -405,6 +405,7 @@ func TestPrintUPGSet(t *testing.T) {
 	jdoe := mkUser(1, "jdoe")
 	p := build(t, cfg(t, upgCfg(config.UPGFromAD)), world{ad: []*model.ADObject{jdoe}, upgs: []*model.ADObject{mkUPG(20, "u-jdoe", jdoe.DN)}}, both)
 	var b strings.Builder
+	p.Verbose = true
 	p.Print(&b)
 	for _, want := range []string{"AD: 1 user private groups (source.upg)", "0 user private group entries", "\nUser private groups (1)\n", "  upgs:        +1 ~0 >0"} {
 		if !strings.Contains(b.String(), want) {

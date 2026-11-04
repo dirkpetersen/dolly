@@ -16,7 +16,9 @@ var symbols = map[Kind]string{
 
 // Print writes a readable plan: operations grouped by section with their
 // reasons, then warnings, the guard, and the summary counts. Each operation
-// shows its step number, the order a real run applies them in.
+// shows its step number, the order a real run applies them in. Without
+// Verbose, only the Containers section and the non-ignored warnings are
+// listed, and hints name the hidden counts.
 func (p *Plan) Print(w io.Writer) {
 	phases := []string{}
 	if p.Users {
@@ -51,7 +53,16 @@ func (p *Plan) Print(w io.Writer) {
 	fmt.Fprintf(w, "Target: %s, %d group entries%s; Dolly owns %d users and %d memberships\n",
 		users, c.TargetGroups, upgs, p.Guard.OwnedUsers, p.Guard.OwnedMemberships)
 
+	hidden := 0
 	for _, sec := range sectionOrder {
+		if !p.Verbose && sec != SectionContainers {
+			for _, op := range p.Ops {
+				if op.Section == sec {
+					hidden++
+				}
+			}
+			continue
+		}
 		var steps []int
 		for i, op := range p.Ops {
 			if op.Section == sec {
@@ -74,10 +85,23 @@ func (p *Plan) Print(w io.Writer) {
 	if len(p.Ops) == 0 {
 		fmt.Fprintf(w, "\nNo changes.\n")
 	}
+	if hidden > 0 {
+		other := "" // the Containers ops above are counted in the Summary too
+		if hidden < len(p.Ops) {
+			other = " other"
+		}
+		fmt.Fprintf(w, "\n(use -v to list the%s %d operations)\n", other, hidden)
+	}
 
-	if len(p.Warnings) > 0 {
-		fmt.Fprintf(w, "\nWarnings (%d)\n", len(p.Warnings))
-		for _, x := range p.Warnings {
+	var shown []Warning
+	for _, x := range p.Warnings {
+		if p.Verbose || x.Kind != WarnIgnored {
+			shown = append(shown, x)
+		}
+	}
+	if len(shown) > 0 {
+		fmt.Fprintf(w, "\nWarnings (%d)\n", len(shown))
+		for _, x := range shown {
 			fmt.Fprintf(w, "  %-12s %s: %s\n", x.Kind, x.Subject, x.Message)
 		}
 	}
@@ -114,7 +138,12 @@ func (p *Plan) Print(w io.Writer) {
 	}
 	fmt.Fprintf(w, "  memberships: +%d -%d (%d of them local, removed by a prune; %d values renamed)\n", c.MembersAdded, c.MembersRemoved, p.Guard.LocalRemovals, c.MembersRenamed)
 	fmt.Fprintf(w, "  records:     +%d ~%d -%d\n", c.RecordsAdded, c.RecordsUpdated, c.RecordsDeleted)
-	fmt.Fprintf(w, "  ignored:     %d entries missing required attributes\n", c.IgnoredEntries)
+	switch {
+	case p.Verbose:
+		fmt.Fprintf(w, "  ignored:     %d entries missing required attributes\n", c.IgnoredEntries)
+	case c.IgnoredEntries > 0:
+		fmt.Fprintf(w, "  ignored:     %d entries missing required attributes (use -v to list them)\n", c.IgnoredEntries)
+	}
 	if p.Users && c.GIDFromUPG > 0 {
 		fmt.Fprintf(w, "  gidNumber:   %d users take it from their UPG group (gid_from_upg)\n", c.GIDFromUPG)
 	}

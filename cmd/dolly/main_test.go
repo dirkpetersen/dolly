@@ -86,12 +86,13 @@ func TestVersion(t *testing.T) {
 
 func TestDryRunWithFixture(t *testing.T) {
 	template := templateCopy(t)
-	code, out, errs := runCLI("sync", "--dry-run", "--config", template, "--fixture", "testdata/fixture.yaml")
+	code, out, errs := runCLI("sync", "--dry-run", "-v", "--config", template, "--fixture", "testdata/fixture.yaml")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errs)
 	}
 	for _, want := range []string{
 		"Plan: dolly sync (users and groups)",
+		"  ignored:     1 entries missing required attributes\n",
 		"add uid=jdoe,ou=people,dc=local",
 		"gecos: Jane Doe",                             // transliterated
 		"loginShell: /sbin/nologin",                   // disabled account
@@ -104,7 +105,20 @@ func TestDryRunWithFixture(t *testing.T) {
 		}
 	}
 
-	code, out, _ = runCLI("adopt", "--dry-run", "--config", template, "--fixture", "testdata/fixture.yaml")
+	// Without -v: counts and hints, no operation or ignored lines; the
+	// state_base containers always print.
+	code, out, _ = runCLI("sync", "--dry-run", "--config", template, "--fixture", "testdata/fixture.yaml")
+	for _, want := range []string{"\nContainers (", "(use -v to list the ", "  ignored:     1 entries missing required attributes (use -v to list them)",
+		"conflict     cn=hpc-users,ou=group,dc=local", "Summary: "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("without -v, output lacks %q:\n%s", want, out)
+		}
+	}
+	if code != 0 || strings.Contains(out, "add uid=jdoe") || strings.Contains(out, "ignored      CN=") {
+		t.Errorf("without -v: exit %d, operation or ignored lines:\n%s", code, out)
+	}
+
+	code, out, _ = runCLI("adopt", "--dry-run", "--verbose", "--config", template, "--fixture", "testdata/fixture.yaml")
 	if code != 0 || !strings.Contains(out, "add record cn=00000000-0000-0000-0000-0000000000a1,ou=groups,ou=dolly,dc=local") {
 		t.Errorf("adopt: %d\n%s", code, out)
 	}

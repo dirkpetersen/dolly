@@ -71,7 +71,7 @@ This is the same rule as for duplicate uids.
 
 ## Out-of-range values
 
-A UPG `gidNumber` that Dolly would use must be an integer from 0 to 4294967294, like any ID. If it is not, the user is ignored and listed once:
+A UPG `gidNumber` that Dolly would use must be an integer from 0 to 4294967294, like any ID. If it is not, the user is ignored. It is counted once in the summary, and listed with `-v`:
 
 ```text
 gets its gidNumber from AD group CN=u-jdoe,..., but gidNumber "4294967295" is not a valid ID
@@ -85,7 +85,7 @@ Dolly does not fall back to the user's own value in this case. A broken UPG stay
 - `when: always`, user has a valid `gidNumber`, no group found: the user keeps its own value.
 - `when: always`, user has no valid `gidNumber`, no group found: the user is ignored.
 
-An ignored user is a user that lacks a required attribute. It gets no user entry. It is listed once under "Warnings" as `ignored`, for example:
+An ignored user is a user that lacks a required attribute. It gets no user entry. It is counted once in the summary, and with `-v` it is listed under "Warnings" as `ignored`, for example:
 
 ```text
 has no gidNumber, and no AD group is named "u-jdoe" (gid_from_upg)

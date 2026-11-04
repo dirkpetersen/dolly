@@ -52,7 +52,7 @@ dolly check --groups   # for a groups-only deployment: a truncated users_base is
 If you're migrating from [ad2openldap](https://github.com/dirkpetersen/ad2openldap) or otherwise already have a target tree with no Dolly ownership records, adopt it once before your first sync:
 
 ```bash
-dolly adopt --dry-run
+dolly adopt --dry-run -v
 dolly adopt
 ```
 
@@ -61,10 +61,10 @@ See [Adopting an existing tree](operations/adopting.md) for what this does and i
 ## Dry run
 
 ```bash
-dolly sync --dry-run
+dolly sync --dry-run -v
 ```
 
-This prints the full plan — every add, modify, rename, and removal — without writing anything to the target. Review it before running for real, especially the first time.
+This prints the full plan (every add, modify, rename, and removal) without writing anything to the target. Without `-v`, it prints the summary, base creation, and the warnings other than ignored entries. Review it before running for real, especially the first time.
 
 ## First sync
 

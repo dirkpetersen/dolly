@@ -49,8 +49,8 @@ Usage:
 
 Commands:
   sync       Read AD and the target, then apply the differences
-             [--users|--groups] [--dry-run] [--force] [--debug]
-  adopt      One-time takeover of an existing tree [--dry-run] [--debug]
+             [--users|--groups] [--dry-run] [--force] [--debug] [-v]
+  adopt      One-time takeover of an existing tree [--dry-run] [--debug] [-v]
   unlock     Show and remove the run lock after a crash [--yes]
   check      Test connectivity, binds, search scopes, size limits, and SMTP
              [--groups] [--send-test-mail]
@@ -68,7 +68,8 @@ Every command that reads the config accepts --config FILE. Without it Dolly
 uses ./dolly.yaml, then $XDG_CONFIG_HOME/dolly/dolly.yaml (~/.config/dolly/).
 Every command that plans (sync, adopt) accepts --debug, which prints debug
 details to stderr, such as each group member skipped for having no entry on
-the target.
+the target, and --verbose (-v), which lists every planned operation and every
+ignored entry; without it the plan shows counts (and base creation) only.
 
 Exit codes: 0 success (or the lock is held elsewhere), 1 error, 2 guard tripped.
 Run "dolly <command> -h" for a command's flags.
@@ -161,36 +162,45 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 	groups := fs.Bool("groups", false, "sync groups only")
 	dryRun := fs.Bool("dry-run", false, "print the plan without writing or taking the lock")
 	force := fs.Bool("force", false, "apply even if the mass-deletion guard trips")
-	dbg := debugFlag(fs)
+	show := showFlags(fs)
 	fix := fs.String("fixture", "", "plan from a snapshot file (development only)")
 	if code, ok := parse(fs, args); !ok {
 		return code
 	}
 	// --users and --groups select phases; both together, like neither, mean both.
 	opt := planner.Options{Users: *users || !*groups, Groups: *groups || !*users}
-	return plan("sync", *cfgPath, *fix, *dryRun, *force, *dbg, opt, stdout, stderr)
+	return plan("sync", *cfgPath, *fix, *dryRun, *force, *show, opt, stdout, stderr)
 }
 
 func runAdopt(args []string, stdout, stderr io.Writer) int {
 	fs := newFlags("adopt", "Create ownership records for an existing tree, such as one written by ad2openldap.\nRun it once before the first sync, and check --dry-run first.", stderr, fixtureHelp)
 	cfgPath := fs.String("config", "", "config file")
 	dryRun := fs.Bool("dry-run", false, "print the records adopt would create without writing")
-	dbg := debugFlag(fs)
+	show := showFlags(fs)
 	fix := fs.String("fixture", "", "plan from a snapshot file (development only)")
 	if code, ok := parse(fs, args); !ok {
 		return code
 	}
-	return plan("adopt", *cfgPath, *fix, *dryRun, false, *dbg, planner.Options{Adopt: true}, stdout, stderr)
+	return plan("adopt", *cfgPath, *fix, *dryRun, false, *show, planner.Options{Adopt: true}, stdout, stderr)
 }
 
-// debugFlag adds --debug, which every command that plans accepts.
-func debugFlag(fs *flag.FlagSet) *bool {
-	return fs.Bool("debug", false, "print debug details to stderr, such as each group member skipped for having no entry on the target")
+// show holds the printing flags every command that plans accepts.
+type show struct {
+	debug   bool // --debug: debug details to stderr
+	verbose bool // --verbose, -v: every operation and ignored entry in the plan
+}
+
+func showFlags(fs *flag.FlagSet) *show {
+	s := &show{}
+	fs.BoolVar(&s.debug, "debug", false, "print debug details to stderr, such as each group member skipped for having no entry on the target")
+	fs.BoolVar(&s.verbose, "verbose", false, "list every planned operation and every ignored entry (default: the counts only)")
+	fs.BoolVar(&s.verbose, "v", false, "same as --verbose")
+	return s
 }
 
 // plan loads the config, then either prints the plan (--dry-run) or runs
-// for real (see realRun). With showDebug, debug details go to stderr.
-func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
+// for real (see realRun). With sh.debug, debug details go to stderr; sh.verbose lists every operation.
+func plan(cmd, cfgPath, fix string, dryRun, force bool, sh show, opt planner.Options, stdout, stderr io.Writer) int {
 	path, err := config.Find(cfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
@@ -206,7 +216,7 @@ func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.O
 		return exitError
 	}
 	if !dryRun {
-		return realRun(cmd, cfg, force, showDebug, opt, stdout, stderr)
+		return realRun(cmd, cfg, force, sh, opt, stdout, stderr)
 	}
 	var snaps *fixture.Snapshots
 	if fix != "" {
@@ -229,9 +239,10 @@ func plan(cmd, cfgPath, fix string, dryRun, force, showDebug bool, opt planner.O
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
 		return exitError
 	}
-	if showDebug {
+	if sh.debug {
 		p.PrintDebug(stderr)
 	}
+	p.Verbose = sh.verbose
 	p.Print(stdout)
 	if p.Guard.Tripped {
 		if force {
@@ -265,7 +276,7 @@ func runContext(cfg *config.Config) (context.Context, func()) {
 // lock (success, read error, guard, per-entry errors, a stop by signal or
 // run_timeout) is recorded in cn=status, and so is a lock Dolly refuses to
 // judge because of clock skew (exit 1).
-func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.Options, stdout, stderr io.Writer) int {
+func realRun(cmd string, cfg *config.Config, force bool, sh show, opt planner.Options, stdout, stderr io.Writer) int {
 	ctx, cleanup := runContext(cfg)
 	defer cleanup()
 	start := time.Now()
@@ -381,10 +392,10 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		p = nil
 		return fail(err)
 	}
-	if showDebug {
+	if sh.debug {
 		p.PrintDebug(stderr)
 	}
-	p.Real = true
+	p.Real, p.Verbose = true, sh.verbose
 	p.Print(stdout)
 	if p.Guard.Tripped {
 		if !force {
@@ -395,7 +406,7 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		}
 		fmt.Fprintf(stdout, "\n--force: applying the plan despite the guard.\n")
 	}
-	res = applyWithProgress(ctx, conn, p, stderr, rawErr, showDebug)
+	res = applyWithProgress(ctx, conn, p, stderr, rawErr, sh.debug)
 	res.Print(stdout)
 	summary := fmt.Sprintf("%d operations: %d applied, %d already in place, %d skipped, %d failed, %d not run",
 		len(p.Ops), res.Applied, res.AlreadyDone, res.Skipped, res.Failed, res.NotRun)

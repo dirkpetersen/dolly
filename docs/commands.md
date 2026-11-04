@@ -19,7 +19,7 @@ dolly sync --debug        # also print per-entry debug lines to stderr
 |---|---|
 | `--users` | Sync users only. |
 | `--groups` | Sync groups only. The default with neither flag is both. |
-| `--dry-run` | Print the planned adds, modifies, renames, and removals without writing anything. Takes no run lock. |
+| `--dry-run` | Print the plan without writing anything. Add `-v` to list every operation. Takes no run lock. |
 | `--force` | Apply the run even if it trips the [mass-deletion guard](how-it-works/index.md#guard). |
 | `--debug` | Print debug details to stderr. See [The `--debug` flag](#the-debug-flag). |
 
@@ -32,6 +32,10 @@ A groups-only run doesn't read the AD users base or the target's `users_base` in
 In a `--groups` run, a member's target DN comes from the user's own ownership record (`seeAlso`), not a fresh AD lookup, so a pending user rename causes no group churn. A member is added only if its entry already exists under `users_base` (see [Ownership](how-it-works/ownership.md)); otherwise it is skipped, counted in the summary, and listed with `--debug`. Neither AD users nor target users need `uidNumber`; only groups need `gidNumber`.
 
 `--users` and `--groups` each work standalone and never assume the other ran in the same invocation.
+
+## The `--verbose` flag
+
+`--verbose` (`-v`) is accepted by every command that plans (`sync` and `adopt`). Without `--verbose` (`-v`), the plan lists only base creation (the Containers section) and the warnings other than ignored entries, then the Summary, which counts every kind of operation, with `ignored: N entries missing required attributes (use -v to list them)` (omitted when the count is zero). The hint `(use -v to list the N operations)` prints after the plan sections, before Warnings; when base creation is listed it reads `(use -v to list the other N operations)`. `-v` lists every operation and every ignored entry. A real run applies the same plan either way, and its per-entry errors always print. The mail body is the run's output, so a timer run without `-v` mails the counts. `cn=status`, the exit code, and the warnings hash that decides a warnings mail never depend on the printed lines and still cover every warning.
 
 ## The `--debug` flag
 
@@ -54,7 +58,7 @@ A skipped member is re-evaluated on every run and added (and recorded as Dolly-o
 One-time takeover of an existing target tree that has no Dolly ownership records, such as one written by [ad2openldap](https://github.com/dirkpetersen/ad2openldap).
 
 ```bash
-dolly adopt --dry-run
+dolly adopt --dry-run -v
 dolly adopt
 dolly adopt --debug      # also print per-entry debug lines to stderr
 ```

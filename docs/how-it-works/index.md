@@ -19,7 +19,7 @@ Every run reads *all* in-scope groups, and all in-scope users when it syncs user
 
 ## 3. Shear
 
-Each AD entry is mapped through the configured [attribute rules](../configuration.md#mapping). Entries missing a `required` attribute, or with a `uidNumber` or `gidNumber` outside 0 to 4294967294, are ignored — not just skipped with a warning every run, but listed once in the run summary. A user missing `uidNumber` or `gidNumber` only gets no entry of its own; it can still be a group member (see [Required attributes](ownership.md#required-attributes)). Nested groups are flattened into direct user members, with a cycle guard against loops in the parent chain. A group whose only members are other groups is still emitted once flattening resolves it to actual users.
+Each AD entry is mapped through the configured [attribute rules](../configuration.md#mapping). Entries missing a `required` attribute, or with a `uidNumber` or `gidNumber` outside 0 to 4294967294, are ignored — not just skipped with a warning every run, but counted once in the run summary and listed with `-v`. A user missing `uidNumber` or `gidNumber` only gets no entry of its own; it can still be a group member (see [Required attributes](ownership.md#required-attributes)). Nested groups are flattened into direct user members, with a cycle guard against loops in the parent chain. A group whose only members are other groups is still emitted once flattening resolves it to actual users.
 
 Members are resolved by DN, never by CN: AD member DNs are mapped through a `distinguishedName → objectGUID` map to the correct user, because CNs aren't unique and can contain escaped commas (`CN=Gow\, Edward L,...`).
 
@@ -27,7 +27,7 @@ Members are resolved by DN, never by CN: AD member DNs are mapped through a `dis
 
 Dolly reads the target's current entries and its own ownership records under `state_base`, then computes a plan: adds, attribute modifications, renames (`modrdn`), and member additions and removals. See [Ownership](ownership.md) for the full set of rules the comparison follows.
 
-`--dry-run` prints exactly this plan and stops — the same plan a real run would apply.
+`--dry-run` prints this plan and stops; it is the same plan a real run would apply. Without `-v` it shows base creation, the warnings, and the counts; `-v` lists every operation and every ignored entry.
 
 ## 5. Guard {: #guard }
 
@@ -54,7 +54,7 @@ Writes happen in a crash-safe order:
 
 This order matters because a crash partway through must never leave a Dolly-added member looking like a local one (which would make it un-removable later), and must never remove an ownership record while the thing it owns still exists (which would leak an entry Dolly can no longer track).
 
-The operations run in exactly plan order — the step numbers `--dry-run` prints — and Dolly never reorders them. See [Applying the plan](#applying-the-plan) for what happens when one of them fails.
+The operations run in exactly plan order — the step numbers `--dry-run -v` prints — and Dolly never reorders them. See [Applying the plan](#applying-the-plan) for what happens when one of them fails.
 
 Finally, Dolly updates the `cn=status` entry under `state_base` and releases the lock.
 

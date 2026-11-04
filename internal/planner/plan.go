@@ -153,7 +153,10 @@ type Plan struct {
 	Mode string // "sync" or "adopt"
 	// Real is set by a real run before printing, so the guard line says
 	// what this run does rather than what a real run would do.
-	Real     bool
+	Real bool
+	// Verbose, set before printing, lists every operation and every
+	// ignored entry; without it Print shows counts (containers always).
+	Verbose  bool
 	Users    bool   // users were planned
 	Groups   bool   // groups were planned
 	UPG      string // source.upg.from, "" without a UPG set

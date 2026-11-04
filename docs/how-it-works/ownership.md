@@ -101,9 +101,9 @@ With `memberUid` only (RFC 2307, structural `posixGroup`), none of this applies:
 
 ## Required attributes
 
-To be a group member, an AD user needs only the attribute its `uid` is mapped from (`sAMAccountName` by default, or AD's `uid` attribute). A user entry needs every attribute in `mapping.users.required` (`sAMAccountName`, `uidNumber`, and `gidNumber` by default): a user missing one gets no entry, and in runs that sync users it's listed once in the run summary, but it can still be a member. Groups need `name` and `gidNumber` (`mapping.groups.required`). A group missing a required attribute, or a user without a uid, is ignored everywhere — including as a source for flattening a nested group — not just skipped with output on every run. Ignored entries are listed once in the run summary instead.
+To be a group member, an AD user needs only the attribute its `uid` is mapped from (`sAMAccountName` by default, or AD's `uid` attribute). A user entry needs every attribute in `mapping.users.required` (`sAMAccountName`, `uidNumber`, and `gidNumber` by default): a user missing one gets no entry, and in runs that sync users it's counted once in the run summary and listed with `-v`, but it can still be a member. Groups need `name` and `gidNumber` (`mapping.groups.required`). A group missing a required attribute, or a user without a uid, is ignored everywhere — including as a source for flattening a nested group — not just skipped with output on every run. Ignored entries are counted once in the run summary instead, and listed with `-v`.
 
-A `uidNumber` or `gidNumber` Dolly would write must be an integer from 0 to 4294967294: Linux `uid_t` and `gid_t` are unsigned 32-bit, and 4294967295 is reserved as -1. An entry with any other value, such as an 11-digit university ID, is ignored and listed once in the summary, like one missing a required attribute.
+A `uidNumber` or `gidNumber` Dolly would write must be an integer from 0 to 4294967294: Linux `uid_t` and `gid_t` are unsigned 32-bit, and 4294967295 is reserved as -1. An entry with any other value, such as an 11-digit university ID, is ignored and counted once in the summary and listed with `-v`, like one missing a required attribute.
 
 ## Out-of-scope members
 
