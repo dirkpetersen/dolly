@@ -465,25 +465,29 @@ type writerConn interface {
 	Close() error
 }
 
-// Progress intervals: the first line of a phase after progressFirst, then
-// one every progressEvery (apply) or readProgressEvery (reads); tests
+// Progress intervals: the first line of a phase after progressFirst (or,
+// while nothing is counted yet, at the next progressRetry with a count),
+// then one every progressEvery (apply) or readProgressEvery (reads); tests
 // shorten them.
 var (
-	progressFirst     = 10 * time.Second
+	progressFirst     = 2 * time.Second
+	progressRetry     = 1 * time.Second
 	progressEvery     = 60 * time.Second
 	readProgressEvery = 10 * time.Second
 )
 
-// ticker prints "dolly: <line(elapsed)>" to w after progressFirst and then
-// every `every` until the returned stop is called; stop waits for it, and
-// a phase that ends before progressFirst prints nothing.
-func ticker(w io.Writer, every time.Duration, line func(elapsed time.Duration) string) (stop func()) {
+// ticker prints "dolly: <line(elapsed)>" to w after progressFirst, once
+// active reports a count above zero, and then every `every` until the
+// returned stop is called; stop waits for it, and a phase that ends before
+// its first line prints nothing.
+func ticker(w io.Writer, every time.Duration, active func() bool, line func(elapsed time.Duration) string) (stop func()) {
 	quit, done := make(chan struct{}), make(chan struct{})
 	start := time.Now()
 	go func() {
 		defer close(done)
 		t := time.NewTimer(progressFirst)
 		defer t.Stop()
+		printed := false
 		for {
 			select {
 			case <-quit:
@@ -495,6 +499,11 @@ func ticker(w io.Writer, every time.Duration, line func(elapsed time.Duration) s
 				return
 			default:
 			}
+			if !printed && !active() {
+				t.Reset(progressRetry)
+				continue
+			}
+			printed = true
 			fmt.Fprintf(w, "dolly: %s\n", line(time.Since(start).Round(time.Second)))
 			t.Reset(every)
 		}
@@ -507,7 +516,7 @@ func ticker(w io.Writer, every time.Duration, line func(elapsed time.Duration) s
 func applyWithProgress(ctx context.Context, conn target.Conn, p *planner.Plan, log, progress io.Writer, debug bool) *target.Result {
 	var prog target.Progress
 	next := fmt.Sprintf("; next update every %gs", progressEvery.Seconds())
-	stop := ticker(progress, progressEvery, func(elapsed time.Duration) string {
+	stop := ticker(progress, progressEvery, func() bool { return prog.Done.Load()+prog.Failed.Load()+prog.Skipped.Load() > 0 }, func(elapsed time.Duration) string {
 		n, total := prog.Done.Load(), len(p.Ops)
 		s := fmt.Sprintf("done %d of %d operations (%d%%), %d failed, %d skipped, %s elapsed%s",
 			n, total, n*100/int64(max(total, 1)), prog.Failed.Load(), prog.Skipped.Load(), elapsed, next)
@@ -557,7 +566,9 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 	defer ad.Close()
 	summary("connected to AD %s as %s", ad.URL, cfg.Source.BindDN)
 	p := &ad.Progress
-	stop := ticker(progress, readProgressEvery, func(elapsed time.Duration) string {
+	stop := ticker(progress, readProgressEvery, func() bool {
+		return p.Users.Load()+p.Groups.Load()+p.UPGs.Load()+p.Members.Load() > 0
+	}, func(elapsed time.Duration) string {
 		var parts []string
 		if readUsers {
 			parts = append(parts, fmt.Sprintf("%d users", p.Users.Load()))
@@ -596,7 +607,7 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 	}
 	defer tr.Close()
 	summary("connected to target %s as %s", tr.URL, cfg.Target.BindDN)
-	stop = ticker(progress, readProgressEvery, func(elapsed time.Duration) string {
+	stop = ticker(progress, readProgressEvery, func() bool { return tr.Progress.Entries.Load() > 0 }, func(elapsed time.Duration) string {
 		return fmt.Sprintf("reading target: %d entries so far, %s elapsed", tr.Progress.Entries.Load(), elapsed)
 	})
 	tgt, recs, err := tr.Read(ctx, readUsers)
@@ -623,7 +634,8 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 		for i, c := range cands {
 			uids[i] = c.UID
 		}
-		stop = ticker(progress, readProgressEvery, func(elapsed time.Duration) string {
+		// The total counts: "0 of M" already says the lookup is under way.
+		stop = ticker(progress, readProgressEvery, func() bool { return tr.Progress.UIDsTotal.Load() > 0 }, func(elapsed time.Duration) string {
 			return fmt.Sprintf("looking up member uids: %d of %d, %s elapsed", tr.Progress.UIDsDone.Load(), tr.Progress.UIDsTotal.Load(), elapsed)
 		})
 		set, err := tr.LookupUsers(ctx, uids)

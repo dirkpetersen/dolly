@@ -87,7 +87,7 @@ func (op Op) String() string { return describe(op) }
 // WarningKind classifies run-summary warnings.
 type WarningKind string
 
-// Warning kinds.
+// Warning kinds. A new kind must also go into warningOrder (print.go).
 const (
 	WarnIgnored     WarningKind = "ignored"      // missing a required attribute
 	WarnConflict    WarningKind = "conflict"     // target entry without a record, rename collision

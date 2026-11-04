@@ -413,7 +413,7 @@ func TestRealRunNotifications(t *testing.T) {
 	if !strings.Contains(errs, "progress marker") || strings.Contains(body, "progress marker") || strings.Contains(statusNotes(dir), "progress marker") {
 		t.Errorf("the read progress line must reach stderr only:\n%s", errs)
 	}
-	for _, want := range []string{"Outcome:  succeeded", "list of warnings", "Plan: dolly sync (users and groups)", "conflict     cn=hpc-users,ou=group,dc=local", "Result: 6 applied", "connected to"} {
+	for _, want := range []string{"Outcome:  succeeded", "list of warnings", "Plan: dolly sync (users and groups)", "Warnings: 1 ignored, 1 conflict (use -v to list them)", "Result: 6 applied", "connected to"} {
 		if want == "connected to" {
 			continue // readSnapshots is faked, so no progress lines
 		}

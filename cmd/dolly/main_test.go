@@ -108,13 +108,13 @@ func TestDryRunWithFixture(t *testing.T) {
 	// Without -v: counts and hints, no operation or ignored lines; the
 	// state_base containers always print.
 	code, out, _ = runCLI("sync", "--dry-run", "--config", template, "--fixture", "testdata/fixture.yaml")
-	for _, want := range []string{"\nContainers (", "(use -v to list the ", "  ignored:     1 entries missing required attributes (use -v to list them)",
-		"conflict     cn=hpc-users,ou=group,dc=local", "Summary: "} {
+	for _, want := range []string{"\nContainers (", "(use -v to list the ", "  ignored:     1 entries missing required attributes\n",
+		"\nWarnings: 1 ignored, 1 conflict (use -v to list them)\n", "Summary: "} {
 		if !strings.Contains(out, want) {
 			t.Errorf("without -v, output lacks %q:\n%s", want, out)
 		}
 	}
-	if code != 0 || strings.Contains(out, "add uid=jdoe") || strings.Contains(out, "ignored      CN=") {
+	if code != 0 || strings.Contains(out, "add uid=jdoe") || strings.Contains(out, "ignored      CN=") || strings.Contains(out, "conflict     cn=") {
 		t.Errorf("without -v: exit %d, operation or ignored lines:\n%s", code, out)
 	}
 

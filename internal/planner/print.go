@@ -3,10 +3,15 @@ package planner
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
 var sectionOrder = []Section{SectionContainers, SectionUsers, SectionGroups, SectionUPGs, SectionMemberships, SectionRecords}
+
+// warningOrder is the order of the WarningKind constants, for the
+// Warnings count line.
+var warningOrder = []WarningKind{WarnIgnored, WarnConflict, WarnDuplicate, WarnDuplicateID, WarnIDChanged, WarnPending, WarnInvalid}
 
 var symbols = map[Kind]string{
 	CreateContainer: "+", AddEntry: "+", AddMember: "+", AddPlaceholder: "+", AddRecord: "+",
@@ -93,16 +98,47 @@ func (p *Plan) Print(w io.Writer) {
 		fmt.Fprintf(w, "\n(use -v to list the%s %d operations)\n", other, hidden)
 	}
 
-	var shown []Warning
-	for _, x := range p.Warnings {
-		if p.Verbose || x.Kind != WarnIgnored {
-			shown = append(shown, x)
-		}
-	}
-	if len(shown) > 0 {
-		fmt.Fprintf(w, "\nWarnings (%d)\n", len(shown))
-		for _, x := range shown {
+	switch {
+	case len(p.Warnings) == 0:
+	case p.Verbose:
+		fmt.Fprintf(w, "\nWarnings (%d)\n", len(p.Warnings))
+		for _, x := range p.Warnings {
 			fmt.Fprintf(w, "  %-12s %s: %s\n", x.Kind, x.Subject, x.Message)
+		}
+	default:
+		// id-changed is listed always: it is applied in this run, so a later -v can't show it.
+		n := map[WarningKind]int{}
+		var changed []Warning
+		for _, x := range p.Warnings {
+			if x.Kind == WarnIDChanged {
+				changed = append(changed, x)
+			} else {
+				n[x.Kind]++
+			}
+		}
+		if len(changed) > 0 {
+			fmt.Fprintf(w, "\nID changes (%d)\n", len(changed))
+			for _, x := range changed {
+				fmt.Fprintf(w, "  %-12s %s: %s\n", x.Kind, x.Subject, x.Message)
+			}
+		}
+		var parts []string
+		for _, k := range warningOrder {
+			if n[k] > 0 {
+				parts = append(parts, fmt.Sprintf("%d %s", n[k], k))
+				delete(n, k)
+			}
+		}
+		var rest []string // a kind missing from warningOrder still gets counted
+		for k := range n {
+			rest = append(rest, string(k))
+		}
+		sort.Strings(rest)
+		for _, k := range rest {
+			parts = append(parts, fmt.Sprintf("%d %s", n[WarningKind(k)], k))
+		}
+		if len(parts) > 0 {
+			fmt.Fprintf(w, "\nWarnings: %s (use -v to list them)\n", strings.Join(parts, ", "))
 		}
 	}
 
@@ -138,11 +174,8 @@ func (p *Plan) Print(w io.Writer) {
 	}
 	fmt.Fprintf(w, "  memberships: +%d -%d (%d of them local, removed by a prune; %d values renamed)\n", c.MembersAdded, c.MembersRemoved, p.Guard.LocalRemovals, c.MembersRenamed)
 	fmt.Fprintf(w, "  records:     +%d ~%d -%d\n", c.RecordsAdded, c.RecordsUpdated, c.RecordsDeleted)
-	switch {
-	case p.Verbose:
+	if p.Verbose || c.IgnoredEntries > 0 { // the Warnings line has the -v hint
 		fmt.Fprintf(w, "  ignored:     %d entries missing required attributes\n", c.IgnoredEntries)
-	case c.IgnoredEntries > 0:
-		fmt.Fprintf(w, "  ignored:     %d entries missing required attributes (use -v to list them)\n", c.IgnoredEntries)
 	}
 	if p.Users && c.GIDFromUPG > 0 {
 		fmt.Fprintf(w, "  gidNumber:   %d users take it from their UPG group (gid_from_upg)\n", c.GIDFromUPG)

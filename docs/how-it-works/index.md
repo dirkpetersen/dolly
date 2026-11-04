@@ -27,7 +27,7 @@ Members are resolved by DN, never by CN: AD member DNs are mapped through a `dis
 
 Dolly reads the target's current entries and its own ownership records under `state_base`, then computes a plan: adds, attribute modifications, renames (`modrdn`), and member additions and removals. See [Ownership](ownership.md) for the full set of rules the comparison follows.
 
-`--dry-run` prints this plan and stops; it is the same plan a real run would apply. Without `-v` it shows base creation, the warnings, and the counts; `-v` lists every operation and every ignored entry.
+`--dry-run` prints this plan and stops; it is the same plan a real run would apply. Without `-v` it shows base creation and the counts (warnings as one count line); `-v` lists every operation and every warning.
 
 ## 5. Guard {: #guard }
 

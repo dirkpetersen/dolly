@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,3 +51,48 @@ func TestApplyProgress(t *testing.T) {
 		t.Errorf("fast apply printed %q", prog.String())
 	}
 }
+
+// The first line comes at progressFirst once a count is above zero; while
+// counts are zero the ticker waits and checks every progressRetry; a fast
+// phase prints nothing.
+func TestTickerFirstLine(t *testing.T) {
+	oldFirst, oldRetry := progressFirst, progressRetry
+	t.Cleanup(func() { progressFirst, progressRetry = oldFirst, oldRetry })
+	progressFirst, progressRetry = 20*time.Millisecond, 5*time.Millisecond
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	w := writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return buf.Write(p) })
+	lines := func() int { mu.Lock(); defer mu.Unlock(); return strings.Count(buf.String(), "\n") }
+	var active atomic.Bool
+	line := func(time.Duration) string { return "x" }
+
+	stop := ticker(w, time.Hour, func() bool { return true }, line)
+	time.Sleep(60 * time.Millisecond)
+	stop()
+	if lines() != 1 {
+		t.Errorf("counts above zero: %d lines, want 1", lines())
+	}
+
+	buf.Reset()
+	stop = ticker(w, time.Hour, active.Load, line)
+	time.Sleep(60 * time.Millisecond)
+	if lines() != 0 {
+		t.Errorf("zero counts printed %d lines", lines())
+	}
+	active.Store(true)
+	time.Sleep(40 * time.Millisecond)
+	stop()
+	if lines() != 1 {
+		t.Errorf("after the first count: %d lines, want 1", lines())
+	}
+
+	buf.Reset()
+	ticker(w, time.Hour, func() bool { return true }, line)()
+	if lines() != 0 {
+		t.Errorf("fast phase printed %d lines", lines())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

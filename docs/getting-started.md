@@ -64,7 +64,7 @@ See [Adopting an existing tree](operations/adopting.md) for what this does and i
 dolly sync --dry-run -v
 ```
 
-This prints the full plan (every add, modify, rename, and removal) without writing anything to the target. Without `-v`, it prints the summary, base creation, and the warnings other than ignored entries. Review it before running for real, especially the first time.
+This prints the full plan (every add, modify, rename, and removal) without writing anything to the target. Without `-v`, it prints the summary, base creation, and one count line for the warnings. Review it before running for real, especially the first time.
 
 ## First sync
 
