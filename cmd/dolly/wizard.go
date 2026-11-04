@@ -134,6 +134,19 @@ func (w *wizard) yes(label string) (bool, error) {
 	return v == "y" || v == "yes", err
 }
 
+// yesDefault is yes with Enter meaning yes; anything but y/yes/n/no asks again.
+func (w *wizard) yesDefault(label string) (bool, error) {
+	v, err := w.ask(label+" [Y/n]", "", func(v string) error {
+		switch strings.ToLower(v) {
+		case "", "y", "yes", "n", "no":
+			return nil
+		}
+		return errors.New("enter y or n")
+	})
+	v = strings.ToLower(v)
+	return v != "n" && v != "no", err
+}
+
 func splitList(v string) []string {
 	var out []string
 	for _, s := range strings.Split(v, ",") {
@@ -194,7 +207,7 @@ func (w *wizard) servers(def []string, multi bool, keepFor []string) (urls, pins
 			}
 			continue
 		}
-		if ok, err := w.yes("Trust these certificates (they become tls_fingerprint, and ca_file is removed)?"); err != nil || ok {
+		if ok, err := w.yesDefault("Trust these certificates (they become tls_fingerprint, and ca_file is removed)?"); err != nil || ok {
 			return urls, pins, err
 		}
 		if keepFor != nil && sameServers(urls, keepFor) {

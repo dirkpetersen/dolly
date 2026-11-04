@@ -101,10 +101,10 @@ func runWizard(t *testing.T, path string, answers ...string) (int, string, strin
 // target base defaults, RFC 2307 with sAMAccountName.
 func (w *wizardWorld) newAnswers() []string {
 	return []string{
-		w.adURL, "y", // 1
+		w.adURL, "", // 1: Enter trusts
 		"svc-dolly@example.edu", adPw, // 2
 		"OU=People,DC=example,DC=edu", "OU=Groups,DC=example,DC=edu", // 3
-		w.tgtURL, "y", // 4
+		w.tgtURL, "", // 4
 		"cn=admin,dc=local", tgtPw, // 5
 		"", "", "", // 6: the defaults under dc=local
 		"rfc2307", "sAMAccountName", // 7
@@ -134,7 +134,7 @@ func TestConfigWizardNew(t *testing.T) {
 	if !written(code, errs) {
 		t.Fatalf("exit %d\n%s\n%s", code, out, errs)
 	}
-	for _, want := range []string{"Creating " + path, "[1/7] Source servers", "[7/7] Group schema", "Trust these certificates",
+	for _, want := range []string{"Creating " + path, "[1/7] Source servers", "[7/7] Group schema", "Trust these certificates (they become tls_fingerprint, and ca_file is removed)? [Y/n]",
 		"✓ bind as svc-dolly@example.edu works", "✓ users base OU=People,DC=example,DC=edu returns entries",
 		"! groups base OU=Groups,DC=example,DC=edu: no entries match", "users_base [ou=people,dc=local]",
 		"✓ users_base ou=people,dc=local exists", "groups_base ou=group,dc=local does not exist yet",
@@ -178,10 +178,10 @@ func TestConfigWizardNew(t *testing.T) {
 	// Editing: Enter keeps every value; the existing pins are kept.
 	before, _ := os.ReadFile(path)
 	code, out, errs = runWizard(t, path,
-		"", "", "y", // URLs kept, not re-trusted, keep the existing pins
+		"", "n", "y", // URLs kept, not re-trusted, keep the existing pins
 		"", "", // bind name and password kept
 		"", "",
-		"", "", "y",
+		"", "n", "y",
 		"", "",
 		"", "", "",
 		"", "",
@@ -210,14 +210,14 @@ func TestConfigWizardRetries(t *testing.T) {
 	w := newWizardWorld(t)
 	path := filepath.Join(t.TempDir(), "dolly.yaml")
 	a := w.newAnswers()
-	answers := append([]string{w.adURL, "n"}, a[:2]...)         // rejected, then trusted
+	answers := append([]string{w.adURL, "x", "n"}, a[:2]...)    // asked again, rejected, then trusted
 	answers = append(answers, "svc-dolly@example.edu", "wrong") // bind failed
 	answers = append(answers, a[2:]...)                         // then the right password
 	code, out, errs := runWizard(t, path, answers...)
 	if !written(code, errs) {
 		t.Fatalf("exit %d\n%s\n%s", code, out, errs)
 	}
-	if !strings.Contains(out, "Enter the URLs again.") || !strings.Contains(out, "Server URLs, comma-separated (ldaps://host, or ldap://host for StartTLS) ["+w.adURL+"]") ||
+	if !strings.Contains(out, "Enter the URLs again.") || !strings.Contains(out, "enter y or n") || !strings.Contains(out, "Server URLs, comma-separated (ldaps://host, or ldap://host for StartTLS) ["+w.adURL+"]") ||
 		!strings.Contains(out, "✗ bind failed") || !strings.Contains(out, "2 of 3 tries left") {
 		t.Errorf("output:\n%s", out)
 	}
