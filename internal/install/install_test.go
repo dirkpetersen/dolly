@@ -408,7 +408,7 @@ func TestNextStepsQuoting(t *testing.T) {
 	bin := "'" + filepath.Join(f.env.Home, ".local", "bin", "dolly") + "'"
 	cfg := `'` + filepath.Join(f.env.Home, "it") + `'\''s $x.yaml'`
 	out := f.out.String()
-	for _, want := range []string{"$EDITOR " + cfg + "\n", bin + " check --config " + cfg + "\n", bin + " sync --dry-run --config " + cfg + "\n"} {
+	for _, want := range []string{bin + " config --config " + cfg + "   (or edit it: $EDITOR " + cfg + ")\n", bin + " check --config " + cfg + "\n", bin + " sync --dry-run --config " + cfg + "\n"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}

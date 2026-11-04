@@ -9,6 +9,31 @@ It is deliberately simple. Dolly is not a bidirectional sync engine, an identity
 !!! note "Status"
     Dolly is in early development. Expect breaking changes to config and behavior before v1.0.
 
+## Quick start
+
+You need no Go and no root.
+
+```bash
+# 1. Download the binary for this machine (Linux or macOS, amd64 or arm64)
+curl -fsSL "https://github.com/dirkpetersen/dolly/releases/latest/download/dolly_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar -xz dolly
+
+# 2. Install it: binary to ~/.local/bin, config from the template, systemd --user units
+./dolly install
+
+# 3. Set up servers, certificates, bind accounts and OUs interactively
+~/.local/bin/dolly config
+
+# 4. See what Dolly would do. This writes nothing.
+~/.local/bin/dolly sync --dry-run
+```
+
+- Run these steps as a regular user, never as root.
+- If `~/.local/bin` is on your `PATH`, you can type `dolly` instead of the full path.
+- `dolly config` asks before it trusts each server certificate and before it writes any file.
+- Read the plan. Then run `dolly sync`, and enable the timer with `systemctl --user enable --now dolly.timer`. `dolly install` does not enable it.
+- To check the download, compare its SHA-256 with `checksums.txt` in the same release.
+- Full documentation: [dirkpetersen.github.io/dolly](https://dirkpetersen.github.io/dolly/).
+
 ## Who it's for
 
 Dolly is for administrators who run Active Directory as the identity source of truth but need a standard LDAP tree — for Linux authentication, HPC clusters, or applications that speak LDAP but not AD's dialect. It's a modern, simplified replacement for [ad2openldap](https://github.com/dirkpetersen/ad2openldap), a 15-year-old Python tool of the same kind.

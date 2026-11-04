@@ -149,7 +149,7 @@ func TestFetchCertWritesPins(t *testing.T) {
 	})
 	t.Run("ldap:// sets start_tls", func(t *testing.T) {
 		data := []byte("target:\n  url: ldaps://old.example.edu\n")
-		edited, err := setPins(data, []pinSide{{section: "target", edits: []pinEdit{
+		edited, err := editConfig(data, []pinSide{{section: "target", remove: []string{"ca_file"}, edits: []pinEdit{
 			{"url", scalar("!!str", "ldap://new.example.edu"), true}, {"start_tls", scalar("!!bool", "true"), true}}}})
 		if err != nil || string(edited) != "target:\n  url: ldap://new.example.edu\n  start_tls: true\n" {
 			t.Errorf("%v\n%s", err, edited)

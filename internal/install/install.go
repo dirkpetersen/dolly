@@ -383,7 +383,7 @@ func Install(env Env, o Options) error {
 		scope = " --groups"
 	}
 	fmt.Fprintf(w, "\nNext steps:\n")
-	fmt.Fprintf(w, "  1. Edit the config:     $EDITOR %s\n", shellQuote(p.Config))
+	fmt.Fprintf(w, "  1. Set it up:           %s config%s   (or edit it: $EDITOR %s)\n", dolly, cfgFlag, shellQuote(p.Config))
 	fmt.Fprintf(w, "  2. Test it:             %s check%s%s\n", dolly, scope, cfgFlag)
 	fmt.Fprintf(w, "  3. Preview a run:       %s sync%s --dry-run%s\n", dolly, scope, cfgFlag)
 	if systemd {

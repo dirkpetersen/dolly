@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -28,17 +29,19 @@ var reloadConfig = config.Load
 
 // pinEdit is one key fetch-cert sets in a config section.
 type pinEdit struct {
-	key  string
+	key  string // a key in the section, or a dotted path (users.base)
 	node *yaml.Node
 	// ifMissing: insert the key when the section lacks it (otherwise only
 	// an existing key is changed).
 	ifMissing bool
 }
 
-// pinSide is what fetch-cert writes to one side of the config.
+// pinSide is what fetch-cert (or dolly config) writes to one section of
+// the config.
 type pinSide struct {
-	section string // "source" or "target"
+	section string // "source", "target", ...; created if missing
 	edits   []pinEdit
+	remove  []string // keys removed first; new keys go where the first one was
 	summary []string // what changes, for the confirmation
 }
 
@@ -97,7 +100,7 @@ func writePins(ctx context.Context, sources []string, targetURL, cfgFlag string,
 			}
 			urls, pins = appendNew(urls, u), appendNew(pins, fp)
 		}
-		s := pinSide{section: "source",
+		s := pinSide{section: "source", remove: []string{"ca_file"},
 			edits: []pinEdit{{"urls", &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Content: flowList(urls, false).Content}, true}, // block style, like the template
 				{"tls_fingerprint", flowList(pins, true), true}},
 			summary: []string{"source.urls: " + list(cfg.Source.URLs) + " -> " + list(urls), "source.tls_fingerprint: " + list(pins)}}
@@ -112,7 +115,7 @@ func writePins(ctx context.Context, sources []string, targetURL, cfgFlag string,
 			return exitError
 		}
 		startTLS := ldapconn.Scheme(targetURL) == "ldap" // the fetch used StartTLS
-		s := pinSide{section: "target",
+		s := pinSide{section: "target", remove: []string{"ca_file"},
 			edits: []pinEdit{{"url", scalar("!!str", targetURL), true}, {"tls_fingerprint", flowList([]string{fp}, true), true},
 				{"start_tls", scalar("!!bool", fmt.Sprint(startTLS)), startTLS}},
 			summary: []string{"target.url: " + cfg.Target.URL + " -> " + targetURL, "target.tls_fingerprint: " + list([]string{fp})}}
@@ -147,7 +150,7 @@ func writePins(ctx context.Context, sources []string, targetURL, cfgFlag string,
 	orig, err := os.ReadFile(path)
 	if err == nil {
 		var edited []byte
-		if edited, err = setPins(orig, sides); err == nil {
+		if edited, err = editConfig(orig, sides); err == nil {
 			err = writeConfigFile(path, edited)
 		}
 	}
@@ -176,11 +179,11 @@ func appendNew(list []string, v string) []string {
 	return append(list, v)
 }
 
-// setPins edits the YAML node tree, so comments, key order, and every
-// other value stay as they are: per side, ca_file is removed, an existing
-// key is changed in place, and a missing one is inserted where ca_file
-// was, or at the end of the section.
-func setPins(data []byte, sides []pinSide) ([]byte, error) {
+// editConfig edits the YAML node tree, so comments, key order, and every
+// other value stay as they are: per section, the remove keys go, an
+// existing key is changed in place (keeping its comments), and a missing
+// one is inserted where the first removed key was, or at the end.
+func editConfig(data []byte, sides []pinSide) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, err
@@ -190,21 +193,38 @@ func setPins(data []byte, sides []pinSide) ([]byte, error) {
 	}
 	for _, s := range sides {
 		sec := mapValue(doc.Content[0], s.section)
-		if sec == nil || sec.Kind != yaml.MappingNode {
-			return nil, fmt.Errorf("no %s section", s.section)
+		if sec == nil {
+			sec = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			doc.Content[0].Content = append(doc.Content[0].Content, scalar("!!str", s.section), sec)
 		}
-		at := -1 // where ca_file was
+		if sec.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("%s is not a section", s.section)
+		}
+		at := -1 // where the first removed key was
 		var kept []*yaml.Node
 		for i := 0; i+1 < len(sec.Content); i += 2 {
-			if sec.Content[i].Value == "ca_file" {
-				at = len(kept)
+			if slices.Contains(s.remove, sec.Content[i].Value) {
+				if at < 0 {
+					at = len(kept)
+				}
 				continue
 			}
 			kept = append(kept, sec.Content[i], sec.Content[i+1])
 		}
 		sec.Content = kept
 		for _, e := range s.edits {
-			if v := mapValue(sec, e.key); v != nil {
+			m, key := sec, e.key
+			for strings.Contains(key, ".") {
+				var parent string
+				parent, key, _ = strings.Cut(key, ".")
+				next := mapValue(m, parent)
+				if next == nil {
+					next = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+					m.Content = append(m.Content, scalar("!!str", parent), next)
+				}
+				m = next
+			}
+			if v := mapValue(m, key); v != nil {
 				head, line, foot := v.HeadComment, v.LineComment, v.FootComment
 				*v = *e.node
 				v.HeadComment, v.LineComment, v.FootComment = head, line, foot
@@ -213,12 +233,12 @@ func setPins(data []byte, sides []pinSide) ([]byte, error) {
 			if !e.ifMissing {
 				continue
 			}
-			pos := len(sec.Content)
-			if at >= 0 {
+			pos := len(m.Content)
+			if m == sec && at >= 0 {
 				pos, at = at, at+2
 			}
-			kv := []*yaml.Node{scalar("!!str", e.key), e.node}
-			sec.Content = append(sec.Content[:pos:pos], append(kv, sec.Content[pos:]...)...)
+			kv := []*yaml.Node{scalar("!!str", key), e.node}
+			m.Content = append(m.Content[:pos:pos], append(kv, m.Content[pos:]...)...)
 		}
 	}
 	var b strings.Builder
@@ -239,8 +259,9 @@ func mapValue(m *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-// writeConfigFile replaces path atomically: a temp file in the same
-// directory, mode 0600 (or the original mode if stricter), fsync, rename.
+// writeConfigFile replaces (or creates) path atomically: a temp file in
+// the same directory, mode 0600 (or the original mode if stricter), fsync,
+// rename. It also writes the password files of dolly config.
 func writeConfigFile(path string, data []byte) error {
 	mode := os.FileMode(0o600)
 	if st, err := os.Stat(path); err == nil {

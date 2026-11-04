@@ -1,16 +1,16 @@
 # Getting started
 
-This page walks through installing Dolly, configuring it, and running your first sync.
+This page walks through installing Dolly, configuring it, and running your first sync. The short version is the [Quick start](index.md#quick-start) on the home page. The sections below give the same steps in more detail.
 
 ## Install
 
-Install with Go:
+The quick start downloads a release binary with `curl`. Or install with Go:
 
 ```bash
 go install github.com/dirkpetersen/dolly/cmd/dolly@latest
 ```
 
-Or download a static binary from the project's [GitHub Releases](https://github.com/dirkpetersen/dolly/releases). Releases are built for Linux and macOS, on amd64 and arm64, with no runtime dependencies. Each release archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`.
+Or download a static binary by hand from the project's [GitHub Releases](https://github.com/dirkpetersen/dolly/releases). Releases are built for Linux and macOS, on amd64 and arm64, with no runtime dependencies. Each release archive also contains `LICENSE`, `README.md`, and `dolly.yaml.template`.
 
 Dolly runs as a regular user by default and needs no root.
 
@@ -21,6 +21,14 @@ dolly install
 ```
 
 This copies the binary to `~/.local/bin`, creates `$XDG_CONFIG_HOME/dolly/dolly.yaml` from the built-in template if one doesn't already exist, and writes the `systemd --user` units. For a groups-only deployment, use `dolly install --groups` instead, which bakes `--groups` into the unit's `ExecStart` (see [Groups-only deployments](configuration.md#groups-only-deployments)). Re-running `dolly install` is always safe: it never overwrites an existing config, replaces the binary only when it differs, and only rewrites the systemd units when their content has changed. It prints the next steps and doesn't enable the timer itself. See [Scheduling](operations/scheduling.md) for what the units look like and how to handle service-account environments.
+
+## Quick start with `dolly config`
+
+```bash
+dolly config
+```
+
+`dolly config` asks for the AD and target servers, shows each server's certificate and pins it once you trust it, tests each bind right away, checks the bases, and asks for the group schema. The passwords go to `ad.secret` and `ldap.secret` next to the config (mode `0600`). Nothing is written until you confirm the summary, and then it runs `dolly check`. See [Commands](commands.md#dolly-config). Edit `notify` by hand afterwards.
 
 ## Edit the configuration
 

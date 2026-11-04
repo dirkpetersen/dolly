@@ -17,6 +17,31 @@ It is deliberately simple. Dolly is not a bidirectional sync engine, an identity
 
 > **Status:** early development. Expect breaking changes to config and behavior before v1.0.
 
+## Quick start
+
+You need no Go and no root.
+
+```bash
+# 1. Download the binary for this machine (Linux or macOS, amd64 or arm64)
+curl -fsSL "https://github.com/dirkpetersen/dolly/releases/latest/download/dolly_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar -xz dolly
+
+# 2. Install it: binary to ~/.local/bin, config from the template, systemd --user units
+./dolly install
+
+# 3. Set up servers, certificates, bind accounts and OUs interactively
+~/.local/bin/dolly config
+
+# 4. See what Dolly would do. This writes nothing.
+~/.local/bin/dolly sync --dry-run
+```
+
+- Run these steps as a regular user, never as root.
+- If `~/.local/bin` is on your `PATH`, you can type `dolly` instead of the full path.
+- `dolly config` asks before it trusts each server certificate and before it writes any file.
+- Read the plan. Then run `dolly sync`, and enable the timer with `systemctl --user enable --now dolly.timer`. `dolly install` does not enable it.
+- To check the download, compare its SHA-256 with `checksums.txt` in the same release.
+- Full documentation: [dirkpetersen.github.io/dolly](https://dirkpetersen.github.io/dolly/).
+
 ---
 
 ## Background and design requirements
@@ -65,7 +90,9 @@ Dolly is a new, simplified reimplementation of [ad2openldap](https://github.com/
 
 ---
 
-## Quick start
+## All commands in order
+
+You can also build with Go (`go install`) instead of downloading the binary.
 
 ```bash
 # Install
@@ -73,7 +100,7 @@ go install github.com/dirkpetersen/dolly/cmd/dolly@latest
 
 # Self-install for the current (unprivileged) user: binary, config, systemd --user units
 dolly install            # groups-only deployment: dolly install --groups
-$EDITOR ~/.config/dolly/dolly.yaml
+dolly config             # interactive setup (or: $EDITOR ~/.config/dolly/dolly.yaml)
 dolly check              # groups-only: dolly check --groups
 
 # Taking over a tree written by ad2openldap? Adopt it once first:
@@ -311,10 +338,20 @@ Config lookup order: `--config`, then `./dolly.yaml`, then `$XDG_CONFIG_HOME/dol
 | `dolly unlock` | Shows the current run lock (holder, and age by the server's `createTimestamp`) and removes it after asking for confirmation. Without `--yes`, stdin must be a terminal: Dolly refuses (exit `1`) rather than guess when it isn't, for example under cron. `--yes` skips the prompt. Use it after a crash, when no run is active |
 | `dolly check` | Tests the config, every domain controller, the target's containers and size limit, and SMTP, one `✓`/`✗`/`!` line each; exits `1` if any check fails. Writes nothing. `--groups` for a groups-only deployment; `--send-test-mail` also sends one test message to `notify.to`. See "Checking a config" |
 | `dolly install` | Copies the binary to `~/.local/bin`, creates the config from the built-in template if missing, and writes the `systemd --user` units. `--users` or `--groups` and `--config FILE` are baked into the unit's `ExecStart`. See "Running it on a schedule" |
+| `dolly config [--config FILE]` | Interactive setup: servers (certificates fetched and pinned after you confirm them), binds (tested at once), bases, and the group schema. Passwords go to `ad.secret` and `ldap.secret` (`0600`). Writes nothing until you confirm, then runs `dolly check`. See "Interactive setup" |
 | `dolly uninstall` | Stops and disables the timer, removes the units and the binary, and keeps the config |
 | `dolly fetch-cert [--source URL]... [--target URL] [--config FILE] [--yes]` | Fetches each chain like the form below, then writes the given URLs and their leaf pins to the config after confirmation (`--source` replaces `source.urls` and `source.tls_fingerprint`; `--target` sets `target.url`, `target.tls_fingerprint`, and `start_tls` by the scheme; `ca_file` is removed on that side). See "TLS certificates" |
 | `dolly fetch-cert URL [--out FILE]` | Connects to `ldaps://host[:636]`, or `ldap://host[:389]` with StartTLS, without verifying the server and without sending credentials, and prints each certificate of the chain the server sends (subject, issuer, validity with expired ones flagged, SHA-256 fingerprint), then a ready-to-paste `tls_fingerprint` line for the leaf. `--out FILE` also writes the chain as PEM (mode `0644`, usable as `ca_file`); an existing file is never overwritten. Reads no config. See "TLS certificates" |
 | `dolly version` | Prints the version, commit, build date, and the Go version it was built with |
+
+### Interactive setup
+
+`dolly config [--config FILE]` creates or edits the config interactively, in seven steps: the AD domain controllers, the AD bind account, the AD search bases, the target server, the target bind account, the target bases, and the group schema with the uid source. Enter keeps the value in `[brackets]`. When you edit a config, that is the current value. A new config has defaults only for the group schema and the uid source (from the template) and for the target bases (from the target's `namingContexts`); the URLs, the bind names, and the AD bases have no default. Right after you enter server URLs, Dolly fetches each certificate chain (no credentials) and asks whether to trust it; if you do, the leaf fingerprints become `tls_fingerprint` and `ca_file` is removed on that side. Keeping the existing `ca_file`/`tls_fingerprint` instead is offered only when the URLs name the same servers as before. If a fetch fails, you can enter the URLs again or stop. A plaintext target (`ldap://` without StartTLS) can't be set up with `dolly config`: edit `dolly.yaml` by hand. Each bind is tested at once (three tries; each failed AD bind can count toward the account's lockout). The AD bind is tried on every domain controller, with one `✓` or `!` line each, but an invalid-credentials error stops at the first one. Each AD base gets a one-entry search, each target base is checked (missing is fine: Dolly creates it). Passwords are read without echo, never printed, and written to `ad.secret` and `ldap.secret` in the config's directory (mode `0600`, `bind_password_file`); the inline `bind_password` is cleared. If `bind_password_file` named another file before, the summary says so, and the old file is left in place. If the schema or the uid source changes, `mapping.users` and `mapping.groups` are rewritten from the template to match, so custom attributes and `gid_from_upg` are lost; the summary says so. If the current uid source is a template (`{{ ... }}`), a schema change makes you choose `sAMAccountName` or `uid`. Nothing is written until you confirm the summary; then the files are written atomically, validated (an invalid result restores every file), and `dolly check` runs. A symlinked config stays a link: the file it points to is written, and the password files go beside the link. A signal during the write is held until the files are complete, and then ends the run (exit `1`, `interrupted after writing; files are complete`). If `dolly check` finds problems, the exit code is `1` (`files written; dolly check found N problems`). Without `--config` it edits the config Dolly finds, or creates `$XDG_CONFIG_HOME/dolly/dolly.yaml`. A config that is byte-identical to the template (as `dolly install` writes it) is treated as a new config. It needs a terminal, and it does not touch `notify` or `sync`, except that a new config gets `notify.smtp_host: ""` (notifications off, since the template's example host would fail every check and run); edit the `notify` section by hand to get mail.
+
+```bash
+dolly config                                  # create or edit the default config
+dolly config --config ~/targets/ldap-a.yaml
+```
 
 ### Checking a config
 

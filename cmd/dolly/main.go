@@ -56,6 +56,8 @@ Commands:
              [--groups] [--send-test-mail]
   install    Install the binary, config, and systemd --user units
              [--users|--groups] [--config FILE]
+  config     Create or edit the config interactively (servers, pins, binds, bases, schema)
+             [--config FILE]
   uninstall  Remove the units and binary, keep the config
   fetch-cert Print a server's TLS certificate chain and fingerprint, or write URLs and pins to the config
              URL [--out FILE]
@@ -85,6 +87,7 @@ func commands() []command {
 		{"unlock", "Show the run lock and remove it after confirmation.", runUnlock},
 		{"check", "Test connectivity, binds, search scopes, the target's containers and size limit, and SMTP.", runCheck},
 		{"install", "Install the binary to ~/.local/bin, create the config from the template if missing, and write the systemd --user units.", runInstall},
+		{"config", "Create or edit the config interactively: servers and their certificates, binds, bases, and the group schema.", runConfigWizard},
 		{"uninstall", "Remove the systemd --user units and the binary. The config is kept.", runUninstall},
 		{"fetch-cert", "Print an LDAP server's TLS certificate chain and the tls_fingerprint line for its leaf, or write URLs and pins to the config (--source, --target).", runFetchCert},
 		{"version", "Print the version.", runVersion},

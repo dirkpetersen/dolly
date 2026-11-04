@@ -336,14 +336,23 @@ func (c *Config) applyDefaults() {
 	// spec: a bare AD account name becomes the UPN <name>@<domain>, the
 	// domain taken from the DC= components of the users (else groups) base.
 	// A down-level name (DOMAIN\name) is left as it is.
-	if b := c.Source.BindDN; b != "" && !strings.ContainsAny(b, "=@\\") {
-		for _, base := range []string{c.Source.Users.Base, c.Source.Groups.Base} {
-			if d := dnsDomain(base); d != "" {
-				c.Source.BindDN = strings.TrimSpace(b) + "@" + d
-				break
-			}
+	c.Source.BindDN = BindName(c.Source.BindDN, c.Source.Users.Base, c.Source.Groups.Base)
+}
+
+// BindName returns the AD bind name Dolly uses for bindDN: a bare account
+// name becomes <name>@<domain>, with the domain from the DC= components of
+// the first base that has them; anything else (a DN, a UPN, DOMAIN\name,
+// or a bare name without such a base) is returned as it is.
+func BindName(bindDN string, bases ...string) string {
+	if bindDN == "" || strings.ContainsAny(bindDN, "=@\\") {
+		return bindDN
+	}
+	for _, base := range bases {
+		if d := dnsDomain(base); d != "" {
+			return strings.TrimSpace(bindDN) + "@" + d
 		}
 	}
+	return bindDN
 }
 
 // dnsDomain returns the DNS domain of a DN's DC= components
