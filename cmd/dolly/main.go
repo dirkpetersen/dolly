@@ -268,6 +268,7 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 	// The run's output (stdout and stderr, as written) becomes the body of
 	// the run's single notification.
 	capture := &lockedBuffer{}
+	rawErr := stderr // progress lines go here only: they stay out of cn=status and the mail
 	stdout, stderr = io.MultiWriter(stdout, capture), io.MultiWriter(stderr, capture)
 	sb := cfg.Target.StateBase
 	conn, err := dialWriter(cfg)
@@ -390,7 +391,7 @@ func realRun(cmd string, cfg *config.Config, force, showDebug bool, opt planner.
 		}
 		fmt.Fprintf(stdout, "\n--force: applying the plan despite the guard.\n")
 	}
-	res = target.Apply(ctx, conn, p, stderr, showDebug)
+	res = applyWithProgress(ctx, conn, p, stderr, rawErr, showDebug)
 	res.Print(stdout)
 	summary := fmt.Sprintf("%d operations: %d applied, %d already in place, %d skipped, %d failed, %d not run",
 		len(p.Ops), res.Applied, res.AlreadyDone, res.Skipped, res.Failed, res.NotRun)
@@ -447,6 +448,47 @@ func (b *lockedBuffer) String() string {
 type writerConn interface {
 	target.Conn
 	Close() error
+}
+
+// Progress intervals during apply; tests shorten them.
+var (
+	progressFirst = 10 * time.Second
+	progressEvery = 60 * time.Second
+)
+
+// applyWithProgress applies the plan, printing a plain progress line to
+// progress after progressFirst and then every progressEvery while it runs.
+func applyWithProgress(ctx context.Context, conn target.Conn, p *planner.Plan, log, progress io.Writer, debug bool) *target.Result {
+	var prog target.Progress
+	stop, done := make(chan struct{}), make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		t := time.NewTimer(progressFirst)
+		defer t.Stop()
+		next := fmt.Sprintf("; next update every %gs", progressEvery.Seconds())
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+			}
+			select {
+			case <-stop: // apply finished as the timer fired
+				return
+			default:
+			}
+			n, total := prog.Done.Load(), len(p.Ops)
+			fmt.Fprintf(progress, "dolly: done %d of %d operations (%d%%), %d failed, %d skipped, %s elapsed%s\n",
+				n, total, n*100/int64(max(total, 1)), prog.Failed.Load(), prog.Skipped.Load(), time.Since(start).Round(time.Second), next)
+			next = ""
+			t.Reset(progressEvery)
+		}
+	}()
+	res := target.ApplyProgress(ctx, conn, p, log, debug, &prog)
+	close(stop)
+	<-done
+	return res
 }
 
 // readSnapshots reads AD and the target for a real run; tests replace it.

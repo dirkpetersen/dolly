@@ -23,6 +23,8 @@ dolly sync --debug        # also print per-entry debug lines to stderr
 | `--force` | Apply the run even if it trips the [mass-deletion guard](how-it-works/index.md#guard). |
 | `--debug` | Print debug details to stderr. See [The `--debug` flag](#the-debug-flag). |
 
+A real run (also `dolly adopt`) prints a progress line to stderr 10 seconds after it starts to apply the plan, and then one every 60 seconds, for example `dolly: done 41200 of 194661 operations (21%), 3 failed, 0 skipped, 12m10s elapsed`. A run that finishes within 10 seconds prints none, and these lines are not part of the mail or `cn=status`.
+
 There is no `dolly diff` — use `dolly sync --dry-run` instead.
 
 A groups-only run doesn't read the AD users base or the target's `users_base` in full: it fetches each group member from AD by DN and looks up only the uids it needs on the target, so it works with a huge or size-limited `users_base`. See [Groups-only deployments](configuration.md#groups-only-deployments). A users-only run still reads AD groups, because Dolly needs them to know which out-of-scope users are still referenced; the only group values a `--users` run changes are `member`/`memberUid` fix-ups for a renamed or pruned user. Removing owned memberships from a group happens only in a run that includes groups.

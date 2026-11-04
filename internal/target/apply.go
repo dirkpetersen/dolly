@@ -6,6 +6,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -73,6 +74,17 @@ func (r *Result) OK() bool {
 // log receives one line per failure and skip; with debug, one per applied
 // operation too.
 func Apply(ctx context.Context, c Conn, plan *planner.Plan, log io.Writer, debug bool) *Result {
+	return ApplyProgress(ctx, c, plan, log, debug, nil)
+}
+
+// Progress counts the operations Apply has finished so far, for progress
+// lines printed by another goroutine while Apply runs.
+type Progress struct {
+	Done, Failed, Skipped atomic.Int64
+}
+
+// ApplyProgress is Apply, updating prog (if not nil) after each operation.
+func ApplyProgress(ctx context.Context, c Conn, plan *planner.Plan, log io.Writer, debug bool, prog *Progress) *Result {
 	res := &Result{}
 	broken := map[string]int{} // dependency key -> step that broke it
 	for i, op := range plan.Ops {
@@ -114,6 +126,15 @@ func Apply(ctx context.Context, c Conn, plan *planner.Plan, log io.Writer, debug
 		}
 		res.count(r.Outcome)
 		res.Ops = append(res.Ops, r)
+		if prog != nil {
+			switch r.Outcome {
+			case Failed:
+				prog.Failed.Add(1)
+			case Skipped:
+				prog.Skipped.Add(1)
+			}
+			prog.Done.Add(1)
+		}
 	}
 	return res
 }
