@@ -79,7 +79,7 @@ func (p *planner) pruneUser(rec *model.Record, reason string) {
 			if p.findManaged(grec) != nil {
 				continue
 			}
-			if occ := occupant(grec, dn); occ != "" {
+			if occ := p.occupant(grec, dn); occ != "" {
 				p.recDelOccupant(grec, occ, "user pruned; group entry is missing")
 			}
 		}
@@ -171,22 +171,26 @@ func (p *planner) fixUserRefs(old, newDN string) {
 	oldUID, newUID := model.RDNValue(old), model.RDNValue(newDN)
 	caseOnly := model.DNEqual(old, newDN)
 	reason := "user renamed from " + old
+	oldKey, err := model.DNKey(old)
+	if err != nil {
+		oldKey = "\x00" // matches no value, as with model.DNEqual
+	}
 	for _, gk := range model.SortedKeys(p.groupEntries) {
 		g := p.groupEntries[gk]
 		if p.memberMode {
-			for _, v := range g.Get(config.AttrMember) {
-				if !model.DNEqual(v, old) || model.DNExact(v, newDN) {
+			for _, v := range p.attrVals(g, config.AttrMember).all(oldKey) {
+				if model.DNExact(v, newDN) {
 					continue
 				}
-				if !caseOnly && findDN(g, config.AttrMember, newDN) != "" {
+				if !caseOnly && p.findDN(g, config.AttrMember, newDN) != "" {
 					p.deleteMember(g, config.AttrMember, v, reason+"; new DN already present")
 				} else {
 					p.renameMember(g, config.AttrMember, v, newDN, reason)
 				}
 			}
 		}
-		if p.uidMode && oldUID != newUID && findExact(g, config.AttrMemberUID, oldUID) != "" {
-			if findExact(g, config.AttrMemberUID, newUID) != "" {
+		if p.uidMode && oldUID != newUID && p.findExact(g, config.AttrMemberUID, oldUID) != "" {
+			if p.findExact(g, config.AttrMemberUID, newUID) != "" {
 				p.deleteMember(g, config.AttrMemberUID, oldUID, reason+"; new uid already present")
 			} else {
 				p.renameMember(g, config.AttrMemberUID, oldUID, newUID, reason)
@@ -195,11 +199,11 @@ func (p *planner) fixUserRefs(old, newDN string) {
 	}
 	for _, guid := range model.SortedKeys(p.groupRecs) {
 		grec := p.groupRecs[guid]
-		for _, o := range append([]string(nil), grec.Occupants...) {
-			if !model.DNEqual(o, old) || model.DNExact(o, newDN) {
+		for _, o := range p.occVals(grec).all(oldKey) {
+			if model.DNExact(o, newDN) {
 				continue
 			}
-			if !caseOnly && grec.HasOccupant(newDN) {
+			if !caseOnly && p.occupant(grec, newDN) != "" {
 				p.recDelOccupant(grec, o, reason+"; new DN already recorded")
 			} else {
 				p.recRenameOccupant(grec, o, newDN, reason)

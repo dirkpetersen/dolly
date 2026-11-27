@@ -75,7 +75,7 @@ func (p *planner) planUserUPGs() {
 		}
 		p.in(func() {
 			if cur := p.findManaged(rec); cur != nil {
-				for _, o := range append([]string(nil), rec.Occupants...) {
+				for _, o := range p.occupants(rec) {
 					p.removeMembership(cur, rec, o, model.RDNValue(o), false, false, why+"; its private group stays")
 				}
 			}
@@ -283,7 +283,7 @@ func (p *planner) createGroup(g *adGroup, rec *model.Record, want []member, reas
 	if p.memberMode && len(want) == 0 {
 		p.warn(WarnPending, g.dn, "AD group has no resolvable members; groupOfNames needs one, so it isn't created yet")
 		if rec != nil {
-			for _, o := range append([]string(nil), rec.Occupants...) {
+			for _, o := range p.occupants(rec) {
 				p.recDelOccupant(rec, o, "group isn't on the target and the member is no longer in the AD group")
 			}
 		}
@@ -322,7 +322,7 @@ func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, r
 		p.addRecord(rec, fmt.Sprintf("record ownership of %s and its %d members before creating it", g.dn, len(dns)))
 	} else {
 		for _, m := range want {
-			if occupant(rec, m.dn) == "" {
+			if p.occupant(rec, m.dn) == "" {
 				p.recAddOccupant(rec, m.dn, "record ownership before re-creating the group with "+m.uid)
 			}
 		}
@@ -333,7 +333,7 @@ func (p *planner) createGroupOps(g *adGroup, rec *model.Record, want []member, r
 		p.countAdd(g.dn, m.dn)
 	}
 	wantKeys := memberKeys(want)
-	for _, o := range append([]string(nil), rec.Occupants...) {
+	for _, o := range p.occupants(rec) {
 		if !wantKeys[model.MustDNKey(o)] {
 			p.recDelOccupant(rec, o, "no longer in the AD group")
 		}
@@ -372,13 +372,13 @@ func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member, 
 	// Index the current values once; each wanted member is looked up once
 	// and additions never affect another member's lookup.
 	occ, mem, uids := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for _, o := range rec.Occupants {
+	for _, o := range p.occupants(rec) {
 		occ[model.MustDNKey(o)] = true
 	}
-	for _, v := range g.Get(config.AttrMember) {
+	for _, v := range p.memberValues(g, config.AttrMember) {
 		mem[model.MustDNKey(v)] = true
 	}
-	for _, v := range g.Get(config.AttrMemberUID) {
+	for _, v := range p.memberValues(g, config.AttrMemberUID) {
 		uids[v] = true
 	}
 	for _, m := range want {
@@ -389,7 +389,7 @@ func (p *planner) syncMembers(g *model.Entry, rec *model.Record, want []member, 
 	}
 
 	wantKeys := memberKeys(want)
-	for _, o := range append([]string(nil), rec.Occupants...) {
+	for _, o := range p.occupants(rec) {
 		if wantKeys[model.MustDNKey(o)] || keep[model.MustDNKey(o)] {
 			continue
 		}
@@ -455,7 +455,7 @@ func (p *planner) goneGroup(rec *model.Record) {
 		why = "user record gone: " + why
 	}
 	if cur := p.findManaged(rec); cur != nil {
-		for _, o := range append([]string(nil), rec.Occupants...) {
+		for _, o := range p.occupants(rec) {
 			p.removeMembership(cur, rec, o, model.RDNValue(o), false, true, "group gone from AD ("+why+")")
 		}
 	}

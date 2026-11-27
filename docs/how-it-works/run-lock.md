@@ -16,7 +16,7 @@ If another host already holds a fresh lock when a run starts, Dolly prints one l
 
 ## `run_timeout` vs. `lock_ttl`
 
-Every run enforces a hard `sync.run_timeout`, which must be configured shorter than `sync.lock_ttl`. This ordering guarantees that a run which is still legitimately in progress never has its own lock mistaken for stale and broken out from under it. `sync.network_timeout` additionally bounds each connection setup (TCP connect, StartTLS or the LDAPS handshake, and the bind, together) and each operation against AD and the target, so a single hung network call can't stall a run indefinitely.
+Every run enforces a hard `sync.run_timeout`, which must be configured shorter than `sync.lock_ttl`. The timeout covers the whole run: reading, planning, and applying. A run stopped while it plans changes nothing, records the failure in `cn=status`, and releases its lock. This ordering guarantees that a run which is still legitimately in progress never has its own lock mistaken for stale and broken out from under it. `sync.network_timeout` additionally bounds each connection setup (TCP connect, StartTLS or the LDAPS handshake, and the bind, together) and each operation against AD and the target, so a single hung network call can't stall a run indefinitely.
 
 ## Stale locks
 

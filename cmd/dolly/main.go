@@ -449,7 +449,7 @@ func realRun(cmd string, cfg *config.Config, force bool, sh show, opt planner.Op
 	if err != nil {
 		return fail(err)
 	}
-	p, err = planner.Build(snaps.AD, snaps.Target, snaps.Records, cfg, opt)
+	p, err = planWithContext(ctx, snaps, cfg, opt)
 	if err != nil {
 		p = nil
 		return fail(err)
@@ -594,6 +594,30 @@ func applyWithProgress(ctx context.Context, conn target.Conn, p *planner.Plan, l
 	})
 	defer stop()
 	return target.ApplyProgress(ctx, conn, p, log, debug, &prog)
+}
+
+// planBuild is the planner; tests replace it with a slow one.
+var planBuild = planner.Build
+
+// planWithContext plans in a goroutine, so a signal or run_timeout stops the
+// run while it plans: the planner is pure and doesn't watch the context. A
+// stopped planner goroutine ends with the process.
+func planWithContext(ctx context.Context, s *fixture.Snapshots, cfg *config.Config, opt planner.Options) (*planner.Plan, error) {
+	type result struct {
+		p   *planner.Plan
+		err error
+	}
+	done, build := make(chan result, 1), planBuild
+	go func() {
+		p, err := build(s.AD, s.Target, s.Records, cfg, opt)
+		done <- result{p, err}
+	}()
+	select {
+	case r := <-done:
+		return r.p, r.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("run stopped while planning (%v); nothing was changed", ctx.Err())
+	}
 }
 
 // readSnapshots reads AD and the target for a real run; tests replace it.

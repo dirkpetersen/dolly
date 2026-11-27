@@ -103,7 +103,7 @@ func (p *planner) planAdopt(ad *model.ADSnapshot) {
 				continue // a duplicate-uid loser
 			}
 			uid := model.RDNValue(dn)
-			if (p.memberMode && findDN(e, config.AttrMember, dn) != "") || (p.uidMode && findExact(e, config.AttrMemberUID, uid) != "") {
+			if (p.memberMode && p.findDN(e, config.AttrMember, dn) != "") || (p.uidMode && p.findExact(e, config.AttrMemberUID, uid) != "") {
 				owned = append(owned, dn)
 			}
 		}

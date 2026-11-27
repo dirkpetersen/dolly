@@ -167,6 +167,11 @@ type planner struct {
 	localRemovedPairs        map[string]bool    // local memberships removed by a prune
 	byUserDN                 map[string]*adUser // built on first use in the groups phase
 
+	// Indexes of the membership values and roleOccupants, built on first use
+	// (see vals.go). They hold the current values once built.
+	attrIdx map[valsKey]*vals
+	occIdx  map[*model.Record]*vals
+
 	scopes []scope // active dependency scopes, see deps.go
 }
 
@@ -201,6 +206,8 @@ func newPlanner(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Rec
 		userRecBySee: map[string]string{}, groupRecBySee: map[string]string{},
 		removedPairs: map[string]bool{}, addedPairs: map[string]bool{},
 		localRemovedPairs: map[string]bool{},
+		attrIdx:           map[valsKey]*vals{},
+		occIdx:            map[*model.Record]*vals{},
 		existing:          tgt.ExistingUsers,
 	}
 	for name, src := range cfg.Mapping.Users.Attributes {
@@ -1144,28 +1151,17 @@ func sameValues(a, b []string) bool {
 	return true
 }
 
-// findDN returns the stored value of attr equal to dn (DN matching), or "".
-func findDN(e *model.Entry, attr, dn string) string {
-	for _, v := range e.Get(attr) {
-		if model.DNEqual(v, dn) {
-			return v
-		}
-	}
-	return ""
+// findDN returns the stored value of a membership attribute equal to dn
+// (DN matching), or "".
+func (p *planner) findDN(e *model.Entry, attr, dn string) string {
+	return p.attrVals(e, attr).lookupDN(dn)
 }
 
-// findExact returns value if attr holds it exactly (memberUid uses
-// caseExactIA5Match), or "".
-func findExact(e *model.Entry, attr, value string) string {
-	for _, v := range e.Get(attr) {
-		if v == value {
-			return v
-		}
-	}
-	return ""
+// findExact returns value if a membership attribute holds it exactly
+// (memberUid uses caseExactIA5Match), or "".
+func (p *planner) findExact(e *model.Entry, attr, value string) string {
+	return p.attrVals(e, attr).first(value)
 }
-
-func exactEq(a, b string) bool { return a == b }
 
 func pairKey(group, userDN string) string {
 	return model.MustDNKey(group) + "|" + model.MustDNKey(userDN)

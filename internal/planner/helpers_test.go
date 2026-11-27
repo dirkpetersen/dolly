@@ -28,7 +28,7 @@ const (
 var now = time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 
 // cfg returns the template config, optionally modified.
-func cfg(t *testing.T, mod ...func(*config.Config)) *config.Config {
+func cfg(t testing.TB, mod ...func(*config.Config)) *config.Config {
 	t.Helper()
 	c, err := config.Parse(dolly.ConfigTemplate, "/test/dolly.yaml")
 	if err != nil {
@@ -139,7 +139,21 @@ type world struct {
 
 // build runs the planner on a world, reading AD through source.Read and
 // the target through model.Classify, like a real run.
-func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
+func build(t testing.TB, c *config.Config, w world, opt Options) *Plan {
+	t.Helper()
+	snap, tgt, recs := snapshots(t, c, w, opt)
+	if opt.Now.IsZero() {
+		opt.Now = now
+	}
+	p, err := Build(snap, tgt, recs, c, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// snapshots reads a world the way build does, without planning.
+func snapshots(t testing.TB, c *config.Config, w world, opt Options) (*model.ADSnapshot, *model.TargetSnapshot, *model.Records) {
 	t.Helper()
 	fake := &source.Fake{}
 	for _, o := range w.ad {
@@ -168,14 +182,7 @@ func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
 		t.Fatal(err)
 	}
 	tgt.UsersRead = true
-	if opt.Now.IsZero() {
-		opt.Now = now
-	}
-	p, err := Build(snap, tgt, recs, c, opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
+	return snap, tgt, recs
 }
 
 var both = Options{Users: true, Groups: true}

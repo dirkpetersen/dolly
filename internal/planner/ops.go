@@ -62,41 +62,40 @@ func (p *planner) deleteEntry(sec Section, entries map[string]*model.Entry, e *m
 
 func (p *planner) addMember(g *model.Entry, attr, value, reason string) {
 	p.emit(Op{Kind: AddMember, Section: SectionMemberships, DN: g.DN, Attr: attr, Value: value, Reason: reason})
-	g.AddValue(attr, value)
+	p.attrVals(g, attr).add(value)
 }
 
 func (p *planner) deleteMember(g *model.Entry, attr, value, reason string) {
 	p.emit(Op{Kind: DeleteMember, Section: SectionMemberships, DN: g.DN, Attr: attr, Value: value, Reason: reason})
-	g.DeleteValue(attr, value, exactEq)
+	p.attrVals(g, attr).del(value)
 }
 
 func (p *planner) renameMember(g *model.Entry, attr, old, value, reason string) {
 	p.emit(Op{Kind: RenameMember, Section: SectionMemberships, DN: g.DN, Attr: attr, Old: old, Value: value, Reason: reason})
-	g.DeleteValue(attr, old, exactEq)
-	g.AddValue(attr, value)
+	x := p.attrVals(g, attr)
+	x.del(old)
+	x.add(value)
 	p.plan.Counts.MembersRenamed++
 }
 
 // realMembers counts member values other than the placeholder.
 func (p *planner) realMembers(g *model.Entry) int {
-	n := 0
-	for _, v := range g.Get(config.AttrMember) {
-		if !model.DNEqual(v, p.placeholder) {
-			n++
-		}
+	x := p.attrVals(g, config.AttrMember)
+	if k, err := model.DNKey(p.placeholder); err == nil {
+		return x.live - len(x.pos[k])
 	}
-	return n
+	return x.live
 }
 
 // ensurePlaceholder adds empty_group_member before the last real member of
 // a groupOfNames group is removed.
 func (p *planner) ensurePlaceholder(g *model.Entry) {
-	if !p.memberMode || p.realMembers(g) != 1 || findDN(g, config.AttrMember, p.placeholder) != "" {
+	if !p.memberMode || p.realMembers(g) != 1 || p.findDN(g, config.AttrMember, p.placeholder) != "" {
 		return
 	}
 	p.emit(Op{Kind: AddPlaceholder, Section: SectionMemberships, DN: g.DN, Attr: config.AttrMember, Value: p.placeholder,
 		Reason: "groupOfNames needs a member; placeholder added before the last real member is removed"})
-	g.AddValue(config.AttrMember, p.placeholder)
+	p.attrVals(g, config.AttrMember).add(p.placeholder)
 }
 
 // dropPlaceholder removes empty_group_member once a real member exists.
@@ -104,10 +103,10 @@ func (p *planner) dropPlaceholder(g *model.Entry) {
 	if !p.memberMode || p.realMembers(g) == 0 {
 		return
 	}
-	if v := findDN(g, config.AttrMember, p.placeholder); v != "" {
+	if v := p.findDN(g, config.AttrMember, p.placeholder); v != "" {
 		p.emit(Op{Kind: DeletePlaceholder, Section: SectionMemberships, DN: g.DN, Attr: config.AttrMember, Value: v,
 			Reason: "the group has a real member again"})
-		g.DeleteValue(config.AttrMember, v, exactEq)
+		p.attrVals(g, config.AttrMember).del(v)
 	}
 }
 
@@ -159,20 +158,14 @@ func (p *planner) updateRecord(r *model.Record, reason string, mutate func(*mode
 func (p *planner) recAddOccupant(r *model.Record, dn, reason string) {
 	p.emit(Op{Kind: UpdateRecord, Section: SectionRecords, DN: r.DN(p.cfg.Target.StateBase),
 		Changes: []Change{{Add, "roleOccupant", []string{dn}}}, Reason: reason})
-	r.Occupants = append(r.Occupants, dn)
+	p.occVals(r).add(dn)
 	p.plan.Counts.RecordsUpdated++
 }
 
 func (p *planner) recDelOccupant(r *model.Record, stored, reason string) {
 	p.emit(Op{Kind: UpdateRecord, Section: SectionRecords, DN: r.DN(p.cfg.Target.StateBase),
 		Changes: []Change{{Delete, "roleOccupant", []string{stored}}}, Reason: reason})
-	var keep []string
-	for _, o := range r.Occupants {
-		if o != stored {
-			keep = append(keep, o)
-		}
-	}
-	r.Occupants = keep
+	p.occVals(r).del(stored)
 	p.plan.Counts.RecordsUpdated++
 }
 
@@ -180,16 +173,14 @@ func (p *planner) recDelOccupant(r *model.Record, stored, reason string) {
 func (p *planner) recRenameOccupant(r *model.Record, stored, dn, reason string) {
 	p.emit(Op{Kind: UpdateRecord, Section: SectionRecords, DN: r.DN(p.cfg.Target.StateBase),
 		Changes: []Change{{Delete, "roleOccupant", []string{stored}}, {Add, "roleOccupant", []string{dn}}}, Reason: reason})
-	for i, o := range r.Occupants {
-		if o == stored {
-			r.Occupants[i] = dn
-		}
-	}
+	p.occVals(r).replace(stored, dn)
 	p.plan.Counts.RecordsUpdated++
 }
 
 func (p *planner) deleteRecord(r *model.Record, reason string) {
 	p.emit(Op{Kind: DeleteRecord, Section: SectionRecords, DN: r.DN(p.cfg.Target.StateBase), Reason: reason})
+	p.occupants(r)
+	delete(p.occIdx, r)
 	recs, bySee := p.recIndex(r.Kind)
 	delete(recs, r.GUID)
 	if bySee[model.MustDNKey(r.SeeAlso)] == r.GUID {
@@ -199,16 +190,11 @@ func (p *planner) deleteRecord(r *model.Record, reason string) {
 }
 
 // occupant returns the stored roleOccupant value equal to dn, or "".
-func occupant(r *model.Record, dn string) string {
+func (p *planner) occupant(r *model.Record, dn string) string {
 	if r == nil {
 		return ""
 	}
-	for _, o := range r.Occupants {
-		if model.DNEqual(o, dn) {
-			return o
-		}
-	}
-	return ""
+	return p.occVals(r).lookupDN(dn)
 }
 
 // removeMembership removes one user (by DN and uid) from group g in
@@ -225,16 +211,16 @@ func (p *planner) removeMembership(g *model.Entry, rec *model.Record, dn, uid st
 }
 
 func (p *planner) removeMembershipOps(g *model.Entry, rec *model.Record, dn, uid string, includeLocal, keepOccupant bool, reason string) {
-	occ := occupant(rec, dn)
+	occ := p.occupant(rec, dn)
 	if occ == "" && !includeLocal {
 		return
 	}
 	var mv, uv string
 	if p.memberMode {
-		mv = findDN(g, config.AttrMember, dn)
+		mv = p.findDN(g, config.AttrMember, dn)
 	}
 	if p.uidMode && uid != "" {
-		uv = findExact(g, config.AttrMemberUID, uid)
+		uv = p.findExact(g, config.AttrMemberUID, uid)
 	}
 	if occ == "" {
 		reason += " (local member, removed because the user is pruned)"

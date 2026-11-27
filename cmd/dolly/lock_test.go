@@ -364,3 +364,35 @@ func TestRealRunUPGFromUsers(t *testing.T) {
 		t.Errorf("second run: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
 	}
 }
+
+// run_timeout also stops a run while it plans (the planner doesn't watch the
+// context): the failure goes to cn=status, the lock is released, and nothing
+// is applied.
+func TestRealRunTimeoutWhilePlanning(t *testing.T) {
+	path := templateCopy(t)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.Replace(string(data), "  run_timeout: 45m", "  run_timeout: 200ms", 1)
+	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := ldapfake.New()
+	withFake(t, dir, "", false)
+	withSnapshots(t, "testdata/fixture.yaml")
+	release := make(chan struct{})
+	old := planBuild
+	planBuild = func(*model.ADSnapshot, *model.TargetSnapshot, *model.Records, *config.Config, planner.Options) (*planner.Plan, error) {
+		<-release
+		return nil, context.Canceled
+	}
+	t.Cleanup(func() { close(release); planBuild = old })
+	code, out, errs := runCLI("sync", "--config", path)
+	if code != 1 || !strings.Contains(errs, "run stopped while planning (context deadline exceeded)") || strings.Contains(out, "Result:") {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errs)
+	}
+	if st := statusNotes(dir); !strings.Contains(st, "failure=run stopped while planning") || dir.Has(lockDN) {
+		t.Errorf("status:\n%s\nlock left: %v", st, dir.Has(lockDN))
+	}
+}
