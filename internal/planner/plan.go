@@ -142,6 +142,7 @@ type Guard struct {
 	ADUPGs             int  // groups the UPG search returned
 	UPGFromAD          bool // source.upg.from is ad (ADUPGs is meaningful)
 	UsersRead          bool // the AD users base was read (ADUsers is meaningful)
+	OnlyGroupMembers   bool // only_group_members: ADUsers counts the users found through the groups
 	MaxDeleteMin       int
 	MaxDeletePercent   float64
 	Tripped            bool

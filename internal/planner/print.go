@@ -41,6 +41,9 @@ func (p *Plan) Print(w io.Writer) {
 		fmt.Fprintf(w, "AD: %d groups in scope; users base not read, %d members fetched by DN; %d unresolved, %d filtered, and %d non-user members skipped\n",
 			c.ADGroups, c.Followed, c.UnresolvedMembers, c.FilteredMembers, c.SkippedMembers)
 	}
+	if p.Guard.OnlyGroupMembers {
+		fmt.Fprintf(w, "Users: only group members (%d found by DN lookup)\n", p.Guard.ADUsers)
+	}
 	switch p.UPG {
 	case "ad":
 		fmt.Fprintf(w, "AD: %d user private groups (source.upg)\n", c.ADUPGs)

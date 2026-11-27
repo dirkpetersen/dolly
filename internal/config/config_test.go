@@ -84,6 +84,7 @@ func TestValidationErrors(t *testing.T) {
 		{"not an attribute", []string{"gecos: gecos", "gecos: two words"}, "neither an AD attribute name nor a Go template"},
 		{"required is absolute", []string{"required: [sAMAccountName, uidNumber, gidNumber]", "required: [sAMAccountName, uidNumber]"}, "mapping.users.required: must include gidNumber"},
 		{"unknown key", []string{"page_size: 500", "page_size: 500\n  pagesize: 1"}, "field pagesize not found"},
+		{"only_group_members on groups", []string{"filter: (objectClass=group)", "filter: (objectClass=group)\n    only_group_members: true"}, "source.groups.only_group_members: only valid under source.users"},
 		{"bad filter", []string{"filter: (objectClass=group)", "filter: (objectClass=group"}, "source.groups.filter"},
 		{"same bases", []string{"groups_base: ou=group,dc=local", "groups_base: OU=People,dc=local"}, "target.users_base and target.groups_base must differ"},
 		{"state_base is groups_base", []string{"state_base: ou=dolly,dc=local", "state_base: OU=Group,dc=local"}, "target.state_base and target.groups_base must differ"},
@@ -375,5 +376,17 @@ func TestDefaultMappingAndSync(t *testing.T) {
 	// A present subsection is not filled in key by key.
 	if _, err := Parse([]byte(head+"\nmapping:\n  users:\n    rdn: uid\n"+tail), "/x/dolly.yaml"); err == nil || !strings.Contains(err.Error(), "mapping.users.attributes") {
 		t.Errorf("partial users mapping: %v", err)
+	}
+}
+
+// source.users.only_group_members is a plain bool, off by default.
+func TestOnlyGroupMembersKey(t *testing.T) {
+	c, err := Parse(edit(t, "# only_group_members: true  ", "only_group_members: true    "), "/x/dolly.yaml")
+	if err != nil || !c.Source.Users.OnlyGroupMembers {
+		t.Fatalf("on: %v %+v", err, c)
+	}
+	c, err = Parse(dolly.ConfigTemplate, "/x/dolly.yaml")
+	if err != nil || c.Source.Users.OnlyGroupMembers {
+		t.Fatalf("default: %v", err)
 	}
 }

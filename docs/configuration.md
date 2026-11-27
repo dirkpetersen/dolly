@@ -39,6 +39,7 @@ source:
   users:
     base: OU=People,DC=example,DC=edu
     filter: (&(objectClass=user)(objectCategory=person))
+    # only_group_members: true        # user entries only for members of the synced groups (found by DN); the users base is not read
   groups:
     base: OU=Groups,DC=example,DC=edu
     filter: (objectClass=group)
@@ -180,6 +181,7 @@ Dolly validates `dolly.yaml` before connecting to anything:
 - SMTP without authentication is allowed: with `notify.username`, `notify.password`, and `notify.password_file` all empty, Dolly never sends `AUTH` (plain relay, with or without `notify.start_tls`). A username without a password, or a password without a username, is a config error. A username also requires TLS, since `AUTH` is never sent over an unencrypted connection: `notify.start_tls: true`, or `notify.smtp_port: 465` (implicit TLS, where `notify.start_tls` must be `false`). `notify.from` and each `notify.to` entry must be valid mail addresses.
 - `source.page_size` defaults to `500` if omitted.
 - `mapping.users.gid_from_upg.group_name` must be a Go template, and `when` must be `missing` or `always` (default `missing`). With `gid_from_upg`, `mapping.users.required` may leave out the source of `gidNumber`. See [gidNumber from the user private group](operations/gid-from-upg.md).
+- `only_group_members` is only valid under `source.users`, not under `source.groups`.
 - `source.bind_dn` as a bare account name needs `DC=` parts in `source.users.base` or `source.groups.base`.
 - Each `tls_fingerprint` entry must be a SHA-256 fingerprint: 64 hex digits, with or without a `sha256:` prefix and colons, in any case. `ca_file` and `tls_fingerprint` can't both be set on the same side. On the target, `ca_file` or `tls_fingerprint` with a plaintext `ldap://` URL and `start_tls: false` is a config error, because no TLS would be used and the setting would be silently ignored. (The source always uses TLS.) See [TLS certificates](operations/tls.md).
 - Listing `member` in `mapping.groups.membership` requires `target.empty_group_member` to be set.
@@ -201,6 +203,7 @@ Connection and search settings for Active Directory. Dolly only ever reads from 
 | `bind_password_file` | `ad.secret` | Path to a file holding the bind password. Resolved against the config file's directory if relative. |
 | `users.base` | `OU=People,DC=example,DC=edu` | Search base for users. |
 | `users.filter` | `(&(objectClass=user)(objectCategory=person))` | LDAP filter selecting in-scope users. It also applies to users fetched by DN as group members. See [Excluding entries](#excluding-entries-with-filters). |
+| `users.only_group_members` | `false` | `true`: runs that sync users make user entries only for the members of the synced shared groups, fetched by DN. The users base is not read. Only valid under `users`. See [Only group members](operations/only-group-members.md). |
 | `groups.base` | `OU=Groups,DC=example,DC=edu` | Search base for groups. |
 | `groups.filter` | `(objectClass=group)` | LDAP filter selecting in-scope groups. It also applies to nested groups fetched by DN. |
 | `upg.from` | `ad` or `users` (optional) | Turns on the user private group set. See [User private groups](operations/user-private-groups.md). |

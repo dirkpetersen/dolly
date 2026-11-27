@@ -153,7 +153,7 @@ func build(t *testing.T, c *config.Config, w world, opt Options) *Plan {
 		}
 	}
 	fake.UPGs = w.upgs
-	snap, err := source.Read(context.Background(), fake, opt.Users || opt.Adopt)
+	snap, err := source.Read(context.Background(), fake, opt.ReadADUsers(c))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -33,6 +33,9 @@ func (p *planner) goneWhy(guid string) string {
 	if why := p.ignoredWhy[guid]; why != "" {
 		return why
 	}
+	if p.onlyGroupMembers() {
+		return "deleted from AD, out of scope, or no longer a member of a synced group"
+	}
 	return "deleted from AD or out of scope"
 }
 

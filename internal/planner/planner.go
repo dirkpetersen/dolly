@@ -27,6 +27,20 @@ type Options struct {
 	Now time.Time
 }
 
+// ReadADUsers reports whether the run must read the AD users base: in runs
+// that sync users and in adopt, except with source.users.only_group_members,
+// where a sync finds its users by DN through the groups (adopt still reads
+// the users base).
+func (o Options) ReadADUsers(cfg *config.Config) bool {
+	return o.Adopt || o.Users && !cfg.Source.Users.OnlyGroupMembers
+}
+
+// onlyGroupMembers reports whether the users plan holds only members of the
+// shared groups (source.users.only_group_members, in a sync of users).
+func (p *planner) onlyGroupMembers() bool {
+	return p.opt.Users && !p.opt.Adopt && p.cfg.Source.Users.OnlyGroupMembers
+}
+
 // Build computes the plan. It does no I/O. The snapshots are not modified.
 func Build(ad *model.ADSnapshot, tgt *model.TargetSnapshot, recs *model.Records, cfg *config.Config, opt Options) (*Plan, error) {
 	p, err := newPlanner(ad, tgt, recs, cfg, opt)
@@ -327,7 +341,7 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 			continue
 		}
 		p.validUsers[o.GUID] = u
-		if u.gidFromUPG && o.InScope {
+		if u.gidFromUPG && o.InScope && !p.onlyGroupMembers() { // with it, counted below for the managed users
 			p.plan.Counts.GIDFromUPG++
 		}
 	}
@@ -374,17 +388,26 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 	// the valid ones are managed, also when they are outside the users
 	// search base. Duplicate uids are resolved once over both sets, so a
 	// name means the same AD user as a member and as an entry.
+	//
+	// spec: with only_group_members, only the valid members of the shared
+	// set get user entries: in-scope users are not managed for being in the
+	// users base, and a member of a UPG only stays without an entry.
+	only := p.onlyGroupMembers()
 	byGUID := map[string]*adUser{}
 	for guid, u := range p.validUsers {
-		if u.obj.InScope {
+		if u.obj.InScope && !only {
 			byGUID[guid] = u
 		}
 	}
+	shared := map[string]bool{} // GUIDs of members of the shared set
 	for _, guid := range model.SortedKeys(p.groups) {
 		ms := p.flatten(p.groups[guid].obj, false)
 		p.groupMembers[guid] = ms
 		for _, m := range ms {
 			byGUID[m.GUID] = p.memberUsers[m.GUID]
+			if p.groups[guid].kind == model.GroupRecord {
+				shared[m.GUID] = true
+			}
 		}
 	}
 	var ucands []*adUser
@@ -398,8 +421,11 @@ func (p *planner) prepare(ad *model.ADSnapshot) {
 		p.warn(WarnDuplicate, loser.obj.DN, fmt.Sprintf("uid %q is also used by %s, which wins", loser.uid, winner.obj.DN))
 	}) {
 		p.members[u.obj.GUID] = u
-		if p.validUsers[u.obj.GUID] != nil {
+		if p.validUsers[u.obj.GUID] != nil && (!only || shared[u.obj.GUID]) {
 			p.users[u.obj.GUID] = u
+			if only && u.gidFromUPG {
+				p.plan.Counts.GIDFromUPG++
+			}
 		}
 	}
 	// Only runs that plan user UPGs make them, so a --groups run never
@@ -834,6 +860,10 @@ func (p *planner) finish() {
 	g.MaxDeleteMin = p.cfg.Sync.MaxDeleteMin
 	g.MaxDeletePercent = p.cfg.Sync.MaxDeletePercent
 	g.UsersRead = p.plan.ADUsersRead
+	if p.onlyGroupMembers() {
+		// The zero-users check counts the users found through the groups.
+		g.OnlyGroupMembers, g.UsersRead, g.ADUsers = true, true, len(p.users)
+	}
 	if !p.opt.Adopt {
 		g.evaluate()
 	}
@@ -865,7 +895,8 @@ func (p *planner) finish() {
 // evaluate applies the mass-deletion guard: a removal count trips it when
 // it exceeds both max_delete_min and max_delete_percent of what Dolly owns.
 // AD returning no users or no groups trips it too (no users only when the
-// users base was read; a groups-only run doesn't read it). Local memberships
+// users base was read; a groups-only run doesn't read it; with
+// only_group_members, no users means no group member gets a user entry). Local memberships
 // removed by a prune (LocalRemovals) are reported but don't count: Dolly
 // doesn't own them, so they are no part of the percentage's denominator.
 func (g *Guard) evaluate() {
@@ -877,7 +908,10 @@ func (g *Guard) evaluate() {
 	}
 	check("membership", g.MembershipRemovals, g.OwnedMemberships)
 	check("user", g.UserRemovals, g.OwnedUsers)
-	if g.UsersRead && g.ADUsers == 0 {
+	switch {
+	case g.UsersRead && g.ADUsers == 0 && g.OnlyGroupMembers:
+		g.Reasons = append(g.Reasons, "no member of the synced groups can get a user entry (only_group_members)")
+	case g.UsersRead && g.ADUsers == 0:
 		g.Reasons = append(g.Reasons, "AD returned no users")
 	}
 	if g.ADGroups == 0 {

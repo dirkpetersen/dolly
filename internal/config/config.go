@@ -98,6 +98,10 @@ func (c *Config) UPGFrom() string {
 type Search struct {
 	Base   string `yaml:"base"`
 	Filter string `yaml:"filter"`
+	// OnlyGroupMembers (source.users only): runs that sync users manage
+	// only the members of the synced shared groups, found by DN, and never
+	// read the users base. See README "Only group members".
+	OnlyGroupMembers bool `yaml:"only_group_members"`
 }
 
 // Target is the OpenLDAP side.
@@ -551,6 +555,9 @@ func (c *Config) Validate() error {
 		s    Search
 	}{{"source.users", c.Source.Users}, {"source.groups", c.Source.Groups}} {
 		checkDN(s.name+".base", s.s.Base, true, add)
+		if s.name == "source.groups" && s.s.OnlyGroupMembers {
+			add("source.groups.only_group_members: only valid under source.users")
+		}
 		if s.s.Filter == "" {
 			add("%s.filter: required", s.name)
 		} else if _, err := ldap.CompileFilter(s.s.Filter); err != nil {

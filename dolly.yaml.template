@@ -15,6 +15,7 @@ source:
   users:
     base: OU=People,DC=example,DC=edu
     filter: (&(objectClass=user)(objectCategory=person))
+    # only_group_members: true        # user entries only for members of the synced groups (found by DN); the users base is not read
   groups:
     base: OU=Groups,DC=example,DC=edu
     filter: (objectClass=group)

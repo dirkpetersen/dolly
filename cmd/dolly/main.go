@@ -50,6 +50,7 @@ Usage:
 Commands:
   sync       Read AD and the target, then apply the differences
              [--users|--groups] [--dry-run] [--force] [--debug] [-v]
+             [--only-group-members] [--upg-prefix PREFIX]
   adopt      One-time takeover of an existing tree [--dry-run] [--debug] [-v]
   unlock     Show and remove the run lock after a crash [--yes]
   check      Test connectivity, binds, search scopes, size limits, and SMTP
@@ -162,6 +163,18 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 	groups := fs.Bool("groups", false, "sync groups only")
 	dryRun := fs.Bool("dry-run", false, "print the plan without writing or taking the lock")
 	force := fs.Bool("force", false, "apply even if the mass-deletion guard trips")
+	var ov overrides
+	fs.BoolVar(&ov.onlyGroupMembers, "only-group-members", false, "user entries only for members of the synced groups, found by DN; the users base is not read (source.users.only_group_members: true)")
+	fs.Func("upg-prefix", "take each user's gidNumber from the AD group named PREFIX<uid> (gid_from_upg with when: always); PREFIX is plain text, not empty, without {{", func(v string) error {
+		if v == "" {
+			return errors.New("must not be empty")
+		}
+		if strings.Contains(v, "{{") {
+			return errors.New("must not contain {{ (it is plain text, not a template)")
+		}
+		ov.upgPrefix = &v
+		return nil
+	})
 	show := showFlags(fs)
 	fix := fs.String("fixture", "", "plan from a snapshot file (development only)")
 	if code, ok := parse(fs, args); !ok {
@@ -169,7 +182,7 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 	}
 	// --users and --groups select phases; both together, like neither, mean both.
 	opt := planner.Options{Users: *users || !*groups, Groups: *groups || !*users}
-	return plan("sync", *cfgPath, *fix, *dryRun, *force, *show, opt, stdout, stderr)
+	return plan("sync", *cfgPath, *fix, *dryRun, *force, *show, ov, opt, stdout, stderr)
 }
 
 func runAdopt(args []string, stdout, stderr io.Writer) int {
@@ -181,13 +194,56 @@ func runAdopt(args []string, stdout, stderr io.Writer) int {
 	if code, ok := parse(fs, args); !ok {
 		return code
 	}
-	return plan("adopt", *cfgPath, *fix, *dryRun, false, *show, planner.Options{Adopt: true}, stdout, stderr)
+	return plan("adopt", *cfgPath, *fix, *dryRun, false, *show, overrides{}, planner.Options{Adopt: true}, stdout, stderr)
+}
+
+// overrides are the sync flags that change the config for one run.
+type overrides struct {
+	onlyGroupMembers bool    // --only-group-members
+	upgPrefix        *string // --upg-prefix, nil if not given
+}
+
+// apply changes cfg for this run and returns a line for the plan output,
+// or "". cfg must be validated again afterwards.
+//
+// spec: --upg-prefix P is the gid_from_upg block of the docs with when:
+// always: group_name 'P{{ .uid }}', and gidNumber's source left out of
+// mapping.users.required, since the group gives it.
+func (o overrides) apply(cfg *config.Config) string {
+	if o.onlyGroupMembers {
+		cfg.Source.Users.OnlyGroupMembers = true
+	}
+	if o.upgPrefix == nil {
+		return ""
+	}
+	u := &cfg.Mapping.Users
+	note := fmt.Sprintf("--upg-prefix %s: gidNumber from the AD group named %s<uid> (gid_from_upg, when: always)", *o.upgPrefix, *o.upgPrefix)
+	if u.GIDFromUPG != nil {
+		note += "; replaces mapping.users.gid_from_upg of the config for this run"
+	}
+	u.GIDFromUPG = &config.GIDFromUPG{GroupName: *o.upgPrefix + "{{ .uid }}", When: config.GIDWhenAlways}
+	for name, src := range u.Attributes {
+		if !strings.EqualFold(name, "gidNumber") {
+			continue
+		}
+		if v, err := config.CompileValue(name, src); err == nil && v.Attr != "" {
+			var req []string
+			for _, r := range u.Required {
+				if !strings.EqualFold(r, v.Attr) {
+					req = append(req, r)
+				}
+			}
+			u.Required = req
+		}
+	}
+	return note
 }
 
 // show holds the printing flags every command that plans accepts.
 type show struct {
-	debug   bool // --debug: debug details to stderr
-	verbose bool // --verbose, -v: every operation and ignored entry in the plan
+	debug   bool   // --debug: debug details to stderr
+	verbose bool   // --verbose, -v: every operation and ignored entry in the plan
+	note    string // printed before the plan (from overrides.apply)
 }
 
 func showFlags(fs *flag.FlagSet) *show {
@@ -200,13 +256,18 @@ func showFlags(fs *flag.FlagSet) *show {
 
 // plan loads the config, then either prints the plan (--dry-run) or runs
 // for real (see realRun). With sh.debug, debug details go to stderr; sh.verbose lists every operation.
-func plan(cmd, cfgPath, fix string, dryRun, force bool, sh show, opt planner.Options, stdout, stderr io.Writer) int {
+func plan(cmd, cfgPath, fix string, dryRun, force bool, sh show, ov overrides, opt planner.Options, stdout, stderr io.Writer) int {
 	path, err := config.Find(cfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
 		return exitError
 	}
 	cfg, err := config.Load(path)
+	if err == nil {
+		if sh.note = ov.apply(cfg); ov != (overrides{}) {
+			err = cfg.Validate()
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "dolly %s: %v\n", cmd, err)
 		return exitError
@@ -220,7 +281,7 @@ func plan(cmd, cfgPath, fix string, dryRun, force bool, sh show, opt planner.Opt
 	}
 	var snaps *fixture.Snapshots
 	if fix != "" {
-		snaps, err = fixture.Load(fix, cfg, opt.Users || opt.Adopt)
+		snaps, err = fixture.Load(fix, cfg, opt.ReadADUsers(cfg))
 	} else {
 		ctx, cleanup := runContext(cfg)
 		snaps, err = readLive(ctx, cfg, opt, stderr, stderr)
@@ -243,6 +304,7 @@ func plan(cmd, cfgPath, fix string, dryRun, force bool, sh show, opt planner.Opt
 		p.PrintDebug(stderr)
 	}
 	p.Verbose = sh.verbose
+	printNote(stdout, sh.note)
 	p.Print(stdout)
 	if p.Guard.Tripped {
 		if force {
@@ -396,6 +458,7 @@ func realRun(cmd string, cfg *config.Config, force bool, sh show, opt planner.Op
 		p.PrintDebug(stderr)
 	}
 	p.Real, p.Verbose = true, sh.verbose
+	printNote(stdout, sh.note)
 	p.Print(stdout)
 	if p.Guard.Tripped {
 		if !force {
@@ -435,6 +498,12 @@ func checkBasesRead(cfg *config.Config, t *model.TargetSnapshot) error {
 		}
 	}
 	return nil
+}
+
+func printNote(w io.Writer, note string) {
+	if note != "" {
+		fmt.Fprintln(w, note)
+	}
 }
 
 // notifyOptions are the notification options other than the config
@@ -548,7 +617,9 @@ var (
 // target's users_base in full. A groups-only run reads neither: AD members
 // are fetched by DN, and the target is asked only about the uids those
 // members need (batched lookups), so a huge or size-limited users_base
-// never has to be read.
+// never has to be read. With only_group_members, a run that syncs users
+// fetches its AD users by DN like a groups-only run, but still reads the
+// target's users_base in full.
 func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stderr, progress io.Writer) (*fixture.Snapshots, error) {
 	start := time.Now()
 	step := time.Now()
@@ -557,7 +628,8 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 		fmt.Fprintf(stderr, "dolly: "+format+" (%s)\n", append(a, now.Sub(step).Round(time.Millisecond))...)
 		step = now
 	}
-	readUsers := opt.Users || opt.Adopt
+	readUsers := opt.Users || opt.Adopt // the target's users_base
+	adUsers := opt.ReadADUsers(cfg)
 
 	ad, err := dialAD(ctx, cfg)
 	if err != nil {
@@ -570,19 +642,19 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 		return p.Users.Load()+p.Groups.Load()+p.UPGs.Load()+p.Members.Load() > 0
 	}, func(elapsed time.Duration) string {
 		var parts []string
-		if readUsers {
+		if adUsers {
 			parts = append(parts, fmt.Sprintf("%d users", p.Users.Load()))
 		}
 		parts = append(parts, fmt.Sprintf("%d groups", p.Groups.Load()))
 		if cfg.UPGFrom() == config.UPGFromAD {
 			parts = append(parts, fmt.Sprintf("%d user private groups", p.UPGs.Load()))
 		}
-		if !readUsers {
+		if !adUsers {
 			parts = append(parts, fmt.Sprintf("%d members fetched by DN", p.Members.Load()))
 		}
 		return fmt.Sprintf("reading AD: %s so far, %s elapsed", strings.Join(parts, ", "), elapsed)
 	})
-	snap, err := source.Read(ctx, ad, readUsers)
+	snap, err := source.Read(ctx, ad, adUsers)
 	stop()
 	if err != nil {
 		return nil, err
@@ -593,7 +665,7 @@ func readLive(ctx context.Context, cfg *config.Config, opt planner.Options, stde
 			fetched++
 		}
 	}
-	if readUsers {
+	if adUsers {
 		summary("read AD: %d users and %d groups in scope, %d objects fetched by DN, %d unresolved, %d filtered",
 			snap.Count(model.KindUser), snap.Count(model.KindGroup), fetched, len(snap.Unresolved), len(snap.Filtered))
 	} else {

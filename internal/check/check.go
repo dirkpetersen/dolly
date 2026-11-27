@@ -249,16 +249,20 @@ func checkAD(ctx context.Context, p *printer, cfg *config.Config, o Options) {
 		if err != nil && ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) && res != nil && len(res.Entries) > 0 {
 			err = nil // one entry is all this check asks for
 		}
-		// A groups-only run never searches the AD users base: it fetches
-		// members by DN.
-		soft := s.users && o.GroupsOnly
+		// A groups-only run never searches the AD users base, nor does a sync
+		// with only_group_members: they fetch members by DN.
+		soft := s.users && (o.GroupsOnly || cfg.Source.Users.OnlyGroupMembers)
+		why := "groups-only runs don't search it"
+		if !o.GroupsOnly {
+			why = "syncs with only_group_members don't search it"
+		}
 		switch {
 		case err != nil && soft:
-			p.warn("%s %s: paged search failed: %v (groups-only runs don't search it)", s.name, s.search.Base, err)
+			p.warn("%s %s: paged search failed: %v (%s)", s.name, s.search.Base, err, why)
 		case err != nil:
 			p.fail("%s %s: paged search failed: %v", s.name, s.search.Base, err)
 		case len(res.Entries) == 0 && soft:
-			p.warn("%s %s: no entries match %s (groups-only runs don't search it)", s.name, s.search.Base, s.search.Filter)
+			p.warn("%s %s: no entries match %s (%s)", s.name, s.search.Base, s.search.Filter, why)
 		case len(res.Entries) == 0:
 			p.fail("%s %s: no entries match %s; the guard stops every sync when AD returns none", s.name, s.search.Base, s.search.Filter)
 		default:

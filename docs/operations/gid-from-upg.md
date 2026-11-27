@@ -102,6 +102,10 @@ Only the `gidNumber` that Dolly writes on user entries changes. So `gid_from_upg
 
 If a UPG's `gidNumber` changes, every user who takes it from that group gets the new value in the next run that syncs users. Dolly applies the change and reports it as an `id-changed` warning, as for any `gidNumber` change.
 
+## The `--upg-prefix` flag
+
+`dolly sync --upg-prefix u-` is a shortcut for one run. It equals the [configuration](#configuration) block above with `when: always`: `group_name: 'u-{{ .uid }}'`, `when: always`, and the source of `gidNumber` left out of `mapping.users.required`. The prefix is plain text: it must not be empty, and it must not contain `{{`. If the config already has `gid_from_upg`, the flag replaces it for that run, and the first line of the output says so. The config keys stay the documented way to set this up; use the flag to try a prefix with `--dry-run`, or for a one-off run.
+
 ## Config validation
 
 - `group_name` must be a Go template.
